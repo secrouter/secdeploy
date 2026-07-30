@@ -1,0 +1,9 @@
+[Unit]
+Description=SecRouter secure-AI suite (SecCert + SecRouter + SecRecorder)
+Documentation=https://github.com/secrouter/secdeploy
+# SecCert + SecRouter are the core; SecRecorder is optional (mask it to skip).
+Wants=seccert.service secrouter.service secrecorder.service
+After=seccert.service
+
+[Install]
+WantedBy=multi-user.target

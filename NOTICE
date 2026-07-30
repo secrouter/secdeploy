@@ -1,0 +1,7 @@
+SecDeploy
+Copyright 2026 Austin Probe
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+SecDeploy is the release and deployment orchestrator for the SecRouter suite
+(SecRouter, SecCert, SecRecorder).

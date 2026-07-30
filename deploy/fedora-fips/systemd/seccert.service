@@ -1,0 +1,34 @@
+[Unit]
+Description=SecCert — internal ACME certificate authority
+Documentation=https://github.com/secrouter/seccert
+After=network-online.target
+Wants=network-online.target
+PartOf=secsuite.target
+
+[Service]
+Type=simple
+User=secsuite-seccert
+Group=secsuite-seccert
+WorkingDirectory=/opt/secsuite/seccert
+EnvironmentFile=/etc/secsuite/seccert.env
+ExecStart=/opt/secsuite/seccert/.venv/bin/seccert
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/secsuite/seccert
+
+[Install]
+WantedBy=secsuite.target

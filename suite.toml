@@ -1,0 +1,34 @@
+# SecDeploy release manifest — the suite "bill of materials".
+# A suite version pins one compatible, tested set of component tags. Deploying a
+# suite version gives you exactly this combination on any target.
+
+suite = "1.0.0"
+released = "2026-07-30"
+description = "SecRouter secure-AI suite"
+
+[components.seccert]
+repo = "secrouter/seccert"
+ref = "v1.0.0"
+runtime = "python>=3.11"
+role = "internal ACME certificate authority (stands up first — issues the suite's certs)"
+
+[components.secrouter]
+repo = "secrouter/secrouter"
+ref = "v1.0.0"
+runtime = "node>=24"
+role = "governed AI gateway"
+
+[components.secrecorder]
+repo = "secrouter/secrecorder"
+ref = "v0.7.0"
+runtime = "python>=3.11"
+role = "transcription (optional; native/MLX on macOS, faster-whisper on Fedora)"
+
+# Deploy targets. `kind` selects the mechanism the CLI uses.
+[targets.macos]
+kind = "compose"
+description = "MacBook Pro M-series — Docker Compose via Colima (SecRouter + SecCert); SecRecorder runs native (MLX/Metal)"
+
+[targets.fedora-fips]
+kind = "systemd-native"
+description = "FIPS-mode Fedora host — native hardened systemd services linking the system OpenSSL FIPS provider"

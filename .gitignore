@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# SecDeploy working state — checkouts, built images, and release bundles
+work/
+out/
+*.tar
+*.tar.zst
+*.qcow2
+SHA256SUMS
+
+# local env overrides
+*.env
+!*.env.example
+
+# Sphinx
+docs/_build/

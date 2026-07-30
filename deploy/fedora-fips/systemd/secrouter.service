@@ -1,0 +1,37 @@
+[Unit]
+Description=SecRouter — governed AI gateway
+Documentation=https://github.com/secrouter/secrouter
+After=network-online.target seccert.service
+Wants=network-online.target
+# SecCert issues the suite's certs, so bring it up first.
+After=seccert.service
+PartOf=secsuite.target
+
+[Service]
+Type=simple
+User=secsuite-secrouter
+Group=secsuite-secrouter
+WorkingDirectory=/opt/secsuite/secrouter
+EnvironmentFile=/etc/secsuite/secrouter.env
+# SecRouter is a zero-runtime-dependency Node app (node:sqlite builtin; needs Node >= 24).
+ExecStart=/usr/bin/node /opt/secsuite/secrouter/dist/server.js
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/secsuite/secrouter
+
+[Install]
+WantedBy=secsuite.target

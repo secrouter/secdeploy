@@ -1,0 +1,31 @@
+[Unit]
+Description=SecRecorder — transcription service (optional)
+Documentation=https://github.com/secrouter/secrecorder
+After=network-online.target
+Wants=network-online.target
+PartOf=secsuite.target
+
+[Service]
+Type=simple
+User=secsuite-secrecorder
+Group=secsuite-secrecorder
+WorkingDirectory=/opt/secsuite/secrecorder
+EnvironmentFile=/etc/secsuite/secrecorder.env
+# The component ships run.sh as its entrypoint (selects the faster-whisper backend on Linux).
+ExecStart=/opt/secsuite/secrecorder/run.sh
+Restart=on-failure
+RestartSec=5
+
+# Hardening (kept lenient enough for the ML runtime)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+ReadWritePaths=/var/lib/secsuite/secrecorder
+
+[Install]
+WantedBy=secsuite.target
