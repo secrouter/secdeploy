@@ -9,22 +9,29 @@ services:
     build:
       context: ../../work/seccert
     environment:
-      SECCERT_EXTERNAL_URL: http://localhost:14000
+      SECCERT_HOST: "0.0.0.0"
+      SECCERT_PORT: "47001"
+      SECCERT_EXTERNAL_URL: http://localhost:47001
       SECCERT_ADMIN_TOKEN: ${SECCERT_ADMIN_TOKEN:-dev-admin-token}
     volumes:
       - seccert-data:/var/lib/seccert
     ports:
-      - "14000:14000"   # ACME directory + console at http://localhost:14000/admin
+      - "47001:47001"   # ACME directory + console at http://localhost:47001/admin
     restart: unless-stopped
 
   secrouter:
     image: secrouter/secrouter:${SECSUITE_VERSION:-1.0.0}
     build:
       context: ../../work/secrouter
+    environment:
+      # server.ts defaults to 127.0.0.1, which is unreachable through the published
+      # port — Docker's healthcheck passes because it runs inside the same container.
+      SECROUTER_HOST: "0.0.0.0"
+      SECROUTER_PORT: "47002"
     depends_on:
       - seccert
     ports:
-      - "18800:18800"   # gateway (dev mode by default; mount a hardened config for real use)
+      - "47002:47002"   # gateway (dev mode by default; mount a hardened config for real use)
     restart: unless-stopped
 
 volumes:

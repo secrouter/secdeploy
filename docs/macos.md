@@ -7,8 +7,8 @@ backend can't run inside Docker on macOS.
 ## Prerequisites
 
 ```bash
-brew install colima docker uv
-colima start                      # Docker daemon on Apple Silicon
+brew install colima docker uv ffmpeg   # ffmpeg: SecRecorder transcoding (build macos also self-installs it)
+colima start                           # Docker daemon on Apple Silicon
 ```
 
 ## Deploy
@@ -20,22 +20,22 @@ uv run secdeploy deploy macos     # SecCert (CA) up → export root → SecRoute
 ```
 
 What `deploy macos` does:
-1. `docker compose up -d seccert` and wait for `http://localhost:14000/health`.
+1. `docker compose up -d seccert` and wait for `http://localhost:47001/health`.
 2. Save the CA trust anchor to `out/seccert-root.pem`.
 3. `docker compose up -d secrouter`.
 
 SecRecorder (optional, native):
 
 ```bash
-uv run --project work/secrecorder secrecorder     # http://127.0.0.1:9000
+HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh     # http://127.0.0.1:47003
 ```
 
 ## Verify
 
 ```bash
 uv run secdeploy status macos
-open http://localhost:14000/admin        # SecCert console
-curl -s http://localhost:18800/health    # SecRouter (dev mode by default)
+open http://localhost:47001/admin        # SecCert console
+curl -s http://localhost:47002/health    # SecRouter (dev mode by default)
 ```
 
 Trust the CA locally so SecCert-issued certs validate:

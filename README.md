@@ -37,7 +37,7 @@ uv run secdeploy fetch                  # checkout every component at its pinned
 ```bash
 uv run secdeploy build macos            # build SecCert + SecRouter images from the checkouts
 uv run secdeploy deploy macos           # SecCert first (CA) → export root → SecRouter
-# SecRecorder is native:  uv run --project work/secrecorder secrecorder
+# SecRecorder is native:  HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh
 ```
 
 **Fedora / FIPS (on the target host, as root)**

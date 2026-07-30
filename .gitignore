@@ -21,3 +21,6 @@ SHA256SUMS
 
 # Sphinx
 docs/_build/
+
+# macOS
+.DS_Store

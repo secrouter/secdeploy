@@ -104,7 +104,7 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path) -> list[tuple[list
     # trust anchor
     steps.append((
         ["bash", "-c",
-         "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:14000/ca.crt "
+         "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:47001/ca.crt "
          f"-o {ANCHORS}/secsuite-seccert-root.pem && break; sleep 1; done && update-ca-trust"],
         "add SecCert root to the host trust store",
     ))
