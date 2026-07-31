@@ -21,10 +21,19 @@ PLAN = [
     "Export the SecCert root to ./out (trust anchor for the enclave)",
     "Bring up SecRouter via Compose",
     "Ensure ffmpeg is installed (SecRecorder transcoding — installs via brew if missing)",
+    "(--tls) Issue SecRecorder a SecCert cert via certbot — HTTP-01 through host.docker.internal",
+    "(--configure-hosts) Map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo)",
     "Prepare SecRecorder to run natively via uv (MLX/Metal — not containerized on macOS)",
 ]
 
 IMAGES = ("seccert", "secrouter")  # secrecorder is native on macOS
+
+# SecRecorder TLS (--tls): certbot's standalone HTTP-01 responder runs on the Mac itself;
+# SecCert (in its container) reaches it via host.docker.internal, which Colima resolves to
+# the host — see compose.yaml's SECCERT_HTTP01_PORT for the matching validation port.
+CERT_HOST = "host.docker.internal"
+HTTP01_PORT = 47080
+SECRECORDER_PORT = 47003
 
 
 def _image(manifest: Manifest, name: str) -> str:
@@ -62,6 +71,60 @@ def _ensure_ffmpeg() -> None:
                "or SecRecorder transcoding will be degraded")
 
 
+def _ensure_certbot() -> None:
+    """certbot is the ACME client used to get SecRecorder a cert from SecCert for --tls."""
+    if P.which("certbot"):
+        return
+    if P.which("brew"):
+        P.warn("certbot not found — installing via brew (required for --tls)")
+        P.run(["brew", "install", "certbot"], check=False)
+        if not P.which("certbot"):
+            P.warn("certbot install did not complete — cannot issue a cert for SecRecorder")
+    else:
+        P.warn("certbot not found and brew is unavailable — install certbot manually for --tls")
+
+
+def _configure_hosts() -> None:
+    """Map host.docker.internal to loopback on the Mac itself, so host-side clients (curl,
+    browsers) can reach SecRecorder using the same hostname its SecCert cert was issued for —
+    Docker/Colima only define that name inside containers, not on the host."""
+    hosts = Path("/etc/hosts")
+    if CERT_HOST in hosts.read_text():
+        P.log(f"/etc/hosts already maps {CERT_HOST}")
+        return
+    P.log(f"adding '127.0.0.1 {CERT_HOST}' to /etc/hosts (sudo — you may be prompted)")
+    P.run(["sudo", "sh", "-c", f"echo '127.0.0.1 {CERT_HOST}' >> /etc/hosts"])
+
+
+def _issue_secrecorder_cert(root: Path) -> tuple[Path, Path] | None:
+    """Get SecRecorder an ACME cert from SecCert via certbot standalone. HTTP-01 crosses the
+    container/host boundary through host.docker.internal (see module docstring). Idempotent —
+    certbot no-ops if the existing cert at out/certbot isn't near expiry."""
+    _ensure_certbot()
+    if not P.which("certbot"):
+        return None
+    cb_root = root / "out/certbot"
+    for d in ("config", "work", "logs"):
+        (cb_root / d).mkdir(parents=True, exist_ok=True)
+    P.run([
+        "certbot", "certonly", "--standalone",
+        "--non-interactive", "--agree-tos", "--register-unsafely-without-email",
+        "--config-dir", str(cb_root / "config"),
+        "--work-dir", str(cb_root / "work"),
+        "--logs-dir", str(cb_root / "logs"),
+        "--server", "http://localhost:47001/acme/directory",
+        "--http-01-port", str(HTTP01_PORT),
+        "--cert-name", "secrecorder",
+        "-d", CERT_HOST,
+    ], check=False)
+    live = cb_root / "config/live/secrecorder"
+    cert, key = live / "fullchain.pem", live / "privkey.pem"
+    if cert.exists() and key.exists():
+        return cert, key
+    P.warn(f"certbot did not produce a certificate — check {cb_root}/logs/letsencrypt.log")
+    return None
+
+
 def build(manifest: Manifest, work: Path, out: Path, root: Path) -> None:
     from .common import require_checkouts
 
@@ -81,7 +144,14 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path) -> None:
     P.log(f"built images: {', '.join(_image(manifest, n) for n in IMAGES)}")
 
 
-def deploy(manifest: Manifest, work: Path, root: Path, dry_run: bool = False) -> None:
+def deploy(
+    manifest: Manifest,
+    work: Path,
+    root: Path,
+    dry_run: bool = False,
+    tls: bool = False,
+    configure_hosts: bool = False,
+) -> None:
     compose = _compose(root)
     dc = ["docker", "compose"] if dry_run else _compose_cmd()
     env = {"SECSUITE_VERSION": manifest.suite}
@@ -100,10 +170,34 @@ def deploy(manifest: Manifest, work: Path, root: Path, dry_run: bool = False) ->
             print(f"  · {desc}: {' '.join(cmd)}")
             continue
         P.run(cmd, env={**_os_environ(), **env})
+
+    run_cmd = f"HOST=0.0.0.0 PORT={SECRECORDER_PORT} work/secrecorder/run.sh"
     if dry_run:
-        print("  · SecRecorder: run natively → HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh")
+        if configure_hosts:
+            print(f"  · (--configure-hosts) map {CERT_HOST} to 127.0.0.1 in /etc/hosts (sudo)")
+        if tls:
+            print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, "
+                  "then start SecRecorder with --ssl-certfile/--ssl-keyfile")
+        else:
+            print(f"  · SecRecorder: run natively → {run_cmd}")
         return
-    P.warn("SecRecorder is native on macOS — start it with: HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh")
+
+    if tls:
+        if configure_hosts:
+            _configure_hosts()
+        cert = _issue_secrecorder_cert(root)
+        if cert:
+            certfile, keyfile = cert
+            P.log(f"SecRecorder cert ready (SecCert-issued): {certfile}")
+            P.warn(
+                "SecRecorder is native on macOS — start it with TLS: "
+                f"cd work/secrecorder && HOST=0.0.0.0 PORT={SECRECORDER_PORT} uv run uvicorn "
+                f"server:app --host 0.0.0.0 --port {SECRECORDER_PORT} "
+                f"--ssl-certfile {certfile} --ssl-keyfile {keyfile}"
+            )
+            return
+        P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
+    P.warn(f"SecRecorder is native on macOS — start it with: {run_cmd}")
 
 
 def status(manifest: Manifest, root: Path) -> None:

@@ -111,7 +111,17 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path) -> list[tuple[list
     return steps
 
 
-def deploy(manifest: Manifest, work: Path, root: Path, dry_run: bool = False) -> None:
+def deploy(
+    manifest: Manifest,
+    work: Path,
+    root: Path,
+    dry_run: bool = False,
+    tls: bool = False,
+    configure_hosts: bool = False,
+) -> None:
+    if tls or configure_hosts:
+        P.warn("--tls/--configure-hosts are macOS-only (fedora-fips gets TLS via secrouter.env's "
+               "FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
     steps = _deploy_steps(manifest, work, root)
     if dry_run:
         print(f"# fedora-fips deploy plan — suite {manifest.suite} (run as root on the Fedora host)")

@@ -30,6 +30,28 @@ SecRecorder (optional, native):
 HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh     # http://127.0.0.1:47003
 ```
 
+### SecRecorder over TLS (SecCert-issued cert)
+
+`deploy macos --tls` gets SecRecorder a real cert from SecCert via `certbot` (installed via
+brew if missing) and prints the TLS run command. HTTP-01 validation crosses the container/host
+boundary through `host.docker.internal` — SecCert (in its container) reaches back to a
+`certbot`-managed responder on the Mac itself via that name; `compose.yaml`'s
+`SECCERT_HTTP01_PORT=47080` matches the unprivileged port `certbot --standalone` binds to.
+
+```bash
+uv run secdeploy deploy macos --tls --configure-hosts
+# --configure-hosts maps host.docker.internal -> 127.0.0.1 in /etc/hosts (sudo, one-time)
+# so host-side clients can use the same hostname the cert was issued for; safe to omit on repeat runs.
+```
+
+Cert + key land under `out/certbot/config/live/secrecorder/`; the printed command starts
+uvicorn directly with `--ssl-certfile`/`--ssl-keyfile` (bypassing `run.sh`, which has no TLS
+flags). Verify with the exported root as the trust anchor:
+
+```bash
+curl --cacert out/seccert-root.pem https://host.docker.internal:47003/health
+```
+
 ## Verify
 
 ```bash

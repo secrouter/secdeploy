@@ -112,7 +112,10 @@ def cmd_bundle(args) -> int:
 def cmd_deploy(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
-    mod.deploy(m, Path(args.work), root=_root(args), dry_run=args.dry_run)
+    mod.deploy(
+        m, Path(args.work), root=_root(args), dry_run=args.dry_run,
+        tls=args.tls, configure_hosts=args.configure_hosts,
+    )
     return 0
 
 
@@ -138,6 +141,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(fn=globals()[f"cmd_{name}"])
     sub.choices["deploy"].add_argument(
         "--dry-run", action="store_true", help="print the steps without executing them"
+    )
+    sub.choices["deploy"].add_argument(
+        "--tls", action="store_true",
+        help="macOS only: issue SecRecorder a SecCert cert via certbot and print its TLS run command",
+    )
+    sub.choices["deploy"].add_argument(
+        "--configure-hosts", action="store_true",
+        help="macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo), "
+             "so host-side clients can use the --tls cert's hostname",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

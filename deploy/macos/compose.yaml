@@ -13,6 +13,9 @@ services:
       SECCERT_PORT: "47001"
       SECCERT_EXTERNAL_URL: http://localhost:47001
       SECCERT_ADMIN_TOKEN: ${SECCERT_ADMIN_TOKEN:-dev-admin-token}
+      # HTTP-01 validation target: certbot's standalone responder runs on the host
+      # (unprivileged port), reached from this container via host.docker.internal.
+      SECCERT_HTTP01_PORT: "47080"
     volumes:
       - seccert-data:/var/lib/seccert
     ports:
