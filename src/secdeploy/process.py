@@ -30,6 +30,21 @@ def which(name: str) -> str | None:
     return _which(name)
 
 
+def confirm(prompt: str, assume_yes: bool = False) -> bool:
+    """Ask before a step that needs sudo / touches shared system state (/etc/hosts, the
+    System keychain). `assume_yes` (CLI: -y/--yes) grants blanket consent up front for
+    unattended runs — it doesn't touch sudo's own password prompt, just this ask."""
+    if assume_yes:
+        log(f"{prompt} — proceeding (--yes)")
+        return True
+    try:
+        reply = input(f"{_YELLOW}?{_RESET} {prompt} [y/N] ").strip().lower()
+    except EOFError:
+        warn(f"{prompt} — no TTY to ask; declining (pass -y/--yes to skip this ask)")
+        return False
+    return reply in ("y", "yes")
+
+
 def run(
     cmd: list[str],
     cwd=None,

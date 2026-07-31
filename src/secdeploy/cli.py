@@ -115,6 +115,7 @@ def cmd_deploy(args) -> int:
     mod.deploy(
         m, Path(args.work), root=_root(args), dry_run=args.dry_run,
         tls=args.tls, configure_hosts=args.configure_hosts,
+        trust_ca=args.trust_ca, assume_yes=args.yes,
     )
     return 0
 
@@ -148,8 +149,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.choices["deploy"].add_argument(
         "--configure-hosts", action="store_true",
-        help="macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo), "
-             "so host-side clients can use the --tls cert's hostname",
+        help="macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo, asks "
+             "first — see -y/--yes), so host-side clients can use the --tls cert's hostname",
+    )
+    sub.choices["deploy"].add_argument(
+        "--trust-ca", action="store_true",
+        help="macOS only: trust the SecCert root in the System keychain (sudo, asks first — "
+             "see -y/--yes), so browsers/curl stop flagging SecRecorder's cert as untrusted",
+    )
+    sub.choices["deploy"].add_argument(
+        "-y", "--yes", action="store_true",
+        help="grant blanket consent up front for --configure-hosts/--trust-ca's confirmation "
+             "prompts (still runs sudo, which prompts for your password separately)",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

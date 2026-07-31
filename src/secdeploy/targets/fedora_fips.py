@@ -118,10 +118,12 @@ def deploy(
     dry_run: bool = False,
     tls: bool = False,
     configure_hosts: bool = False,
+    trust_ca: bool = False,
+    assume_yes: bool = False,
 ) -> None:
-    if tls or configure_hosts:
-        P.warn("--tls/--configure-hosts are macOS-only (fedora-fips gets TLS via secrouter.env's "
-               "FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
+    if tls or configure_hosts or trust_ca:
+        P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
+               "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
     steps = _deploy_steps(manifest, work, root)
     if dry_run:
         print(f"# fedora-fips deploy plan — suite {manifest.suite} (run as root on the Fedora host)")

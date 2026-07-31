@@ -7,6 +7,7 @@ comes up first as the internal CA; its root is exported so hosts/clients can tru
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .. import process as P
@@ -22,7 +23,8 @@ PLAN = [
     "Bring up SecRouter via Compose",
     "Ensure ffmpeg is installed (SecRecorder transcoding — installs via brew if missing)",
     "(--tls) Issue SecRecorder a SecCert cert via certbot — HTTP-01 through host.docker.internal",
-    "(--configure-hosts) Map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo)",
+    "(--configure-hosts) Map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo, asks first)",
+    "(--trust-ca) Trust the SecCert root in the System keychain (sudo, asks first)",
     "Prepare SecRecorder to run natively via uv (MLX/Metal — not containerized on macOS)",
 ]
 
@@ -84,7 +86,7 @@ def _ensure_certbot() -> None:
         P.warn("certbot not found and brew is unavailable — install certbot manually for --tls")
 
 
-def _configure_hosts() -> None:
+def _configure_hosts(assume_yes: bool = False) -> None:
     """Map host.docker.internal to loopback on the Mac itself, so host-side clients (curl,
     browsers) can reach SecRecorder using the same hostname its SecCert cert was issued for —
     Docker/Colima only define that name inside containers, not on the host."""
@@ -92,8 +94,47 @@ def _configure_hosts() -> None:
     if CERT_HOST in hosts.read_text():
         P.log(f"/etc/hosts already maps {CERT_HOST}")
         return
-    P.log(f"adding '127.0.0.1 {CERT_HOST}' to /etc/hosts (sudo — you may be prompted)")
+    if not P.confirm(f"Add '127.0.0.1 {CERT_HOST}' to /etc/hosts?", assume_yes):
+        P.warn("skipped /etc/hosts — host-side clients can't use the --tls cert's hostname")
+        return
     P.run(["sudo", "sh", "-c", f"echo '127.0.0.1 {CERT_HOST}' >> /etc/hosts"])
+
+
+def _ca_already_trusted(root_pem: Path) -> bool:
+    import subprocess
+
+    subj = subprocess.run(
+        ["openssl", "x509", "-in", str(root_pem), "-noout", "-subject"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    m = re.search(r"CN\s*=\s*([^,/\n]+)", subj)
+    if not m:
+        return False
+    cn = m.group(1).strip()
+    return subprocess.run(
+        ["security", "find-certificate", "-c", cn, "/Library/Keychains/System.keychain"],
+        capture_output=True, check=False,
+    ).returncode == 0
+
+
+def _trust_ca_root(root: Path, assume_yes: bool = False) -> None:
+    """Add the SecCert root to the macOS System keychain as a trusted root, so browsers/curl
+    stop flagging SecRecorder's SecCert-issued cert as untrusted. Same command docs/macos.md
+    already documents for manual use — this just runs it for you, with consent."""
+    root_pem = root / "out/seccert-root.pem"
+    if not root_pem.exists():
+        P.warn(f"{root_pem} not found — deploy SecCert first (root export happens during deploy)")
+        return
+    if _ca_already_trusted(root_pem):
+        P.log("SecCert root already trusted in the System keychain")
+        return
+    if not P.confirm(f"Trust the SecCert root ({root_pem}) in the System keychain?", assume_yes):
+        P.warn("skipped CA trust — browsers/clients will flag SecRecorder's cert as untrusted")
+        return
+    P.run([
+        "sudo", "security", "add-trusted-cert", "-d", "-r", "trustRoot",
+        "-k", "/Library/Keychains/System.keychain", str(root_pem),
+    ])
 
 
 def _issue_secrecorder_cert(root: Path) -> tuple[Path, Path] | None:
@@ -151,6 +192,8 @@ def deploy(
     dry_run: bool = False,
     tls: bool = False,
     configure_hosts: bool = False,
+    trust_ca: bool = False,
+    assume_yes: bool = False,
 ) -> None:
     compose = _compose(root)
     dc = ["docker", "compose"] if dry_run else _compose_cmd()
@@ -174,7 +217,9 @@ def deploy(
     run_cmd = f"HOST=0.0.0.0 PORT={SECRECORDER_PORT} work/secrecorder/run.sh"
     if dry_run:
         if configure_hosts:
-            print(f"  · (--configure-hosts) map {CERT_HOST} to 127.0.0.1 in /etc/hosts (sudo)")
+            print(f"  · (--configure-hosts) map {CERT_HOST} to 127.0.0.1 in /etc/hosts (sudo, asks first)")
+        if trust_ca:
+            print("  · (--trust-ca) trust the SecCert root in the System keychain (sudo, asks first)")
         if tls:
             print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, "
                   "then start SecRecorder with --ssl-certfile/--ssl-keyfile")
@@ -182,9 +227,12 @@ def deploy(
             print(f"  · SecRecorder: run natively → {run_cmd}")
         return
 
+    if configure_hosts:
+        _configure_hosts(assume_yes)
+    if trust_ca:
+        _trust_ca_root(root, assume_yes)
+
     if tls:
-        if configure_hosts:
-            _configure_hosts()
         cert = _issue_secrecorder_cert(root)
         if cert:
             certfile, keyfile = cert
