@@ -25,6 +25,8 @@ PLAN = [
     "(--tls) Issue SecRecorder a SecCert cert via certbot — HTTP-01 through host.docker.internal",
     "(--configure-hosts) Map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo, asks first)",
     "(--trust-ca) Trust the SecCert root in the System keychain (sudo, asks first)",
+    "Layer HF_TOKEN (deploy/macos/secrets.env or --hf-token) and --model-dir (air-gapped "
+    "local models) onto SecRecorder's printed run command, if set",
     "Prepare SecRecorder to run natively via uv (MLX/Metal — not containerized on macOS)",
 ]
 
@@ -137,7 +139,47 @@ def _trust_ca_root(root: Path, assume_yes: bool = False) -> None:
     ])
 
 
-def _tls_run_cmd(certfile: Path, keyfile: Path) -> str:
+def _read_hf_token(root: Path) -> str | None:
+    """HF_TOKEN for the gated diarizer model, from deploy/macos/secrets.env (gitignored —
+    copy from secrets.env.example and fill in). A --hf-token flag overrides this."""
+    secrets = root / "deploy/macos/secrets.env"
+    if not secrets.exists():
+        return None
+    for line in secrets.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("HF_TOKEN=") and line[len("HF_TOKEN="):]:
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def _model_env(root: Path, hf_token: str | None, model_dir: str | None) -> dict[str, str]:
+    """Extra env vars layered onto the SecRecorder run command: HF_TOKEN (diarizer gated-model
+    auth) and, for air-gapped hosts, WHISPER_MODEL/WHISPER_DIARIZE_MODEL pointed at manually
+    pre-downloaded local model directories instead of Hugging Face repo IDs — see --model-dir
+    in docs/macos.md for the expected layout and how to populate one on a connected host."""
+    env: dict[str, str] = {}
+    token = hf_token or _read_hf_token(root)
+    if token:
+        env["HF_TOKEN"] = token
+    if model_dir:
+        md = Path(model_dir)
+        whisper_dir, diarizer_dir = md / "whisper", md / "diarizer"
+        if whisper_dir.is_dir():
+            env["WHISPER_MODEL"] = str(whisper_dir)
+        else:
+            P.warn(f"--model-dir given but {whisper_dir} not found — Whisper will use its default (network) model ID")
+        if diarizer_dir.is_dir():
+            env["WHISPER_DIARIZE_MODEL"] = str(diarizer_dir)
+        else:
+            P.warn(f"--model-dir given but {diarizer_dir} not found — diarizer will use its default (network) model ID")
+    return env
+
+
+def _env_prefix(env: dict[str, str]) -> str:
+    return "".join(f"{k}={v} " for k, v in env.items())
+
+
+def _tls_run_cmd(certfile: Path, keyfile: Path, extra_env: dict[str, str] | None = None) -> str:
     """The command to start SecRecorder with TLS. Bypasses run.sh (no --ssl-* flags there),
     so its prewarm defaults (WHISPER_PREWARM/WHISPER_PREWARM_DIARIZER=1) are set explicitly
     here too — otherwise the model loads lazily on the first real request instead of at
@@ -146,6 +188,7 @@ def _tls_run_cmd(certfile: Path, keyfile: Path) -> str:
     return (
         f"cd work/secrecorder && HOST=0.0.0.0 PORT={SECRECORDER_PORT} "
         "WHISPER_PREWARM=1 WHISPER_PREWARM_DIARIZER=1 "
+        f"{_env_prefix(extra_env or {})}"
         f"uv run uvicorn server:app --host 0.0.0.0 --port {SECRECORDER_PORT} "
         f"--ssl-certfile {certfile} --ssl-keyfile {keyfile}"
     )
@@ -208,6 +251,8 @@ def deploy(
     configure_hosts: bool = False,
     trust_ca: bool = False,
     assume_yes: bool = False,
+    hf_token: str | None = None,
+    model_dir: str | None = None,
 ) -> None:
     compose = _compose(root)
     dc = ["docker", "compose"] if dry_run else _compose_cmd()
@@ -228,7 +273,8 @@ def deploy(
             continue
         P.run(cmd, env={**_os_environ(), **env})
 
-    run_cmd = f"HOST=0.0.0.0 PORT={SECRECORDER_PORT} work/secrecorder/run.sh"
+    model_env = _model_env(root, hf_token, model_dir)
+    run_cmd = f"{_env_prefix(model_env)}HOST=0.0.0.0 PORT={SECRECORDER_PORT} work/secrecorder/run.sh"
     if dry_run:
         if configure_hosts:
             print(f"  · (--configure-hosts) map {CERT_HOST} to 127.0.0.1 in /etc/hosts (sudo, asks first)")
@@ -237,7 +283,7 @@ def deploy(
         if tls:
             live = root / "out/certbot/config/live/secrecorder"
             print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, then: "
-                  f"{_tls_run_cmd(live / 'fullchain.pem', live / 'privkey.pem')}")
+                  f"{_tls_run_cmd(live / 'fullchain.pem', live / 'privkey.pem', model_env)}")
         else:
             print(f"  · SecRecorder: run natively → {run_cmd}")
         return
@@ -252,7 +298,7 @@ def deploy(
         if cert:
             certfile, keyfile = cert
             P.log(f"SecRecorder cert ready (SecCert-issued): {certfile}")
-            P.warn(f"SecRecorder is native on macOS — start it with TLS: {_tls_run_cmd(certfile, keyfile)}")
+            P.warn(f"SecRecorder is native on macOS — start it with TLS: {_tls_run_cmd(certfile, keyfile, model_env)}")
             return
         P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
     P.warn(f"SecRecorder is native on macOS — start it with: {run_cmd}")

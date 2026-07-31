@@ -59,6 +59,45 @@ at a time, so everything queues behind it). Verify with the exported root as the
 curl --cacert out/seccert-root.pem https://host.docker.internal:47003/health
 ```
 
+### Diarization (Hugging Face token)
+
+Speaker diarization uses a gated model (`pyannote/speaker-diarization-community-1`) — without
+a token, transcription still works but the UI shows a "diarization skipped" pill. Set it up
+once:
+
+```bash
+cp deploy/macos/secrets.env.example deploy/macos/secrets.env
+# accept https://huggingface.co/pyannote/speaker-diarization-community-1, create a read token
+# at https://huggingface.co/settings/tokens, then fill in HF_TOKEN in secrets.env
+```
+
+`deploy macos --tls` (and the plain-HTTP path) read `deploy/macos/secrets.env` automatically
+and fold `HF_TOKEN` into the printed run command; `--hf-token TOKEN` overrides it for a one-off
+run. `secrets.env` is gitignored (`*.env`) — never commit a real token.
+
+### Air-gapped: manually pre-placed models
+
+For a host with no path to Hugging Face at all, pre-download both models on a connected
+machine and copy the directory over, instead of relying on `secdeploy deploy macos` fetching
+them at runtime:
+
+```bash
+# connected host
+uv run --project work/secrecorder hf download \
+  mlx-community/whisper-large-v3-turbo --local-dir /path/to/models/whisper
+uv run --project work/secrecorder hf download \
+  pyannote/speaker-diarization-community-1 --local-dir /path/to/models/diarizer --token hf_...
+
+# copy /path/to/models to the air-gapped host, then:
+uv run secdeploy deploy macos --tls --model-dir /path/to/models
+```
+
+`--model-dir <dir>` sets `WHISPER_MODEL=<dir>/whisper` and `WHISPER_DIARIZE_MODEL=<dir>/diarizer`
+in the printed run command in place of the Hugging Face repo IDs — both libraries load
+straight from a local directory with no network call, so no `HF_TOKEN` is needed once the
+diarizer model is already in place. Either subdirectory can be present independently; a
+missing one just falls back to that model's default (network) ID with a warning.
+
 ## Verify
 
 ```bash

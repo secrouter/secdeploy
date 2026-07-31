@@ -116,6 +116,7 @@ def cmd_deploy(args) -> int:
         m, Path(args.work), root=_root(args), dry_run=args.dry_run,
         tls=args.tls, configure_hosts=args.configure_hosts,
         trust_ca=args.trust_ca, assume_yes=args.yes,
+        hf_token=args.hf_token, model_dir=args.model_dir,
     )
     return 0
 
@@ -161,6 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
         "-y", "--yes", action="store_true",
         help="grant blanket consent up front for --configure-hosts/--trust-ca's confirmation "
              "prompts (still runs sudo, which prompts for your password separately)",
+    )
+    sub.choices["deploy"].add_argument(
+        "--hf-token",
+        help="macOS only: Hugging Face token for the gated diarizer model, for SecRecorder's "
+             "printed run command. Overrides deploy/macos/secrets.env if both are set.",
+    )
+    sub.choices["deploy"].add_argument(
+        "--model-dir",
+        help="macOS only, for air-gapped hosts: a local directory with pre-downloaded model "
+             "snapshots at <dir>/whisper and <dir>/diarizer, used in place of Hugging Face "
+             "repo IDs in SecRecorder's printed run command — see docs/macos.md",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

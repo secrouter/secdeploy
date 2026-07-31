@@ -120,7 +120,12 @@ def deploy(
     configure_hosts: bool = False,
     trust_ca: bool = False,
     assume_yes: bool = False,
+    hf_token: str | None = None,
+    model_dir: str | None = None,
 ) -> None:
+    if hf_token or model_dir:
+        P.warn("--hf-token/--model-dir are macOS-only — on fedora-fips, set HF_TOKEN/"
+               "WHISPER_MODEL/WHISPER_DIARIZE_MODEL directly in /etc/secsuite/secrecorder.env")
     if tls or configure_hosts or trust_ca:
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
                "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
