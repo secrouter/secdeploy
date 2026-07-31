@@ -16,7 +16,7 @@ def test_load_shipped_manifest():
     assert m.suite == "1.0.0"
     assert set(m.components) == {"seccert", "secrouter", "secrecorder"}
     assert m.components["seccert"].ref == "v1.0.0"
-    assert m.components["secrecorder"].ref == "v0.8.1"
+    assert m.components["secrecorder"].ref == "v0.8.2"
     assert m.components["secrouter"].url == "https://github.com/secrouter/secrouter.git"
     assert set(m.targets) == {"macos", "fedora-fips"}
     assert m.target("fedora-fips").kind == "systemd-native"
@@ -29,7 +29,7 @@ def test_roundtrip_serialization(tmp_path):
     reloaded = Manifest.load(out)
     assert reloaded.suite == m.suite
     assert list(reloaded.components) == list(m.components)
-    assert reloaded.components["secrecorder"].ref == "v0.8.1"
+    assert reloaded.components["secrecorder"].ref == "v0.8.2"
     assert list(reloaded.targets) == list(m.targets)
 
 

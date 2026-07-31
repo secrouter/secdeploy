@@ -20,7 +20,7 @@ role = "governed AI gateway"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
-ref = "v0.8.1"
+ref = "v0.8.2"
 runtime = "python>=3.11"
 role = "transcription (optional; native/MLX on macOS, faster-whisper on Fedora)"
 
