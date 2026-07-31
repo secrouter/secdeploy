@@ -49,7 +49,11 @@ uv run secdeploy deploy macos --tls --configure-hosts --trust-ca
 
 Cert + key land under `out/certbot/config/live/secrecorder/`; the printed command starts
 uvicorn directly with `--ssl-certfile`/`--ssl-keyfile` (bypassing `run.sh`, which has no TLS
-flags). Verify with the exported root as the trust anchor:
+flags) and also sets `WHISPER_PREWARM=1`/`WHISPER_PREWARM_DIARIZER=1` explicitly — those are
+`run.sh`'s defaults too, but bypassing it means they're not applied for free. Without prewarm,
+the model loads lazily on the first real request instead of at startup, which can look like a
+hang if that first load hits a slow/stalled model download (SecRecorder only handles one job
+at a time, so everything queues behind it). Verify with the exported root as the trust anchor:
 
 ```bash
 curl --cacert out/seccert-root.pem https://host.docker.internal:47003/health

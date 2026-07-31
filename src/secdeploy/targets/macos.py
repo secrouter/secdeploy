@@ -137,6 +137,20 @@ def _trust_ca_root(root: Path, assume_yes: bool = False) -> None:
     ])
 
 
+def _tls_run_cmd(certfile: Path, keyfile: Path) -> str:
+    """The command to start SecRecorder with TLS. Bypasses run.sh (no --ssl-* flags there),
+    so its prewarm defaults (WHISPER_PREWARM/WHISPER_PREWARM_DIARIZER=1) are set explicitly
+    here too — otherwise the model loads lazily on the first real request instead of at
+    startup, which can stall a request behind a slow/cold model download (max_concurrency=1
+    means everything queues behind it)."""
+    return (
+        f"cd work/secrecorder && HOST=0.0.0.0 PORT={SECRECORDER_PORT} "
+        "WHISPER_PREWARM=1 WHISPER_PREWARM_DIARIZER=1 "
+        f"uv run uvicorn server:app --host 0.0.0.0 --port {SECRECORDER_PORT} "
+        f"--ssl-certfile {certfile} --ssl-keyfile {keyfile}"
+    )
+
+
 def _issue_secrecorder_cert(root: Path) -> tuple[Path, Path] | None:
     """Get SecRecorder an ACME cert from SecCert via certbot standalone. HTTP-01 crosses the
     container/host boundary through host.docker.internal (see module docstring). Idempotent —
@@ -221,8 +235,9 @@ def deploy(
         if trust_ca:
             print("  · (--trust-ca) trust the SecCert root in the System keychain (sudo, asks first)")
         if tls:
-            print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, "
-                  "then start SecRecorder with --ssl-certfile/--ssl-keyfile")
+            live = root / "out/certbot/config/live/secrecorder"
+            print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, then: "
+                  f"{_tls_run_cmd(live / 'fullchain.pem', live / 'privkey.pem')}")
         else:
             print(f"  · SecRecorder: run natively → {run_cmd}")
         return
@@ -237,12 +252,7 @@ def deploy(
         if cert:
             certfile, keyfile = cert
             P.log(f"SecRecorder cert ready (SecCert-issued): {certfile}")
-            P.warn(
-                "SecRecorder is native on macOS — start it with TLS: "
-                f"cd work/secrecorder && HOST=0.0.0.0 PORT={SECRECORDER_PORT} uv run uvicorn "
-                f"server:app --host 0.0.0.0 --port {SECRECORDER_PORT} "
-                f"--ssl-certfile {certfile} --ssl-keyfile {keyfile}"
-            )
+            P.warn(f"SecRecorder is native on macOS — start it with TLS: {_tls_run_cmd(certfile, keyfile)}")
             return
         P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
     P.warn(f"SecRecorder is native on macOS — start it with: {run_cmd}")
