@@ -20,7 +20,7 @@ role = "governed AI gateway"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
-ref = "b76cb4af16509e3cffb4e2982c92e8eb51167d55"  # main, post-v0.7.0: live transcription MVP (untagged)
+ref = "v0.8.0"
 runtime = "python>=3.11"
 role = "transcription (optional; native/MLX on macOS, faster-whisper on Fedora)"
 
