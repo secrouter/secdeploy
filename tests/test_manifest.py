@@ -9,12 +9,12 @@ import pytest
 from secdeploy.manifest import Manifest
 
 ROOT = Path(__file__).resolve().parents[1]
-ALL = {"seccert", "secsso", "secllm", "secrouter", "secagent", "secchat", "secrecorder"}
+ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "secchat", "secrecorder"}
 
 
 def test_load_shipped_manifest():
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.suite == "1.1.0"
+    assert m.suite == "1.2.0"
     assert ALL <= set(m.components)
     assert m.components["secrecorder"].ref == "v0.8.2"
     assert m.components["secagent"].ref == "v0.1.0"
@@ -26,8 +26,9 @@ def test_kinds_and_optional_flags():
     assert m.components["secsso"].kind == "stack"
     assert m.components["secchat"].kind == "stack"
     assert m.components["secrouter"].kind == "service"
-    assert m.optionals() == ["seccert", "secsso"]
+    assert m.optionals() == ["seccert", "secsso", "secdns"]
     assert m.components["seccert"].optional and m.components["secsso"].optional
+    assert m.components["secdns"].optional and m.components["secdns"].kind == "service"
     assert not m.components["secrouter"].optional
 
 
@@ -57,6 +58,8 @@ def test_tiers_and_ports():
     assert m.components["secllm"].tier == "inference"
     assert m.components["seccert"].tier == "identity"
     assert m.components["seccert"].port == 47001
+    assert m.components["secdns"].tier == "identity"
+    assert m.components["secdns"].port == 53
     assert m.components["secchat"].tier == "collab"
     # every component is tiered
     assert all(c.tier for c in m.components.values())

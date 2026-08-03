@@ -12,6 +12,7 @@ stack up on each supported target — from a single command, air-gap friendly.
 |---|---|---|---|
 | [SecCert](https://github.com/secrouter/seccert) | Internal ACME CA (comes up first) | service | *optional* |
 | [SecSSO](https://github.com/secrouter/secsso) | Single sign-on (Authentik) | stack | *optional* |
+| [SecDns](https://github.com/secrouter/secdns) | Internal DNS (resolves `*.internal`) | service | *optional* |
 | [SecLLM](https://github.com/secrouter/secllm) | Local inference (vLLM control plane) | service | GPU |
 | [SecRouter](https://github.com/secrouter/secrouter) | Governed AI gateway | service | |
 | [SecAgent](https://github.com/secrouter/secagent) | Agentic harness (pi) | service | |
@@ -25,11 +26,11 @@ projects (Authentik, Mattermost).
 
 ### Optional infrastructure
 
-SecCert and SecSSO are the "start-from-zero" identity & trust tier — provide them, or **drop
-them** when you already run a CA / IdP:
+SecCert, SecSSO, and SecDns are the "start-from-zero" identity & trust tier (CA / IdP / DNS) —
+provide them, or **drop** any you already run:
 
 ```bash
-secdeploy deploy fedora-fips --without seccert,secsso
+secdeploy deploy fedora-fips --without seccert,secsso,secdns
 ```
 
 `--without` works on `plan` / `fetch` / `build` / `bundle` / `deploy`; only optional components

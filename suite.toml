@@ -9,8 +9,8 @@
 # optional: droppable with `secdeploy deploy <target> --without <name>` when you already
 #           run that infrastructure (e.g. an existing CA or IdP).
 
-suite = "1.1.0"
-released = "2026-07-31"
+suite = "1.2.0"
+released = "2026-08-03"
 description = "SecRouter secure-AI suite"
 
 # ── Identity & trust (optional infra) ──
@@ -32,6 +32,16 @@ tier = "identity"
 port = 9000
 optional = true
 role = "single sign-on (Authentik) — drop it when you have Okta/Entra/Keycloak"
+
+[components.secdns]
+repo = "secrouter/secdns"
+ref = "v0.1.0"
+kind = "service"
+tier = "identity"
+port = 53
+optional = true
+runtime = "python>=3.11"
+role = "internal DNS — resolves the suite's *.internal names (drop it when you run your own DNS)"
 
 # ── Inference ──
 [components.secllm]

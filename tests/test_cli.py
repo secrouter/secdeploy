@@ -15,8 +15,8 @@ MANIFEST = str(ROOT / "suite.toml")
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
-    assert "suite 1.1.0" in out
-    assert "optional: seccert, secsso" in out
+    assert "suite 1.2.0" in out
+    assert "optional: seccert, secsso, secdns" in out
     assert "target assets present" in out
 
 
