@@ -142,6 +142,11 @@ above.
 - **`deploy <target> --configure-resolver`** points this host's resolver at secdns for the
   internal domain (macOS `/etc/resolver/<domain>`, Fedora systemd-resolved) — the multi-host
   replacement for the `--configure-hosts` `/etc/hosts` trick. It asks before touching the host.
+- **Stack components** (SecSSO/SecChat) are brought up on the host where they're placed via
+  their own `bootstrap/<name>.sh up`. The first deploy writes their `.env` from `.env.example`
+  for you to fill in secrets; once set, the bootstrap does the compose up + suite wiring.
 
-Still being wired on top of this model: bringing up the stack components (SecSSO/SecChat) on
-their host — see [roadmap.md](roadmap.md).
+> Note: `secdns` and the stack components only deploy when a topology is active. To stand up
+> the *full* suite on a single machine, generate a single-host `topology.toml` (via `secdeploy
+> configure`) rather than running a bare `deploy` (which brings up the built-from-source core
+> only). Remaining polish is tracked in [roadmap.md](roadmap.md).

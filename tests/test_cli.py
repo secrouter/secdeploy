@@ -206,6 +206,22 @@ def test_deploy_macos_configure_resolver_remote(tmp_path, capsys):
     assert "10.0.0.5" in out  # points at the secdns host's address
 
 
+def test_deploy_fedora_topology_brings_up_stacks(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # core holds identity (secsso) + collab (secchat)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "stack secsso" in out and "stack secchat" in out
+    assert "bootstrap/secsso.sh up" in out
+
+
+def test_deploy_fedora_single_host_no_stacks(capsys):
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "stack secsso" not in out and "stack secchat" not in out
+
+
 def test_deploy_ssh_requires_endpoint(tmp_path):
     tp = tmp_path / "topology.toml"
     tp.write_text(GPU_SPLIT)  # no ssh endpoints

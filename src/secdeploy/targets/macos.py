@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from . import common
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
@@ -334,6 +335,13 @@ def deploy(
             _configure_resolver(topology.domain, dns_ip, assume_yes)
         elif not dry_run:
             P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
+
+    # Stack components (SecSSO / SecChat) — brought up via their own bootstrap where placed.
+    if topology is not None:
+        stacks = sorted(n for n in placed
+                        if manifest.components[n].kind == "stack" and n not in without)
+        if stacks:
+            common.deploy_stacks(work, stacks, dry_run=dry_run)
 
     # SecRecorder runs natively on macOS — only when it's placed on this resource.
     if not _here("secrecorder"):

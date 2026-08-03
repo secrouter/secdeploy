@@ -21,6 +21,7 @@ from __future__ import annotations
 import platform
 from pathlib import Path
 
+from . import common
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
@@ -170,6 +171,9 @@ def deploy(
         return placed is None or svc in placed
 
     services = [s for s in SERVICES if _include(s)]
+    stacks = sorted(n for n in (placed or set())
+                    if manifest.components[n].kind == "stack" and n not in without) \
+        if topology is not None else []
     addr_dir = (Path(out) / "addressing") if (topology is not None and out is not None) else None
     steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir)
 
@@ -196,6 +200,8 @@ def deploy(
                   f"`bundle fedora-fips --resource {resource}`)")
         for cmd, desc in steps:
             print(f"  · {desc}\n      {' '.join(cmd)}")
+        if stacks:
+            common.deploy_stacks(work, stacks, dry_run=True)
         return
     if platform.system() != "Linux":
         P.die(f"fedora-fips deploy must run on the Fedora host (this is {platform.system()}). "
@@ -204,9 +210,8 @@ def deploy(
 
     if os.geteuid() != 0:
         P.die("fedora-fips deploy must run as root (systemd unit + trust-store install)")
-    from .common import require_checkouts
 
-    require_checkouts(manifest, work, include=set(services))
+    common.require_checkouts(manifest, work, include=set(services) | set(stacks))
     if addr_dir is not None:
         wiring.write_addressing(topology, addr_dir, resource, without)
         if "secdns" in services:
@@ -215,6 +220,8 @@ def deploy(
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)
+    if stacks:
+        common.deploy_stacks(work, stacks, dry_run=False)
     P.log("suite deployed — check `secdeploy status fedora-fips`")
 
 

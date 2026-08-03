@@ -43,14 +43,13 @@ custom), and `deploy --ssh` pushes each resource's bundle to its `ssh` endpoint 
 remotely. When a topology places it, **`secdns` now stands up as a service** — a hardened
 Fedora systemd unit (binding :53 via `CAP_NET_BIND_SERVICE`) or a native macOS run — fed by the
 generated zone + env, and `deploy --configure-resolver` points a host's resolver at it (macOS
-`/etc/resolver/<domain>`, Fedora systemd-resolved). Single-host behavior is unchanged (secdns
-only deploys with a topology).
+`/etc/resolver/<domain>`, Fedora systemd-resolved). **Stack components** (SecSSO/SecChat) are
+brought up via their own `bootstrap` where placed — the first deploy writes their `.env` from
+the example for you to fill in secrets, then the bootstrap does the compose up + wiring.
+Single-host behavior is unchanged (secdns + stacks only deploy with a topology).
 
 Still to do, building on that:
 
-- **Stack-component execution** — bring up `secsso`/`secchat` via their own `compose` /
-  `bootstrap` on the host where they're placed (they're fetched, bundled, and droppable today,
-  but a target's `deploy` still brings up the built-from-source services only).
 - **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect
   the selected component set + placement (the *components* section already honors `--without`).
 

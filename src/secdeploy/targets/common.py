@@ -1,11 +1,44 @@
-"""Shared target helpers — fetching pinned component checkouts."""
+"""Shared target helpers — fetching pinned component checkouts + bringing up stacks."""
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from .. import process as P
 from ..manifest import Manifest
+
+
+def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
+    """Bring up ``stack`` components via each checkout's ``bootstrap/<name>.sh up``.
+
+    Stack components (SecSSO/SecChat) carry their own Compose topology + a bootstrap script.
+    Their ``.env`` holds operator secrets, so the first deploy writes it from ``.env.example``
+    and stops — you set the secrets, then re-run (or run the bootstrap yourself). Once the
+    ``.env`` exists we invoke the bootstrap, which does the compose up + wiring.
+    """
+    for name in stacks:
+        proj = work / name
+        boot = proj / "bootstrap" / f"{name}.sh"
+        env, example = proj / ".env", proj / ".env.example"
+        if dry_run:
+            print(f"  · stack {name}: ensure {proj}/.env (from .env.example if absent), "
+                  f"then bootstrap/{name}.sh up")
+            continue
+        if not boot.exists():
+            P.warn(f"stack {name}: no bootstrap/{name}.sh in {proj} — skipping")
+            continue
+        if not env.exists():
+            if example.exists():
+                shutil.copy(example, env)
+                P.warn(f"stack {name}: wrote {env} from .env.example — set its secrets, "
+                       f"then bring it up:  bash {boot} up")
+            else:
+                P.warn(f"stack {name}: no .env / .env.example in {proj} — configure it, "
+                       f"then run:  bash {boot} up")
+            continue
+        P.log(f"stack {name}: bringing up via bootstrap/{name}.sh up")
+        P.run(["bash", str(boot), "up"], check=False)
 
 
 def fetch(
