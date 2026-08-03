@@ -186,6 +186,26 @@ resource = "mac"
     assert "secdns: run natively" in out
 
 
+def test_deploy_fedora_configure_resolver_local(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # secdns (identity) on core
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--configure-resolver", "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "systemd-resolved" in out
+    assert "127.0.0.1" in out  # secdns is local on core → loopback
+
+
+def test_deploy_macos_configure_resolver_remote(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # secdns on core (10.0.0.5); gpu is a macos resource
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--configure-resolver", "--topology", str(tp), "--resource", "gpu"]) == 0
+    out = capsys.readouterr().out
+    assert "/etc/resolver/sec.internal" in out
+    assert "10.0.0.5" in out  # points at the secdns host's address
+
+
 def test_deploy_ssh_requires_endpoint(tmp_path):
     tp = tmp_path / "topology.toml"
     tp.write_text(GPU_SPLIT)  # no ssh endpoints

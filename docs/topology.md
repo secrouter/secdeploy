@@ -139,6 +139,9 @@ above.
   it to that resource's `ssh` endpoint, and deploys it remotely. `--dry-run` prints the runbook.
 - **`secdns` is stood up** on the host where the `identity` tier lands (Fedora systemd unit /
   macOS native), fed by the generated zone + env — so the internal names actually resolve.
+- **`deploy <target> --configure-resolver`** points this host's resolver at secdns for the
+  internal domain (macOS `/etc/resolver/<domain>`, Fedora systemd-resolved) — the multi-host
+  replacement for the `--configure-hosts` `/etc/hosts` trick. It asks before touching the host.
 
-Still being wired on top of this model: pointing each host's resolver at `secdns`, and bringing
-up the stack components (SecSSO/SecChat) on their host — see [roadmap.md](roadmap.md).
+Still being wired on top of this model: bringing up the stack components (SecSSO/SecChat) on
+their host — see [roadmap.md](roadmap.md).

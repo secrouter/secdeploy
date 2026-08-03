@@ -192,7 +192,7 @@ def cmd_deploy(args) -> int:
         tls=args.tls, configure_hosts=args.configure_hosts,
         trust_ca=args.trust_ca, assume_yes=args.yes,
         hf_token=args.hf_token, model_dir=args.model_dir,
-        without=without,
+        without=without, configure_resolver=args.configure_resolver,
         topology=topo if from_file else None, resource=resource, out=Path(args.out),
     )
     return 0
@@ -278,6 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ssh", action="store_true",
         help="control-host mode: build each resource's bundle, rsync it to that resource's ssh "
              "endpoint, and deploy remotely (needs ssh endpoints in topology.toml)",
+    )
+    sub.choices["deploy"].add_argument(
+        "--configure-resolver", action="store_true", dest="configure_resolver",
+        help="point this host's resolver at secdns for the internal domain (macOS /etc/resolver, "
+             "Fedora systemd-resolved) — asks first; the multi-host replacement for --configure-hosts",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

@@ -22,6 +22,7 @@ import platform
 from pathlib import Path
 
 from .. import process as P
+from .. import wiring
 from ..manifest import Manifest
 
 NAME = "fedora-fips"
@@ -145,6 +146,7 @@ def deploy(
     hf_token: str | None = None,
     model_dir: str | None = None,
     without: list[str] | None = None,
+    configure_resolver: bool = False,
     topology=None,
     resource: str | None = None,
     out: Path | None = None,
@@ -171,6 +173,20 @@ def deploy(
     addr_dir = (Path(out) / "addressing") if (topology is not None and out is not None) else None
     steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir)
 
+    # Optional: point this host's resolver at secdns for the internal domain.
+    if configure_resolver and topology is not None:
+        dns_ip = wiring.secdns_address_for(topology, resource, without)
+        if dns_ip:
+            drop = "/etc/systemd/resolved.conf.d/secsuite.conf"
+            steps.append((
+                ["bash", "-c",
+                 "mkdir -p /etc/systemd/resolved.conf.d && "
+                 f"printf '[Resolve]\\nDNS={dns_ip}\\nDomains=~{topology.domain}\\n' > {drop} && "
+                 "systemctl restart systemd-resolved"],
+                f"point resolver: {topology.domain} → secdns {dns_ip} (systemd-resolved)"))
+        else:
+            P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
+
     if dry_run:
         print(f"# fedora-fips deploy plan — suite {manifest.suite} (run as root on the Fedora host)")
         if topology is not None:
@@ -192,8 +208,6 @@ def deploy(
 
     require_checkouts(manifest, work, include=set(services))
     if addr_dir is not None:
-        from .. import wiring
-
         wiring.write_addressing(topology, addr_dir, resource, without)
         if "secdns" in services:
             (addr_dir / "secdns.env").write_text(wiring.secdns_env_text(topology, str(SECDNS_ZONE)))

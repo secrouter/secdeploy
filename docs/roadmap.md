@@ -42,12 +42,12 @@ configure` writes a validated `topology.toml` interactively (presets: single-hos
 custom), and `deploy --ssh` pushes each resource's bundle to its `ssh` endpoint and deploys it
 remotely. When a topology places it, **`secdns` now stands up as a service** — a hardened
 Fedora systemd unit (binding :53 via `CAP_NET_BIND_SERVICE`) or a native macOS run — fed by the
-generated zone + env. Single-host behavior is unchanged (secdns only deploys with a topology).
+generated zone + env, and `deploy --configure-resolver` points a host's resolver at it (macOS
+`/etc/resolver/<domain>`, Fedora systemd-resolved). Single-host behavior is unchanged (secdns
+only deploys with a topology).
 
 Still to do, building on that:
 
-- **Resolver wiring** — point each host's resolver at `secdns` for the internal domain (macOS
-  `/etc/resolver/<domain>`, Fedora systemd-resolved), retiring the `--configure-hosts` hack.
 - **Stack-component execution** — bring up `secsso`/`secchat` via their own `compose` /
   `bootstrap` on the host where they're placed (they're fetched, bundled, and droppable today,
   but a target's `deploy` still brings up the built-from-source services only).

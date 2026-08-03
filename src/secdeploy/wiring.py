@@ -87,6 +87,19 @@ def env_text(topology: Topology, component: str, without: list[str] | None = Non
     return "\n".join(lines) + "\n"
 
 
+def secdns_address_for(topology: Topology, resource: str,
+                       without: list[str] | None = None) -> str | None:
+    """The address ``resource`` should point its resolver at to reach secdns.
+
+    Loopback when secdns runs on this same resource, otherwise the secdns host's address;
+    ``None`` when secdns isn't deployed in this topology at all.
+    """
+    dns_res = topology.placement(without).get("secdns")
+    if dns_res is None:
+        return None
+    return "127.0.0.1" if dns_res == resource else topology.resources[dns_res].address
+
+
 def secdns_env_text(topology: Topology, zone_path: str) -> str:
     """Render the ``secdns`` service env (domain / upstream / zone) from the topology."""
     return (

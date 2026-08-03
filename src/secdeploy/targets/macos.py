@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from .. import process as P
+from .. import wiring
 from ..manifest import Manifest
 
 NAME = "macos"
@@ -100,6 +101,19 @@ def _configure_hosts(assume_yes: bool = False) -> None:
         P.warn("skipped /etc/hosts — host-side clients can't use the --tls cert's hostname")
         return
     P.run(["sudo", "sh", "-c", f"echo '127.0.0.1 {CERT_HOST}' >> /etc/hosts"])
+
+
+def _configure_resolver(domain: str, dns_ip: str, assume_yes: bool = False) -> None:
+    """Point macOS at secdns for ``domain`` via /etc/resolver/<domain> — the multi-host
+    replacement for the /etc/hosts ``host.docker.internal`` trick. macOS routes queries for a
+    domain to the nameserver named in that file."""
+    path = f"/etc/resolver/{domain}"
+    if not P.confirm(f"Point {domain} at secdns ({dns_ip}) via {path}?", assume_yes):
+        P.warn(f"skipped resolver config — {domain} names won't resolve via secdns on this host")
+        return
+    P.run(["sudo", "mkdir", "-p", "/etc/resolver"])
+    P.run(["sudo", "sh", "-c", f"printf 'nameserver {dns_ip}\\n' > {path}"])
+    P.log(f"{domain} → secdns {dns_ip} ({path})")
 
 
 def _ca_already_trusted(root_pem: Path) -> bool:
@@ -256,6 +270,7 @@ def deploy(
     hf_token: str | None = None,
     model_dir: str | None = None,
     without: list[str] | None = None,
+    configure_resolver: bool = False,
     topology=None,
     resource: str | None = None,
     out: Path | None = None,
@@ -285,8 +300,6 @@ def deploy(
         steps.append((dc + ["-f", str(compose), "up", "-d", "secrouter"], "start SecRouter"))
     P.log(f"deploy {NAME} — suite {manifest.suite} (SECSUITE_VERSION passed to compose)")
     if topology is not None and not dry_run and out is not None:
-        from .. import wiring
-
         written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     if dry_run and topology is not None:
@@ -310,6 +323,17 @@ def deploy(
             print(f"  · secdns: run natively on :53 → {secdns_cmd}")
         else:
             P.warn(f"secdns runs natively on macOS — start it (needs :53) with: {secdns_cmd}")
+
+    # Optional: point this host's resolver at secdns for the internal domain.
+    if configure_resolver and topology is not None:
+        dns_ip = wiring.secdns_address_for(topology, resource, without)
+        if dns_ip and dry_run:
+            print(f"  · (--configure-resolver) point {topology.domain} at secdns {dns_ip} "
+                  f"via /etc/resolver/{topology.domain} (sudo, asks first)")
+        elif dns_ip:
+            _configure_resolver(topology.domain, dns_ip, assume_yes)
+        elif not dry_run:
+            P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
 
     # SecRecorder runs natively on macOS — only when it's placed on this resource.
     if not _here("secrecorder"):
