@@ -32,15 +32,18 @@ ETC = Path("/etc/secsuite")
 VAR = Path("/var/lib/secsuite")
 UNITS = Path("/etc/systemd/system")
 ANCHORS = Path("/etc/pki/ca-trust/source/anchors")
-SERVICES = ("seccert", "secrouter", "secrecorder")
+# Native systemd services, in start order. secdns (internal DNS) comes up first when a
+# topology places it here; it is only deployed with a topology (it needs a generated zone).
+SERVICES = ("secdns", "seccert", "secrouter", "secrecorder")
+SECDNS_ZONE = VAR / "secdns" / "secdns.zone"  # where the secdns service reads its zone
 
 PLAN = [
     "Preflight: verify the host is in FIPS mode + the OpenSSL FIPS provider is active (fail closed)",
     "Create dedicated system users and /opt, /etc, /var state dirs (owner-only)",
-    "Build natively from pinned checkouts (npm build SecRouter; uv sync SecCert + SecRecorder)",
-    "Install code to /opt/secsuite and env files to /etc/secsuite",
+    "Build natively from pinned checkouts (npm build SecRouter; uv sync SecCert/SecRecorder/secdns)",
+    "Install code to /opt/secsuite + env files to /etc/secsuite (+ generated secdns zone/env when placed)",
     "Install hardened systemd units + secsuite.target; daemon-reload",
-    "Enable + start secsuite.target (SecCert first, then SecRouter, then SecRecorder)",
+    "Enable + start secsuite.target (secdns + SecCert first, then SecRouter, then SecRecorder)",
     "Add the SecCert root to the host trust store (update-ca-trust)",
     "Verify service health",
 ]
@@ -62,8 +65,8 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
             P.run(["npm", "run", "build", "--prefix", str(sr)])
         else:
             P.warn("npm not found — SecRouter must be built on the Fedora host (node>=24)")
-    # SecCert + SecRecorder — uv venvs
-    for name in ("seccert", "secrecorder"):
+    # SecCert + SecRecorder + secdns — uv venvs
+    for name in ("seccert", "secrecorder", "secdns"):
         if name in without:
             continue
         proj = work / name
@@ -71,14 +74,11 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
             P.run(["uv", "sync", "--project", str(proj)])
         else:
             P.warn(f"uv not found or {name} missing pyproject — build on the Fedora host")
-    P.log("native build complete (SecRouter dist + SecCert/SecRecorder venvs)")
+    P.log("native build complete (SecRouter dist + SecCert/SecRecorder/secdns venvs)")
 
 
 def _deploy_steps(manifest: Manifest, work: Path, root: Path,
-                  without: list[str] | None = None,
-                  placed: set[str] | None = None) -> list[tuple[list[str], str]]:
-    services = [s for s in SERVICES
-                if s not in (without or []) and (placed is None or s in placed)]
+                  services: list[str], addr_dir: Path | None = None) -> list[tuple[list[str], str]]:
     preflight = root / "deploy/fedora-fips/fips-preflight.sh"
     unit_dir = root / "deploy/fedora-fips/systemd"
     steps: list[tuple[list[str], str]] = [
@@ -100,11 +100,20 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
     for svc in services:
         steps.append((["bash", "-c", f"rm -rf {OPT}/{svc} && cp -a {work}/{svc} {OPT}/{svc}"],
                       f"install {svc} code → {OPT}/{svc}"))
-    # env files (don't clobber existing)
+    # env files from examples (don't clobber) — secdns instead gets a generated env below
     for svc in services:
+        if svc == "secdns":
+            continue
         ex = root / f"deploy/fedora-fips/{svc}.env.example"
         steps.append((["bash", "-c", f"test -f {ETC}/{svc}.env || install -m 640 {ex} {ETC}/{svc}.env"],
                       f"config {ETC}/{svc}.env (from example if absent)"))
+    # secdns — install the topology-generated zone (readable by the service user) + env
+    if "secdns" in services and addr_dir is not None:
+        steps.append((["install", "-m", "644", "-o", "secsuite-secdns", "-g", "secsuite-secdns",
+                       str(addr_dir / "secdns.zone"), str(SECDNS_ZONE)],
+                      f"install generated secdns zone → {SECDNS_ZONE}"))
+        steps.append((["install", "-m", "640", str(addr_dir / "secdns.env"), f"{ETC}/secdns.env"],
+                      "install generated secdns env (domain/upstream/zone)"))
     # units — only the selected services, plus the suite target
     for svc in services:
         steps.append((["install", "-m", "644", str(unit_dir / f"{svc}.service"), f"{UNITS}/"],
@@ -146,16 +155,29 @@ def deploy(
     if tls or configure_hosts or trust_ca:
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
                "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
-    # Topology placement: restrict this host's services to the components placed on `resource`.
+    without = without or []
+    # Placement: which native services run on THIS resource. secdns is only deployed with a
+    # topology (it needs a generated zone); single-host (no topology) is byte-identical.
     placed = set(topology.components_on(resource, without)) if topology is not None else None
-    steps = _deploy_steps(manifest, work, root, without=without, placed=placed)
+
+    def _include(svc: str) -> bool:
+        if svc in without:
+            return False
+        if svc == "secdns" and topology is None:
+            return False
+        return placed is None or svc in placed
+
+    services = [s for s in SERVICES if _include(s)]
+    addr_dir = (Path(out) / "addressing") if (topology is not None and out is not None) else None
+    steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir)
+
     if dry_run:
         print(f"# fedora-fips deploy plan — suite {manifest.suite} (run as root on the Fedora host)")
         if topology is not None:
-            here = ", ".join(sorted(s for s in SERVICES if placed is None or s in placed)) or "(none)"
             print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
-                  f"native services here: {here}")
-            print(f"# addressing: writes secdns.zone + env/ (also via `bundle fedora-fips --resource {resource}`)")
+                  f"native services here: {', '.join(services) or '(none)'}")
+            print("# addressing: writes secdns zone/env + peer env/ (also via "
+                  f"`bundle fedora-fips --resource {resource}`)")
         for cmd, desc in steps:
             print(f"  · {desc}\n      {' '.join(cmd)}")
         return
@@ -168,14 +190,14 @@ def deploy(
         P.die("fedora-fips deploy must run as root (systemd unit + trust-store install)")
     from .common import require_checkouts
 
-    services = [s for s in SERVICES
-                if s not in (without or []) and (placed is None or s in placed)]
     require_checkouts(manifest, work, include=set(services))
-    if topology is not None and out is not None:
+    if addr_dir is not None:
         from .. import wiring
 
-        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
-        P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
+        wiring.write_addressing(topology, addr_dir, resource, without)
+        if "secdns" in services:
+            (addr_dir / "secdns.env").write_text(wiring.secdns_env_text(topology, str(SECDNS_ZONE)))
+        P.log(f"addressing artifacts written → {addr_dir}")
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)

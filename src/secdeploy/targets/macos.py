@@ -299,6 +299,18 @@ def deploy(
             continue
         P.run(cmd, env={**_os_environ(), **env})
 
+    # secdns runs natively on macOS (like SecRecorder), fed by the generated zone — only when
+    # a topology places it here (single-host has no topology, so this is skipped).
+    if topology is not None and _here("secdns"):
+        zone = (Path(out) / "addressing/secdns.zone") if out else Path("out/addressing/secdns.zone")
+        secdns_cmd = (f"sudo SECDNS_DOMAIN={topology.domain} SECDNS_ZONE={zone} "
+                      f"SECDNS_UPSTREAM={','.join(topology.upstream_dns)} "
+                      f"uv run --project work/secdns secdns serve")
+        if dry_run:
+            print(f"  · secdns: run natively on :53 → {secdns_cmd}")
+        else:
+            P.warn(f"secdns runs natively on macOS — start it (needs :53) with: {secdns_cmd}")
+
     # SecRecorder runs natively on macOS — only when it's placed on this resource.
     if not _here("secrecorder"):
         if dry_run:

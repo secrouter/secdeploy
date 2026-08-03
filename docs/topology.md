@@ -137,7 +137,8 @@ above.
   the target when unambiguous; pass `--resource` otherwise.
 - **`secdeploy deploy <target> --ssh`** (control host) builds each resource's bundle, `rsync`s
   it to that resource's `ssh` endpoint, and deploys it remotely. `--dry-run` prints the runbook.
+- **`secdns` is stood up** on the host where the `identity` tier lands (Fedora systemd unit /
+  macOS native), fed by the generated zone + env — so the internal names actually resolve.
 
-Still being wired on top of this model: standing up `secdns` itself as a service, pointing each
-host's resolver at it, and bringing up the stack components (SecSSO/SecChat) on their host — see
-[roadmap.md](roadmap.md).
+Still being wired on top of this model: pointing each host's resolver at `secdns`, and bringing
+up the stack components (SecSSO/SecChat) on their host — see [roadmap.md](roadmap.md).

@@ -53,6 +53,7 @@ def _expected_assets(root: Path, target: str) -> list[Path]:
         return [
             d / "fips-preflight.sh",
             d / "systemd/secsuite.target",
+            d / "systemd/secdns.service",
             d / "systemd/seccert.service",
             d / "systemd/secrouter.service",
             d / "systemd/secrecorder.service",

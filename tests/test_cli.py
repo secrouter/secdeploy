@@ -144,6 +144,48 @@ def test_deploy_ssh_dry_run_runbook(tmp_path, capsys):
     assert "--resource core" in out and "--resource gpu" in out
 
 
+def test_deploy_fedora_topology_stands_up_secdns(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # core (fedora-fips) holds the identity tier → secdns
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "secdns.service" in out
+    assert "generated secdns zone" in out
+    assert "secsuite-secdns" in out
+
+
+def test_deploy_fedora_single_host_excludes_secdns(capsys):
+    # no topology → single-host → secdns is NOT stood up (byte-identical to before)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "secdns.service" not in out
+    assert "seccert.service" in out
+
+
+def test_deploy_macos_topology_secdns_native(tmp_path, capsys):
+    topo = """
+domain = "sec.internal"
+[resources.mac]
+target = "macos"
+address = "127.0.0.1"
+[groups.identity]
+resource = "mac"
+[groups.inference]
+resource = "mac"
+[groups.gateway]
+resource = "mac"
+[groups.collab]
+resource = "mac"
+"""
+    tp = tmp_path / "t.toml"
+    tp.write_text(topo)
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--topology", str(tp), "--resource", "mac"]) == 0
+    out = capsys.readouterr().out
+    assert "secdns: run natively" in out
+
+
 def test_deploy_ssh_requires_endpoint(tmp_path):
     tp = tmp_path / "topology.toml"
     tp.write_text(GPU_SPLIT)  # no ssh endpoints

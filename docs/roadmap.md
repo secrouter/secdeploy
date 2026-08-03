@@ -40,13 +40,14 @@ topology-aware: each target now brings up only the components *placed on the cur
 generate the addressing artifacts (the `secdns` zone + per-component peer-env). `secdeploy
 configure` writes a validated `topology.toml` interactively (presets: single-host, GPU-split,
 custom), and `deploy --ssh` pushes each resource's bundle to its `ssh` endpoint and deploys it
-remotely. Single-host behavior is unchanged.
+remotely. When a topology places it, **`secdns` now stands up as a service** — a hardened
+Fedora systemd unit (binding :53 via `CAP_NET_BIND_SERVICE`) or a native macOS run — fed by the
+generated zone + env. Single-host behavior is unchanged (secdns only deploys with a topology).
 
 Still to do, building on that:
 
-- **Stand up `secdns` + resolver wiring** — deploy `secdns` as a service on its host (Fedora
-  systemd unit / macOS native) fed by the generated zone, and point each host's resolver at it
-  (macOS `/etc/resolver/<domain>`, Fedora systemd-resolved) — retiring `--configure-hosts`.
+- **Resolver wiring** — point each host's resolver at `secdns` for the internal domain (macOS
+  `/etc/resolver/<domain>`, Fedora systemd-resolved), retiring the `--configure-hosts` hack.
 - **Stack-component execution** — bring up `secsso`/`secchat` via their own `compose` /
   `bootstrap` on the host where they're placed (they're fetched, bundled, and droppable today,
   but a target's `deploy` still brings up the built-from-source services only).
