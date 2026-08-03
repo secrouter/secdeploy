@@ -19,6 +19,7 @@ import argparse
 from pathlib import Path
 
 from . import process as P
+from . import wiring
 from .manifest import Manifest
 from .targets import common, fedora_fips, macos
 
@@ -104,17 +105,35 @@ def cmd_plan(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
     t = m.target(args.target)
-    selected = m.select(_without(args))
+    without = _without(args)
+    topo, from_file = wiring.active_topology(m, args.topology, args.target)
     print(f"suite {m.suite}  →  target {t.name} ({t.kind})")
     print(f"  {t.description}\n")
-    print("  components (pinned):")
+
+    if from_file:
+        resource = wiring.resource_for(topo, args.target, args.resource)
+        print(f"  topology {args.topology} — this deploy targets resource "
+              f"{resource!r} ({topo.resources[resource].address})\n")
+        print("  placement:")
+        for rname, r in topo.resources.items():
+            marker = "→" if rname == resource else " "
+            comps = ", ".join(topo.components_on(rname, without)) or "(none)"
+            print(f"   {marker} {rname:<10} {r.target:<12} {r.address:<15} {comps}")
+        selected = topo.components_on(resource, without)
+        print(f"\n  components on {resource!r} (pinned):")
+    else:
+        selected = m.select(without)
+        print("  topology: none — single-host mode (every component on this host)\n")
+        print("  components (pinned):")
+
     for c in selected.values():
         tags = [x for x in ("stack" if c.kind == "stack" else "", "optional" if c.optional else "") if x]
         suffix = f"  ({', '.join(tags)})" if tags else ""
         print(f"    - {c.name} @ {c.ref}   [{c.runtime or c.kind}]   {c.role}{suffix}")
-    dropped = [n for n in m.components if n not in selected]
-    if dropped:
-        print(f"  dropped (--without): {', '.join(dropped)}")
+    elsewhere = [n for n in m.components if n not in selected]
+    if elsewhere:
+        label = "not on this resource / dropped" if from_file else "dropped (--without)"
+        print(f"  {label}: {', '.join(elsewhere)}")
     print("\n  steps:")
     for i, step in enumerate(mod.PLAN, 1):
         print(f"    {i}. {step}")
@@ -142,7 +161,8 @@ def cmd_bundle(args) -> int:
 
     m = Manifest.load(args.manifest)
     bundle.build_bundle(m, args.target, Path(args.work), Path(args.out),
-                        root=_root(args), without=_without(args))
+                        root=_root(args), without=_without(args),
+                        topology_path=args.topology, resource=args.resource)
     return 0
 
 
@@ -181,6 +201,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--topology", default="topology.toml",
                         help="site placement file (optional; single-host mode if absent)")
 
+    def _resource_arg(sp):
+        sp.add_argument("--resource",
+                        help="topology resource this action targets (default: auto-detect by target)")
+
     vp = sub.add_parser("verify", help="validate manifest + target assets")
     _topology_arg(vp)
     vp.set_defaults(fn=cmd_verify)
@@ -191,6 +215,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(fn=globals()[f"cmd_{name}"])
         if name != "status":
             _without_arg(sp)
+        if name in ("plan", "build", "deploy"):
+            _topology_arg(sp)
+            _resource_arg(sp)
     sub.choices["deploy"].add_argument(
         "--dry-run", action="store_true", help="print the steps without executing them"
     )
@@ -233,6 +260,8 @@ def build_parser() -> argparse.ArgumentParser:
     bp = sub.add_parser("bundle", help="produce an air-gapped release bundle")
     bp.add_argument("target", help="deploy target")
     _without_arg(bp)
+    _topology_arg(bp)
+    _resource_arg(bp)
     bp.set_defaults(fn=cmd_bundle)
 
     return p

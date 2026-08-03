@@ -11,6 +11,26 @@ from secdeploy.cli import main
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = str(ROOT / "suite.toml")
 
+GPU_SPLIT = """
+domain = "sec.internal"
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+[resources.gpu]
+target = "macos"
+address = "10.0.0.6"
+capabilities = ["gpu"]
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.inference]
+resource = "gpu"
+"""
+
 
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
@@ -51,6 +71,36 @@ def test_deploy_without_seccert_skips_it(capsys):
     assert "seccert.service" not in out
     assert "SecCert root" not in out  # trust-anchor step skipped
     assert "secrouter.service" in out
+
+
+def test_plan_with_topology_shows_placement(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)
+    assert main(["--manifest", MANIFEST, "plan", "fedora-fips", "--topology", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "resource 'core'" in out and "placement:" in out
+    # secllm lives on the gpu resource → not on this (core) host
+    assert "secllm" in out
+    assert "not on this resource" in out
+
+
+def test_bundle_per_resource(tmp_path):
+    work = tmp_path / "work"
+    (work / "secllm").mkdir(parents=True)  # only the placed component needs a checkout
+    out = tmp_path / "out"
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)
+    rc = main(["--manifest", MANIFEST, "--work", str(work), "--out", str(out),
+               "bundle", "macos", "--topology", str(tp), "--resource", "gpu"])
+    assert rc == 0
+    import tarfile
+
+    tarball = out / "secsuite-1.2.0-macos-gpu.tar.gz"
+    assert tarball.exists()
+    names = tarfile.open(tarball).getnames()
+    assert any(n.endswith("addressing/secdns.zone") for n in names)
+    assert any("/work/secllm" in n for n in names)
+    assert not any("/work/secrouter" in n for n in names)  # secrouter is on 'core', not here
 
 
 def test_without_required_component_errors():

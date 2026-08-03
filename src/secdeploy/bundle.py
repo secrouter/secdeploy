@@ -8,12 +8,15 @@ SecDeploy CLI itself into one ``.tar.gz`` you can carry into the enclave and ``d
 from __future__ import annotations
 
 import hashlib
+import shutil
 import tarfile
 from pathlib import Path
 
 from . import process as P
+from . import wiring
 from .manifest import Manifest
 from .targets import common
+from .topology import Topology
 
 
 def _sha256(path: Path) -> str:
@@ -24,35 +27,51 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _bundle_info(manifest: Manifest, target: str, components, shas: dict[str, str]) -> str:
+def _bundle_info(manifest: Manifest, target: str, components, shas: dict[str, str],
+                 resource: str | None = None) -> str:
     lines = [
         f"suite:    {manifest.suite}",
         f"released: {manifest.released}",
         f"target:   {target}",
-        "components:",
     ]
+    if resource:
+        lines.append(f"resource: {resource}   (per-resource bundle — addressing/ carries the zone + peer env)")
+    lines.append("components:")
     for name, c in components.items():
         sha = shas.get(name, "?")
         lines.append(f"  - {name} {c.ref} ({sha[:12]}) {c.repo}")
+    deploy_cmd = f"uv run secdeploy deploy {target}" + (f" --resource {resource}" if resource else "")
     lines += [
         "",
         "install:",
         "  1. verify:  sha256sum -c *.sha256",
         "  2. extract: tar xzf secsuite-*.tar.gz && cd secsuite-*",
-        f"  3. deploy:  uv run secdeploy deploy {target}   # (root, on the target host)",
+        f"  3. deploy:  {deploy_cmd}   # (root, on the target host)",
     ]
     return "\n".join(lines) + "\n"
 
 
 def build_bundle(manifest: Manifest, target: str, work: Path, out: Path, root: Path,
-                 without: list[str] | None = None) -> Path:
+                 without: list[str] | None = None, topology_path: str | Path | None = None,
+                 resource: str | None = None) -> Path:
     manifest.target(target)  # validates target exists
-    selected = manifest.select(without or [])
+    without = without or []
+    selected = manifest.select(without)
+
+    # Per-resource bundle: if a topology is present, restrict to the components placed on the
+    # chosen resource and carry that resource's addressing artifacts (zone + peer env).
+    topo: Topology | None = None
+    res: str | None = None
+    if topology_path and Path(topology_path).exists():
+        topo = Topology.load(topology_path, manifest)
+        res = wiring.resource_for(topo, target, resource)
+        selected = topo.components_on(res, without)
+
     common.require_checkouts(manifest, work, include=set(selected))
     shas = common.resolved_shas(manifest, work)
     out.mkdir(parents=True, exist_ok=True)
 
-    stem = f"secsuite-{manifest.suite}-{target}"
+    stem = f"secsuite-{manifest.suite}-{target}" + (f"-{res}" if res else "")
     tar_path = out / f"{stem}.tar.gz"
     arc = stem  # top-level dir inside the archive
 
@@ -75,12 +94,21 @@ def build_bundle(manifest: Manifest, target: str, work: Path, out: Path, root: P
         # macOS: include any saved image tarballs from `build`
         for img in sorted(out.glob("*.tar")):
             tar.add(img, arcname=f"{arc}/images/{img.name}")
+        # Addressing artifacts (topology-driven): the secdns zone + per-component peer env.
+        if topo is not None:
+            addr_dir = out / "_addr"
+            wiring.write_addressing(topo, addr_dir, res, without)
+            tar.add(addr_dir / "secdns.zone", arcname=f"{arc}/addressing/secdns.zone")
+            tar.add(addr_dir / "env", arcname=f"{arc}/addressing/env")
         # Bundle info
-        info = _bundle_info(manifest, target, selected, shas)
+        info = _bundle_info(manifest, target, selected, shas, res)
         info_path = out / "BUNDLE-INFO.txt"
         info_path.write_text(info)
         tar.add(info_path, arcname=f"{arc}/BUNDLE-INFO.txt")
         info_path.unlink()
+
+    if topo is not None:
+        shutil.rmtree(out / "_addr", ignore_errors=True)  # artifacts now live inside the tarball
 
     digest = _sha256(tar_path)
     sums = out / f"{stem}.tar.gz.sha256"
