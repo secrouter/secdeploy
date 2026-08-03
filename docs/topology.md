@@ -62,6 +62,25 @@ capabilities = ["fips", "gpu"]
   IP/name), optional `ssh` (`user@host`, enables remote push), and advisory `capabilities`.
 - **`[groups.<tier>]`** — `resource`, the host that tier runs on.
 
+### Generating it with the wizard
+
+`secdeploy configure` asks a few questions and writes a validated `topology.toml`:
+
+```bash
+secdeploy configure                          # writes ./topology.toml
+secdeploy configure --topology sites/prod.toml
+```
+
+Pick a layout preset:
+
+- **single-host** — one resource, every tier on it (equivalent to having no topology file).
+- **gpu-split** — a `core` host (identity + gateway + collaboration) plus a `gpu` host
+  (inference).
+- **custom** — define N resources, then place each tier yourself.
+
+The wizard validates before writing and won't clobber an existing file without confirmation.
+Run `secdeploy verify --topology <file>` afterwards to review the placement.
+
 ## Addressing — how components find each other
 
 From the topology SecDeploy derives, for every component: its FQDN, the DNS **zone**

@@ -101,6 +101,13 @@ def _verify_topology(args, m: Manifest) -> None:
         P.warn(w)
 
 
+def cmd_configure(args) -> int:
+    from . import configure
+
+    m = Manifest.load(args.manifest)
+    return 0 if configure.run(m, dest=args.topology) else 1
+
+
 def cmd_plan(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
@@ -212,6 +219,10 @@ def build_parser() -> argparse.ArgumentParser:
     vp = sub.add_parser("verify", help="validate manifest + target assets")
     _topology_arg(vp)
     vp.set_defaults(fn=cmd_verify)
+
+    cp = sub.add_parser("configure", help="interactively write a topology.toml (resources + placement)")
+    _topology_arg(cp)  # doubles as the destination path
+    cp.set_defaults(fn=cmd_configure)
 
     for name in ("plan", "build", "deploy", "status"):
         sp = sub.add_parser(name, help=f"{name} a target")

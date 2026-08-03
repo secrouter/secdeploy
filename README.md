@@ -50,7 +50,9 @@ GPU box and everything else on a core host — describe your hosts and which **t
 (identity / inference / gateway / collab) runs where in a `topology.toml`:
 
 ```bash
+secdeploy configure                         # wizard → writes topology.toml (presets: single-host / gpu-split / custom)
 secdeploy verify --topology topology.toml   # validate placement + print the host map
+secdeploy plan fedora-fips --resource core  # per-resource placement + steps
 ```
 
 SecDeploy derives each component's internal FQDN and peer URLs from that placement. See
@@ -101,7 +103,8 @@ sudo uv run secdeploy deploy fedora-fips
 
 | Command | Does |
 |---|---|
-| `verify` | Validate the manifest and that each target's assets exist |
+| `configure` | Interactive wizard → write a `topology.toml` (resources + tier placement) |
+| `verify` | Validate the manifest (+ topology, if present) and that each target's assets exist |
 | `plan <target>` | Show the pinned versions and the steps a deploy would run |
 | `fetch` | `git clone`/checkout each component at its pinned ref into `./work` |
 | `build <target>` | Build the target's artifacts (images on macOS; native builds on Fedora) |

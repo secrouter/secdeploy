@@ -34,10 +34,12 @@ The manifest lists all seven components with `kind` (service | stack), `optional
 it and reports placement, and the model derives per-component FQDNs, the DNS zone, and peer
 URLs (see [topology.md](topology.md)). Absent → single-host mode (unchanged behavior).
 
-**Landed — per-resource placement.** `plan` / `deploy` / `bundle` are topology-aware: each
-target now brings up only the components *placed on the current resource* (`deploy --resource`),
-`bundle --resource` emits a per-resource air-gap tarball, and both generate the addressing
-artifacts (the `secdns` zone + per-component peer-env). Single-host behavior is unchanged.
+**Landed — per-resource placement + the configure wizard.** `plan` / `deploy` / `bundle` are
+topology-aware: each target now brings up only the components *placed on the current resource*
+(`deploy --resource`), `bundle --resource` emits a per-resource air-gap tarball, and both
+generate the addressing artifacts (the `secdns` zone + per-component peer-env). `secdeploy
+configure` writes a validated `topology.toml` interactively (presets: single-host, GPU-split,
+custom). Single-host behavior is unchanged.
 
 Still to do, building on that:
 
@@ -49,8 +51,6 @@ Still to do, building on that:
   but a target's `deploy` still brings up the built-from-source services only).
 - **`deploy --ssh` push** — from a control host, rsync each resource's bundle and deploy it on
   resources that declare an `ssh` endpoint.
-- **`secdeploy configure`** — an interactive wizard that writes `topology.toml` (presets:
-  single-host, GPU-split, custom).
 - **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect
   the selected component set + placement (the *components* section already honors `--without`).
 
