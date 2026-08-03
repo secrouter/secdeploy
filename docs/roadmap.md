@@ -39,7 +39,8 @@ topology-aware: each target now brings up only the components *placed on the cur
 (`deploy --resource`), `bundle --resource` emits a per-resource air-gap tarball, and both
 generate the addressing artifacts (the `secdns` zone + per-component peer-env). `secdeploy
 configure` writes a validated `topology.toml` interactively (presets: single-host, GPU-split,
-custom). Single-host behavior is unchanged.
+custom), and `deploy --ssh` pushes each resource's bundle to its `ssh` endpoint and deploys it
+remotely. Single-host behavior is unchanged.
 
 Still to do, building on that:
 
@@ -49,8 +50,6 @@ Still to do, building on that:
 - **Stack-component execution** — bring up `secsso`/`secchat` via their own `compose` /
   `bootstrap` on the host where they're placed (they're fetched, bundled, and droppable today,
   but a target's `deploy` still brings up the built-from-source services only).
-- **`deploy --ssh` push** — from a control host, rsync each resource's bundle and deploy it on
-  resources that declare an `ssh` endpoint.
 - **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect
   the selected component set + placement (the *components* section already honors `--without`).
 

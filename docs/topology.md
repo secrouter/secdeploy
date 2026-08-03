@@ -135,7 +135,9 @@ above.
 - **`secdeploy deploy <target> [--resource R]`** brings up only the components placed on R and
   writes the addressing artifacts under `out/addressing/`. The resource is auto-detected from
   the target when unambiguous; pass `--resource` otherwise.
+- **`secdeploy deploy <target> --ssh`** (control host) builds each resource's bundle, `rsync`s
+  it to that resource's `ssh` endpoint, and deploys it remotely. `--dry-run` prints the runbook.
 
 Still being wired on top of this model: standing up `secdns` itself as a service, pointing each
-host's resolver at it, bringing up the stack components (SecSSO/SecChat) on their host, and
-`deploy --ssh` remote push — see [roadmap.md](roadmap.md).
+host's resolver at it, and bringing up the stack components (SecSSO/SecChat) on their host — see
+[roadmap.md](roadmap.md).

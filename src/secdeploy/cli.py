@@ -178,6 +178,13 @@ def cmd_deploy(args) -> int:
     mod = _target_mod(args.target)
     without = _without(args)
     topo, from_file = wiring.active_topology(m, args.topology, args.target)
+    if getattr(args, "ssh", False):
+        if not from_file:
+            P.die("--ssh needs a topology.toml defining resources with ssh endpoints")
+        from . import remote
+        remote.ssh_deploy(m, args.target, args.topology, topo, Path(args.work), Path(args.out),
+                          _root(args), without=without, dry_run=args.dry_run)
+        return 0
     resource = wiring.resource_for(topo, args.target, args.resource) if from_file else None
     mod.deploy(
         m, Path(args.work), root=_root(args), dry_run=args.dry_run,
@@ -265,6 +272,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="macOS only, for air-gapped hosts: a local directory with pre-downloaded model "
              "snapshots at <dir>/whisper and <dir>/diarizer, used in place of Hugging Face "
              "repo IDs in SecRecorder's printed run command — see docs/macos.md",
+    )
+    sub.choices["deploy"].add_argument(
+        "--ssh", action="store_true",
+        help="control-host mode: build each resource's bundle, rsync it to that resource's ssh "
+             "endpoint, and deploy remotely (needs ssh endpoints in topology.toml)",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

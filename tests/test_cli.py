@@ -124,6 +124,34 @@ def test_deploy_topology_fedora_core_gets_services(tmp_path, capsys):
     assert "seccert.service" in out and "secrouter.service" in out
 
 
+GPU_SPLIT_SSH = GPU_SPLIT.replace(
+    '[resources.core]\ntarget = "fedora-fips"\naddress = "10.0.0.5"',
+    '[resources.core]\ntarget = "fedora-fips"\naddress = "10.0.0.5"\nssh = "root@10.0.0.5"',
+).replace(
+    '[resources.gpu]\ntarget = "macos"\naddress = "10.0.0.6"',
+    '[resources.gpu]\ntarget = "fedora-fips"\naddress = "10.0.0.6"\nssh = "root@10.0.0.6"',
+)
+
+
+def test_deploy_ssh_dry_run_runbook(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT_SSH)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--ssh", "--dry-run",
+                 "--topology", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "root@10.0.0.5" in out and "root@10.0.0.6" in out
+    assert "rsync -az" in out
+    assert "--resource core" in out and "--resource gpu" in out
+
+
+def test_deploy_ssh_requires_endpoint(tmp_path):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # no ssh endpoints
+    with pytest.raises(SystemExit):
+        main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--ssh", "--dry-run",
+              "--topology", str(tp)])
+
+
 def test_without_required_component_errors():
     with pytest.raises(SystemExit):
         main(["--manifest", MANIFEST, "plan", "macos", "--without", "secrouter"])
