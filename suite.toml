@@ -3,6 +3,9 @@
 # suite version gives you exactly this combination on any target.
 #
 # kind:     "service" (built from pinned source) | "stack" (compose deploy of upstream)
+# tier:     placement tier — identity | inference | gateway | collab. The site topology
+#           (topology.toml) assigns each tier to a compute resource; see docs/topology.md.
+# port:     primary inbound port, used to build the component's peer URL for addressing.
 # optional: droppable with `secdeploy deploy <target> --without <name>` when you already
 #           run that infrastructure (e.g. an existing CA or IdP).
 
@@ -15,6 +18,8 @@ description = "SecRouter secure-AI suite"
 repo = "secrouter/seccert"
 ref = "v1.0.0"
 kind = "service"
+tier = "identity"
+port = 47001
 optional = true
 runtime = "python>=3.11"
 role = "internal ACME certificate authority (stands up first — issues the suite's certs)"
@@ -23,6 +28,8 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 repo = "secrouter/secsso"
 ref = "v1.0.0"
 kind = "stack"
+tier = "identity"
+port = 9000
 optional = true
 role = "single sign-on (Authentik) — drop it when you have Okta/Entra/Keycloak"
 
@@ -31,6 +38,8 @@ role = "single sign-on (Authentik) — drop it when you have Okta/Entra/Keycloak
 repo = "secrouter/secllm"
 ref = "v1.0.0"
 kind = "service"
+tier = "inference"
+port = 47004
 runtime = "python>=3.11 + NVIDIA GPU"
 role = "local inference — vLLM control plane (SecRouter routes to it)"
 
@@ -39,6 +48,8 @@ role = "local inference — vLLM control plane (SecRouter routes to it)"
 repo = "secrouter/secrouter"
 ref = "v1.0.0"
 kind = "service"
+tier = "gateway"
+port = 47002
 runtime = "node>=24"
 role = "governed AI gateway"
 
@@ -47,6 +58,8 @@ role = "governed AI gateway"
 repo = "secrouter/secagent"
 ref = "v0.1.0"
 kind = "service"
+tier = "collab"
+port = 47007
 runtime = "python>=3.11"
 role = "agentic harness (pi) — MR review, analysis, chat-ops"
 
@@ -54,12 +67,16 @@ role = "agentic harness (pi) — MR review, analysis, chat-ops"
 repo = "secrouter/secchat"
 ref = "v1.0.0"
 kind = "stack"
+tier = "collab"
+port = 8065
 role = "team chat + chat-ops (Mattermost) — bridges to SecAgent"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
 ref = "v0.8.2"
 kind = "service"
+tier = "collab"
+port = 47003
 runtime = "python>=3.11"
 role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
 

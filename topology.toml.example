@@ -1,0 +1,66 @@
+# SecDeploy site topology (example) — where each tier of the suite runs.
+#
+#   suite.toml   pins WHAT versions (the immutable bill of materials)
+#   topology.toml  places them on YOUR compute resources (this file)
+#
+# Copy to `topology.toml` and edit — or run `secdeploy configure` to generate one.
+# topology.toml is site-specific and gitignored (like your *.env files).
+#
+# If topology.toml is ABSENT, SecDeploy runs in single-host mode: every component is
+# placed on the machine you run `deploy` on. You only need this file for multi-host.
+#
+# Components belong to fixed TIERS (declared in suite.toml); you assign each tier to a
+# resource:
+#   identity   seccert, secsso, secdns   (trust / auth / naming — all optional infra)
+#   inference  secllm                    (wants a resource with the "gpu" capability)
+#   gateway    secrouter
+#   collab     secagent, secchat, secrecorder
+
+# Internal DNS zone the suite resolves under (served by secdns). Component FQDNs are
+# <component>.<domain>, e.g. secrouter.sec.internal.
+domain = "sec.internal"
+
+# Where secdns forwards NON-internal queries. Leave empty ([]) for a closed network.
+upstream_dns = ["1.1.1.1"]
+
+# ── Compute resources (hosts) ────────────────────────────────────────────────────────
+[resources.core]
+target = "fedora-fips"      # deploy mechanism: macos | fedora-fips
+address = "10.0.0.5"        # how peer hosts reach this one (IP or resolvable name)
+# ssh = "root@10.0.0.5"     # optional — set to enable `deploy --ssh` push to this host
+capabilities = ["fips"]     # gpu | fips | arch tags
+
+[resources.gpu]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+
+# ── Tier → resource assignments ──────────────────────────────────────────────────────
+# Multiple tiers may share one resource. Omit an all-optional tier (e.g. identity) to
+# skip that infrastructure. Every REQUIRED tier must be placed.
+[groups.identity]
+resource = "core"
+
+[groups.gateway]
+resource = "core"
+
+[groups.collab]
+resource = "core"
+
+[groups.inference]
+resource = "gpu"
+
+# ── Single-host variant ──────────────────────────────────────────────────────────────
+# For one machine, define a single resource and point every tier at it:
+#
+#   [resources.local]
+#   target = "macos"
+#   address = "127.0.0.1"
+#   capabilities = []
+#
+#   [groups.identity]   { resource = "local" }
+#   [groups.inference]  { resource = "local" }
+#   [groups.gateway]    { resource = "local" }
+#   [groups.collab]     { resource = "local" }
+#
+# …or just delete topology.toml — that is exactly what single-host mode does for you.

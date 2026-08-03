@@ -42,6 +42,20 @@ may be dropped (naming a required one is an error).
 - **`fedora-fips`** — FIPS-mode Fedora host (production): **native, hardened systemd services**
   linking the system OpenSSL FIPS provider directly, with a fail-closed FIPS preflight.
 
+## Placing the suite across hosts
+
+By default a deploy stands the whole suite up on one machine. To split it — say inference on a
+GPU box and everything else on a core host — describe your hosts and which **tier**
+(identity / inference / gateway / collab) runs where in a `topology.toml`:
+
+```bash
+secdeploy verify --topology topology.toml   # validate placement + print the host map
+```
+
+SecDeploy derives each component's internal FQDN and peer URLs from that placement. See
+[docs/topology.md](docs/topology.md) and [topology.toml.example](topology.toml.example); omit
+the file for single-host mode.
+
 ## Quickstart
 
 ```bash

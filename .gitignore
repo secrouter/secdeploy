@@ -19,6 +19,10 @@ SHA256SUMS
 *.env
 !*.env.example
 
+# site placement — operator-specific, like the env files (the .example is tracked)
+topology.toml
+!topology.toml.example
+
 # Sphinx
 docs/_build/
 

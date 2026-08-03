@@ -13,6 +13,9 @@ from pathlib import Path
 
 TARGET_KINDS = {"compose", "systemd-native", "image"}
 COMPONENT_KINDS = {"service", "stack"}
+# Placement tiers — a component belongs to exactly one; the site topology assigns each
+# tier to a compute resource (see topology.py).
+TIERS = {"identity", "inference", "gateway", "collab"}
 
 
 @dataclass
@@ -21,6 +24,8 @@ class Component:
     repo: str  # "org/name" on GitHub
     ref: str  # git tag/branch/sha to pin
     kind: str = "service"  # "service" (built from source) | "stack" (compose deploy of upstream)
+    tier: str = ""  # placement tier: identity | inference | gateway | collab
+    port: int = 0  # primary inbound port for peer addressing (0 = no inbound listener)
     optional: bool = False  # optional infra — droppable with `--without`
     runtime: str = ""
     role: str = ""
@@ -56,6 +61,8 @@ class Manifest:
                 repo=c["repo"],
                 ref=c["ref"],
                 kind=c.get("kind", "service"),
+                tier=c.get("tier", ""),
+                port=int(c.get("port", 0)),
                 optional=bool(c.get("optional", False)),
                 runtime=c.get("runtime", ""),
                 role=c.get("role", ""),
@@ -92,6 +99,12 @@ class Manifest:
                 errors.append(
                     f"component {c.name!r}: unknown kind {c.kind!r} (expected one of {sorted(COMPONENT_KINDS)})"
                 )
+            if c.tier not in TIERS:
+                errors.append(
+                    f"component {c.name!r}: tier must be one of {sorted(TIERS)}, got {c.tier!r}"
+                )
+            if c.port and not 0 < c.port < 65536:
+                errors.append(f"component {c.name!r}: port {c.port} out of range (1–65535)")
         for t in self.targets.values():
             if t.kind not in TARGET_KINDS:
                 errors.append(
@@ -142,7 +155,9 @@ class Manifest:
         ]
         for c in self.components.values():
             lines = [f"[components.{c.name}]", f'repo = "{c.repo}"', f'ref = "{c.ref}"',
-                     f'kind = "{c.kind}"']
+                     f'kind = "{c.kind}"', f'tier = "{c.tier}"']
+            if c.port:
+                lines.append(f"port = {c.port}")
             if c.optional:
                 lines.append("optional = true")
             if c.runtime:

@@ -26,19 +26,35 @@ root), set unique admin tokens/passphrases, and re-key TLS for the real hostname
 
 ## Suite orchestration
 
-The manifest now lists all seven components with `kind` (service | stack) + `optional`, and
-`--without` drops optional infra across `plan`/`fetch`/`build`/`bundle`/`deploy`. Still to do:
+The manifest lists all seven components with `kind` (service | stack), `optional`, and now a
+`tier` + `port`; `--without` drops optional infra across `plan`/`fetch`/`build`/`bundle`/`deploy`.
 
-- **Stack-component deploy execution** — `secsso`/`secchat` are `stack` components; wire the
-  targets to run their own `compose` / `bootstrap` (they're fetched and bundled today, and
-  droppable via `--without`, but a target's `deploy` still brings up the core services only).
+**Landed — site topology model.** A `topology.toml` places the predefined tiers
+(identity / inference / gateway / collab) onto compute resources; `secdeploy verify` validates
+it and reports placement, and the model derives per-component FQDNs, the DNS zone, and peer
+URLs (see [topology.md](topology.md)). Absent → single-host mode (unchanged behavior).
+
+Still to do, building on that model:
+
+- **Multi-resource deploy execution** — have each target deploy the components *placed on the
+  current resource* (via `deploy --resource`), generate the `secdns` zone, and point the host
+  resolver at it. This is also where **stack components** (`secsso`/`secchat`) finally come up
+  via their own `compose` / `bootstrap` — they're fetched, bundled, and droppable today, but a
+  target's `deploy` still brings up the core services only.
+- **Per-resource bundles + `--ssh` push** — `bundle` emits one air-gap bundle per resource;
+  `deploy --ssh` optionally pushes+deploys to resources that declare an `ssh` endpoint.
+- **`secdeploy configure`** — an interactive wizard that writes `topology.toml` (presets:
+  single-host, GPU-split, custom).
 - **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect
-  the selected component set (the *components* section already honors `--without`).
-- **SecLLM on the GPU path** — a target/overlay that places SecLLM on the NVIDIA host.
+  the selected component set + placement (the *components* section already honors `--without`).
 
 ## Other
 
-- **DNS-01 for SecCert** — wildcard + unreachable-host issuance in closed networks.
+- **`secdns` internal DNS** — a small from-scratch authoritative server that serves the zone
+  above and forwards non-internal queries upstream (its own repo; retires the `--configure-hosts`
+  `/etc/hosts` hack).
+- **DNS-01 for SecCert** — wildcard + unreachable-host issuance in closed networks (natural once
+  `secdns` is in place — SecCert sets `_acme-challenge` TXT records).
 - **`secdeploy release`** — one command to tag + pin components and cut a suite version.
 - **Signed bundles** — detached signatures on release tarballs for transfer integrity.
 - **Podman/Quadlet variant** — a containerized Fedora path for sites that prefer it over native.

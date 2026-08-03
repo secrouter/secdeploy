@@ -50,6 +50,18 @@ def test_select_rejects_unknown_component():
         m.select(["nope"])
 
 
+def test_tiers_and_ports():
+    m = Manifest.load(ROOT / "suite.toml")
+    assert m.components["secrouter"].tier == "gateway"
+    assert m.components["secrouter"].port == 47002
+    assert m.components["secllm"].tier == "inference"
+    assert m.components["seccert"].tier == "identity"
+    assert m.components["seccert"].port == 47001
+    assert m.components["secchat"].tier == "collab"
+    # every component is tiered
+    assert all(c.tier for c in m.components.values())
+
+
 def test_roundtrip_serialization(tmp_path):
     m = Manifest.load(ROOT / "suite.toml")
     out = tmp_path / "suite.toml"
@@ -60,25 +72,38 @@ def test_roundtrip_serialization(tmp_path):
     assert reloaded.components["secsso"].kind == "stack"
     assert reloaded.components["seccert"].optional
     assert reloaded.components["secrecorder"].ref == "v0.8.2"
+    assert reloaded.components["secrouter"].tier == "gateway"
+    assert reloaded.components["secrouter"].port == 47002
+    assert reloaded.components["seccert"].port == 47001
 
 
 def test_invalid_repo_and_ref_rejected(tmp_path):
     bad = tmp_path / "bad.toml"
-    bad.write_text('suite = "1"\n[components.x]\nrepo = "noslash"\nref = ""\n')
+    bad.write_text('suite = "1"\n[components.x]\nrepo = "noslash"\nref = ""\ntier = "gateway"\n')
     with pytest.raises(ValueError):
         Manifest.load(bad)
 
 
 def test_unknown_component_kind_rejected(tmp_path):
     bad = tmp_path / "bad.toml"
-    bad.write_text('suite = "1"\n[components.x]\nrepo = "a/b"\nref = "v1"\nkind = "weird"\n')
+    bad.write_text('suite = "1"\n[components.x]\nrepo = "a/b"\nref = "v1"\ntier = "gateway"\nkind = "weird"\n')
+    with pytest.raises(ValueError):
+        Manifest.load(bad)
+
+
+def test_unknown_tier_rejected(tmp_path):
+    bad = tmp_path / "bad.toml"
+    bad.write_text('suite = "1"\n[components.x]\nrepo = "a/b"\nref = "v1"\ntier = "weird"\n')
     with pytest.raises(ValueError):
         Manifest.load(bad)
 
 
 def test_unknown_target_kind_rejected(tmp_path):
     bad = tmp_path / "bad.toml"
-    bad.write_text('suite = "1"\n[components.x]\nrepo = "a/b"\nref = "v1"\n[targets.t]\nkind = "weird"\n')
+    bad.write_text(
+        'suite = "1"\n[components.x]\nrepo = "a/b"\nref = "v1"\ntier = "gateway"\n'
+        '[targets.t]\nkind = "weird"\n'
+    )
     with pytest.raises(ValueError):
         Manifest.load(bad)
 

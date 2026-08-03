@@ -78,7 +78,26 @@ def cmd_verify(args) -> int:
         P.warn("missing target assets:\n    - " + "\n    - ".join(missing))
         return 2
     print("✓ target assets present")
+    _verify_topology(args, m)
     return 0
+
+
+def _verify_topology(args, m: Manifest) -> None:
+    """Report the site topology when a topology.toml is present, else note single-host mode."""
+    from .topology import Topology
+
+    tpath = Path(args.topology)
+    if not tpath.exists():
+        print("  topology: none — single-host mode (deploy places every component on this host)")
+        return
+    topo = Topology.load(tpath, m)  # raises ValueError on an invalid topology → main() dies
+    print(f"✓ topology valid — domain {topo.domain}, {len(topo.resources)} resource(s)")
+    for rname, r in topo.resources.items():
+        placed = ", ".join(topo.components_on(rname)) or "(none)"
+        caps = ",".join(r.capabilities) or "-"
+        print(f"    {rname:<10} {r.target:<13} {r.address:<15} [{caps}]  ← {placed}")
+    for w in topo.warnings:
+        P.warn(w)
 
 
 def cmd_plan(args) -> int:
@@ -158,7 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--without", default="",
                         help="comma-separated optional components to drop (e.g. seccert,secsso)")
 
-    sub.add_parser("verify", help="validate manifest + target assets").set_defaults(fn=cmd_verify)
+    def _topology_arg(sp):
+        sp.add_argument("--topology", default="topology.toml",
+                        help="site placement file (optional; single-host mode if absent)")
+
+    vp = sub.add_parser("verify", help="validate manifest + target assets")
+    _topology_arg(vp)
+    vp.set_defaults(fn=cmd_verify)
 
     for name in ("plan", "build", "deploy", "status"):
         sp = sub.add_parser(name, help=f"{name} a target")
