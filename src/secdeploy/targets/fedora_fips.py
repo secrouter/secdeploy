@@ -75,8 +75,10 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
 
 
 def _deploy_steps(manifest: Manifest, work: Path, root: Path,
-                  without: list[str] | None = None) -> list[tuple[list[str], str]]:
-    services = [s for s in SERVICES if s not in (without or [])]
+                  without: list[str] | None = None,
+                  placed: set[str] | None = None) -> list[tuple[list[str], str]]:
+    services = [s for s in SERVICES
+                if s not in (without or []) and (placed is None or s in placed)]
     preflight = root / "deploy/fedora-fips/fips-preflight.sh"
     unit_dir = root / "deploy/fedora-fips/systemd"
     steps: list[tuple[list[str], str]] = [
@@ -134,6 +136,9 @@ def deploy(
     hf_token: str | None = None,
     model_dir: str | None = None,
     without: list[str] | None = None,
+    topology=None,
+    resource: str | None = None,
+    out: Path | None = None,
 ) -> None:
     if hf_token or model_dir:
         P.warn("--hf-token/--model-dir are macOS-only — on fedora-fips, set HF_TOKEN/"
@@ -141,9 +146,16 @@ def deploy(
     if tls or configure_hosts or trust_ca:
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
                "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
-    steps = _deploy_steps(manifest, work, root, without=without)
+    # Topology placement: restrict this host's services to the components placed on `resource`.
+    placed = set(topology.components_on(resource, without)) if topology is not None else None
+    steps = _deploy_steps(manifest, work, root, without=without, placed=placed)
     if dry_run:
         print(f"# fedora-fips deploy plan — suite {manifest.suite} (run as root on the Fedora host)")
+        if topology is not None:
+            here = ", ".join(sorted(s for s in SERVICES if placed is None or s in placed)) or "(none)"
+            print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
+                  f"native services here: {here}")
+            print(f"# addressing: writes secdns.zone + env/ (also via `bundle fedora-fips --resource {resource}`)")
         for cmd, desc in steps:
             print(f"  · {desc}\n      {' '.join(cmd)}")
         return
@@ -156,8 +168,14 @@ def deploy(
         P.die("fedora-fips deploy must run as root (systemd unit + trust-store install)")
     from .common import require_checkouts
 
-    services = [s for s in SERVICES if s not in (without or [])]
+    services = [s for s in SERVICES
+                if s not in (without or []) and (placed is None or s in placed)]
     require_checkouts(manifest, work, include=set(services))
+    if topology is not None and out is not None:
+        from .. import wiring
+
+        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
+        P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)

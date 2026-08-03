@@ -169,12 +169,16 @@ def cmd_bundle(args) -> int:
 def cmd_deploy(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
+    without = _without(args)
+    topo, from_file = wiring.active_topology(m, args.topology, args.target)
+    resource = wiring.resource_for(topo, args.target, args.resource) if from_file else None
     mod.deploy(
         m, Path(args.work), root=_root(args), dry_run=args.dry_run,
         tls=args.tls, configure_hosts=args.configure_hosts,
         trust_ca=args.trust_ca, assume_yes=args.yes,
         hf_token=args.hf_token, model_dir=args.model_dir,
-        without=_without(args),
+        without=without,
+        topology=topo if from_file else None, resource=resource, out=Path(args.out),
     )
     return 0
 

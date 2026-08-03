@@ -109,7 +109,14 @@ above.
 
 ## What consumes the topology
 
-Today: `secdeploy verify` validates and reports it. Multi-resource **deploy execution**
-(per-resource bundles, the `secdns` zone, host-resolver setup, and `deploy --resource` /
-`--ssh`) and the `secdeploy configure` wizard are being wired on top of this model — see
-[roadmap.md](roadmap.md).
+- **`secdeploy verify`** validates the topology and prints the placement map.
+- **`secdeploy plan <target> [--resource R]`** shows per-resource placement plus the steps.
+- **`secdeploy bundle <target> --resource R`** builds a per-resource air-gap bundle carrying
+  only R's components plus its addressing (`addressing/secdns.zone` + `addressing/env/`).
+- **`secdeploy deploy <target> [--resource R]`** brings up only the components placed on R and
+  writes the addressing artifacts under `out/addressing/`. The resource is auto-detected from
+  the target when unambiguous; pass `--resource` otherwise.
+
+Still being wired on top of this model: standing up `secdns` itself as a service, pointing each
+host's resolver at it, bringing up the stack components (SecSSO/SecChat) on their host, and
+`deploy --ssh` remote push — see [roadmap.md](roadmap.md).

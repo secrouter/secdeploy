@@ -34,15 +34,21 @@ The manifest lists all seven components with `kind` (service | stack), `optional
 it and reports placement, and the model derives per-component FQDNs, the DNS zone, and peer
 URLs (see [topology.md](topology.md)). Absent → single-host mode (unchanged behavior).
 
-Still to do, building on that model:
+**Landed — per-resource placement.** `plan` / `deploy` / `bundle` are topology-aware: each
+target now brings up only the components *placed on the current resource* (`deploy --resource`),
+`bundle --resource` emits a per-resource air-gap tarball, and both generate the addressing
+artifacts (the `secdns` zone + per-component peer-env). Single-host behavior is unchanged.
 
-- **Multi-resource deploy execution** — have each target deploy the components *placed on the
-  current resource* (via `deploy --resource`), generate the `secdns` zone, and point the host
-  resolver at it. This is also where **stack components** (`secsso`/`secchat`) finally come up
-  via their own `compose` / `bootstrap` — they're fetched, bundled, and droppable today, but a
-  target's `deploy` still brings up the core services only.
-- **Per-resource bundles + `--ssh` push** — `bundle` emits one air-gap bundle per resource;
-  `deploy --ssh` optionally pushes+deploys to resources that declare an `ssh` endpoint.
+Still to do, building on that:
+
+- **Stand up `secdns` + resolver wiring** — deploy `secdns` as a service on its host (Fedora
+  systemd unit / macOS native) fed by the generated zone, and point each host's resolver at it
+  (macOS `/etc/resolver/<domain>`, Fedora systemd-resolved) — retiring `--configure-hosts`.
+- **Stack-component execution** — bring up `secsso`/`secchat` via their own `compose` /
+  `bootstrap` on the host where they're placed (they're fetched, bundled, and droppable today,
+  but a target's `deploy` still brings up the built-from-source services only).
+- **`deploy --ssh` push** — from a control host, rsync each resource's bundle and deploy it on
+  resources that declare an `ssh` endpoint.
 - **`secdeploy configure`** — an interactive wizard that writes `topology.toml` (presets:
   single-host, GPU-split, custom).
 - **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect

@@ -103,6 +103,27 @@ def test_bundle_per_resource(tmp_path):
     assert not any("/work/secrouter" in n for n in names)  # secrouter is on 'core', not here
 
 
+def test_deploy_topology_filters_macos_resource(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # gpu (macos) holds only secllm
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--topology", str(tp), "--resource", "gpu"]) == 0
+    out = capsys.readouterr().out
+    assert "resource 'gpu'" in out
+    assert "components here: (none)" in out  # no macOS-native service is placed on gpu
+    assert "start SecCert" not in out
+
+
+def test_deploy_topology_fedora_core_gets_services(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # core (fedora-fips) holds the identity/gateway/collab tiers
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "resource 'core'" in out
+    assert "seccert.service" in out and "secrouter.service" in out
+
+
 def test_without_required_component_errors():
     with pytest.raises(SystemExit):
         main(["--manifest", MANIFEST, "plan", "macos", "--without", "secrouter"])

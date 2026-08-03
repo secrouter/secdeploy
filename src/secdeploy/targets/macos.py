@@ -256,13 +256,23 @@ def deploy(
     hf_token: str | None = None,
     model_dir: str | None = None,
     without: list[str] | None = None,
+    topology=None,
+    resource: str | None = None,
+    out: Path | None = None,
 ) -> None:
     without = without or []
+    # Topology placement: only bring up the components placed on `resource` (single-host
+    # synthesis places everything here, so this is a no-op without a topology.toml).
+    placed = set(topology.components_on(resource, without)) if topology is not None else None
+
+    def _here(name: str) -> bool:
+        return placed is None or name in placed
+
     compose = _compose(root)
     dc = ["docker", "compose"] if dry_run else _compose_cmd()
     env = {"SECSUITE_VERSION": manifest.suite}
     steps = []
-    if "seccert" not in without:
+    if "seccert" not in without and _here("seccert"):
         steps += [
             (dc + ["-f", str(compose), "up", "-d", "seccert"], "start SecCert (CA)"),
             (["bash", "-c",
@@ -271,21 +281,40 @@ def deploy(
             (["bash", "-c", "curl -fsS http://localhost:47001/ca.crt -o out/seccert-root.pem && echo saved out/seccert-root.pem"],
              "export SecCert root trust anchor"),
         ]
-    steps.append((dc + ["-f", str(compose), "up", "-d", "secrouter"], "start SecRouter"))
+    if _here("secrouter"):
+        steps.append((dc + ["-f", str(compose), "up", "-d", "secrouter"], "start SecRouter"))
     P.log(f"deploy {NAME} — suite {manifest.suite} (SECSUITE_VERSION passed to compose)")
+    if topology is not None and not dry_run and out is not None:
+        from .. import wiring
+
+        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
+        P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
+    if dry_run and topology is not None:
+        here = ", ".join(sorted(s for s in ("seccert", "secrouter", "secrecorder") if _here(s))) or "(none)"
+        print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
+              f"components here: {here}")
     for cmd, desc in steps:
         if dry_run:
             print(f"  · {desc}: {' '.join(cmd)}")
             continue
         P.run(cmd, env={**_os_environ(), **env})
 
+    # SecRecorder runs natively on macOS — only when it's placed on this resource.
+    if not _here("secrecorder"):
+        if dry_run:
+            _print_ca_dry_run(configure_hosts, trust_ca)
+            return
+        if configure_hosts:
+            _configure_hosts(assume_yes)
+        if trust_ca:
+            _trust_ca_root(root, assume_yes)
+        P.log(f"SecRecorder not placed on resource {resource!r} — skipping on this host")
+        return
+
     model_env = _model_env(root, hf_token, model_dir)
     run_cmd = f"{_env_prefix(model_env)}HOST=0.0.0.0 PORT={SECRECORDER_PORT} work/secrecorder/run.sh"
     if dry_run:
-        if configure_hosts:
-            print(f"  · (--configure-hosts) map {CERT_HOST} to 127.0.0.1 in /etc/hosts (sudo, asks first)")
-        if trust_ca:
-            print("  · (--trust-ca) trust the SecCert root in the System keychain (sudo, asks first)")
+        _print_ca_dry_run(configure_hosts, trust_ca)
         if tls:
             live = root / "out/certbot/config/live/secrecorder"
             print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, then: "
@@ -308,6 +337,13 @@ def deploy(
             return
         P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
     P.warn(f"SecRecorder is native on macOS — start it with: {run_cmd}")
+
+
+def _print_ca_dry_run(configure_hosts: bool, trust_ca: bool) -> None:
+    if configure_hosts:
+        print(f"  · (--configure-hosts) map {CERT_HOST} to 127.0.0.1 in /etc/hosts (sudo, asks first)")
+    if trust_ca:
+        print("  · (--trust-ca) trust the SecCert root in the System keychain (sudo, asks first)")
 
 
 def status(manifest: Manifest, root: Path) -> None:
