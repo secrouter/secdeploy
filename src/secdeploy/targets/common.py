@@ -8,9 +8,15 @@ from .. import process as P
 from ..manifest import Manifest
 
 
-def fetch(manifest: Manifest, work_dir: Path, only: str | None = None) -> Path:
+def fetch(
+    manifest: Manifest,
+    work_dir: Path,
+    only: str | None = None,
+    include: set[str] | None = None,
+) -> Path:
     """Clone/checkout every component at its pinned ref into ``work_dir/<name>``.
 
+    ``include`` (if given) restricts to that set of component names — used by ``--without``.
     Run this on a network-connected build host; the resulting checkouts (and the
     artifacts built from them) are what get bundled for air-gapped transfer.
     """
@@ -19,6 +25,8 @@ def fetch(manifest: Manifest, work_dir: Path, only: str | None = None) -> Path:
     work_dir.mkdir(parents=True, exist_ok=True)
     for name, c in manifest.components.items():
         if only and name != only:
+            continue
+        if include is not None and name not in include:
             continue
         dest = work_dir / name
         if (dest / ".git").exists():
@@ -42,7 +50,10 @@ def resolved_shas(manifest: Manifest, work_dir: Path) -> dict[str, str]:
     return out
 
 
-def require_checkouts(manifest: Manifest, work_dir: Path) -> None:
-    missing = [n for n in manifest.components if not (work_dir / n).exists()]
+def require_checkouts(
+    manifest: Manifest, work_dir: Path, include: set[str] | None = None
+) -> None:
+    names = include if include is not None else set(manifest.components)
+    missing = [n for n in names if not (work_dir / n).exists()]
     if missing:
         P.die(f"missing checkouts: {', '.join(missing)} — run `secdeploy fetch` first")

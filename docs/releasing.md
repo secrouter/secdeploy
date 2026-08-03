@@ -7,23 +7,29 @@ version — the whole point of a bill of materials.
 ## The manifest
 
 ```toml
-suite = "1.0.0"
+suite = "1.1.0"
 released = "2026-07-30"
 
 [components.seccert]
 repo = "secrouter/seccert"
 ref  = "v1.0.0"          # the pinned, compatible tag
+kind = "service"        # "service" (build from source) | "stack" (compose deploy of upstream)
+optional = true         # optional infra — droppable with --without
 
 [components.secrouter]
 repo = "secrouter/secrouter"
 ref  = "v1.0.0"
+kind = "service"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
 ref  = "v0.7.0"          # components move at their own pace
+kind = "service"
 ```
 
-`ref` may be a tag (preferred for releases), a branch, or a commit SHA.
+`ref` may be a tag (preferred for releases), a branch, or a commit SHA. `kind` defaults to
+`service`; `optional` to `false`. Mark the identity/trust tier (`seccert`, `secsso`) optional
+so sites with an existing CA/IdP can `secdeploy deploy … --without seccert,secsso`.
 
 ## Cutting a new suite version
 

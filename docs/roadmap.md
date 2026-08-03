@@ -24,6 +24,18 @@ Planned approach:
 First-boot concerns to design for: regenerate the SecCert CA (or inject an operator-provided
 root), set unique admin tokens/passphrases, and re-key TLS for the real hostname.
 
+## Suite orchestration
+
+The manifest now lists all seven components with `kind` (service | stack) + `optional`, and
+`--without` drops optional infra across `plan`/`fetch`/`build`/`bundle`/`deploy`. Still to do:
+
+- **Stack-component deploy execution** — `secsso`/`secchat` are `stack` components; wire the
+  targets to run their own `compose` / `bootstrap` (they're fetched and bundled today, and
+  droppable via `--without`, but a target's `deploy` still brings up the core services only).
+- **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect
+  the selected component set (the *components* section already honors `--without`).
+- **SecLLM on the GPU path** — a target/overlay that places SecLLM on the NVIDIA host.
+
 ## Other
 
 - **DNS-01 for SecCert** — wildcard + unreachable-host issuance in closed networks.

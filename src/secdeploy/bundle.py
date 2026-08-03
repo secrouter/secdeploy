@@ -24,14 +24,14 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _bundle_info(manifest: Manifest, target: str, shas: dict[str, str]) -> str:
+def _bundle_info(manifest: Manifest, target: str, components, shas: dict[str, str]) -> str:
     lines = [
         f"suite:    {manifest.suite}",
         f"released: {manifest.released}",
         f"target:   {target}",
         "components:",
     ]
-    for name, c in manifest.components.items():
+    for name, c in components.items():
         sha = shas.get(name, "?")
         lines.append(f"  - {name} {c.ref} ({sha[:12]}) {c.repo}")
     lines += [
@@ -44,9 +44,11 @@ def _bundle_info(manifest: Manifest, target: str, shas: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_bundle(manifest: Manifest, target: str, work: Path, out: Path, root: Path) -> Path:
+def build_bundle(manifest: Manifest, target: str, work: Path, out: Path, root: Path,
+                 without: list[str] | None = None) -> Path:
     manifest.target(target)  # validates target exists
-    common.require_checkouts(manifest, work)
+    selected = manifest.select(without or [])
+    common.require_checkouts(manifest, work, include=set(selected))
     shas = common.resolved_shas(manifest, work)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -67,14 +69,14 @@ def build_bundle(manifest: Manifest, target: str, work: Path, out: Path, root: P
             src = root / item
             if src.exists():
                 tar.add(src, arcname=f"{arc}/{item}", filter=_filter)
-        # Pinned component source
-        for name in manifest.components:
+        # Pinned component source (selected set)
+        for name in selected:
             tar.add(work / name, arcname=f"{arc}/work/{name}", filter=_filter)
         # macOS: include any saved image tarballs from `build`
         for img in sorted(out.glob("*.tar")):
             tar.add(img, arcname=f"{arc}/images/{img.name}")
         # Bundle info
-        info = _bundle_info(manifest, target, shas)
+        info = _bundle_info(manifest, target, selected, shas)
         info_path = out / "BUNDLE-INFO.txt"
         info_path.write_text(info)
         tar.add(info_path, arcname=f"{arc}/BUNDLE-INFO.txt")

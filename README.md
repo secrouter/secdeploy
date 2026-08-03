@@ -1,21 +1,39 @@
 # SecDeploy — release train & deployer for the SecRouter suite
 
-**One versioned product out of four independent components.** SecDeploy pins a compatible,
-tested set of component tags (a suite "bill of materials") and stands the whole stack up on
-each supported target — from a single command, air-gap friendly.
+**One versioned product out of the suite's independent components.** SecDeploy pins a
+compatible, tested set of component tags (a suite "bill of materials") and stands the whole
+stack up on each supported target — from a single command, air-gap friendly.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ## The suite
 
-| Component | Role | Runtime |
-|---|---|---|
-| [SecCert](https://github.com/secrouter/seccert) | Internal ACME CA (comes up first, issues the suite's certs) | Python ≥3.11 |
-| [SecRouter](https://github.com/secrouter/secrouter) | Governed AI gateway | Node ≥24 |
-| [SecRecorder](https://github.com/secrouter/secrecorder) | Transcription (optional) | Python ≥3.11 |
+| Component | Role | Kind | |
+|---|---|---|---|
+| [SecCert](https://github.com/secrouter/seccert) | Internal ACME CA (comes up first) | service | *optional* |
+| [SecSSO](https://github.com/secrouter/secsso) | Single sign-on (Authentik) | stack | *optional* |
+| [SecLLM](https://github.com/secrouter/secllm) | Local inference (vLLM control plane) | service | GPU |
+| [SecRouter](https://github.com/secrouter/secrouter) | Governed AI gateway | service | |
+| [SecAgent](https://github.com/secrouter/secagent) | Agentic harness (pi) | service | |
+| [SecChat](https://github.com/secrouter/secchat) | Team chat + chat-ops (Mattermost) | stack | |
+| [SecRecorder](https://github.com/secrouter/secrecorder) | Transcription | service | |
 
 The compatible versions for a release live in [`suite.toml`](suite.toml) — the manifest.
-Deploying a suite version gives you *exactly* that combination on any target.
+Deploying a suite version gives you *exactly* that combination on any target. **`service`**
+components build from pinned source; **`stack`** components are Compose deploys of upstream
+projects (Authentik, Mattermost).
+
+### Optional infrastructure
+
+SecCert and SecSSO are the "start-from-zero" identity & trust tier — provide them, or **drop
+them** when you already run a CA / IdP:
+
+```bash
+secdeploy deploy fedora-fips --without seccert,secsso
+```
+
+`--without` works on `plan` / `fetch` / `build` / `bundle` / `deploy`; only optional components
+may be dropped (naming a required one is an error).
 
 ## Targets
 

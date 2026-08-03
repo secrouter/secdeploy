@@ -1,6 +1,6 @@
 [project]
 name = "secdeploy"
-version = "1.0.0"
+version = "1.1.0"
 description = "SecDeploy — release train + deploy orchestration for the SecRouter suite."
 readme = "README.md"
 requires-python = ">=3.11"

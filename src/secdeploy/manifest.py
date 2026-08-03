@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 TARGET_KINDS = {"compose", "systemd-native", "image"}
+COMPONENT_KINDS = {"service", "stack"}
 
 
 @dataclass
@@ -19,6 +20,8 @@ class Component:
     name: str
     repo: str  # "org/name" on GitHub
     ref: str  # git tag/branch/sha to pin
+    kind: str = "service"  # "service" (built from source) | "stack" (compose deploy of upstream)
+    optional: bool = False  # optional infra — droppable with `--without`
     runtime: str = ""
     role: str = ""
 
@@ -52,6 +55,8 @@ class Manifest:
                 name=name,
                 repo=c["repo"],
                 ref=c["ref"],
+                kind=c.get("kind", "service"),
+                optional=bool(c.get("optional", False)),
                 runtime=c.get("runtime", ""),
                 role=c.get("role", ""),
             )
@@ -83,6 +88,10 @@ class Manifest:
                 errors.append(f"component {c.name!r}: repo must be 'org/name', got {c.repo!r}")
             if not c.ref:
                 errors.append(f"component {c.name!r}: missing 'ref'")
+            if c.kind not in COMPONENT_KINDS:
+                errors.append(
+                    f"component {c.name!r}: unknown kind {c.kind!r} (expected one of {sorted(COMPONENT_KINDS)})"
+                )
         for t in self.targets.values():
             if t.kind not in TARGET_KINDS:
                 errors.append(
@@ -98,6 +107,27 @@ class Manifest:
             )
         return self.targets[name]
 
+    def optionals(self) -> list[str]:
+        return [c.name for c in self.components.values() if c.optional]
+
+    def select(self, without: list[str] | None = None) -> dict[str, Component]:
+        """Components to act on after dropping the (optional) ones named in ``without``.
+
+        Only optional components may be dropped — naming a required one is an error, so a
+        deploy can't accidentally omit the gateway.
+        """
+        without = list(without or [])
+        unknown = [n for n in without if n not in self.components]
+        if unknown:
+            raise KeyError(f"unknown component(s) in --without: {', '.join(unknown)}")
+        required = [n for n in without if not self.components[n].optional]
+        if required:
+            raise ValueError(
+                f"cannot drop required component(s): {', '.join(required)} "
+                f"(droppable: {', '.join(self.optionals()) or 'none'})"
+            )
+        return {n: c for n, c in self.components.items() if n not in without}
+
     def to_toml(self) -> str:
         """Serialize back to TOML deterministically (used when cutting a new suite version)."""
         out = [
@@ -111,14 +141,14 @@ class Manifest:
             "",
         ]
         for c in self.components.values():
-            out += [
-                f"[components.{c.name}]",
-                f'repo = "{c.repo}"',
-                f'ref = "{c.ref}"',
-                f'runtime = "{c.runtime}"',
-                f'role = "{c.role}"',
-                "",
-            ]
+            lines = [f"[components.{c.name}]", f'repo = "{c.repo}"', f'ref = "{c.ref}"',
+                     f'kind = "{c.kind}"']
+            if c.optional:
+                lines.append("optional = true")
+            if c.runtime:
+                lines.append(f'runtime = "{c.runtime}"')
+            lines.append(f'role = "{c.role}"')
+            out += lines + [""]
         for t in self.targets.values():
             out += [
                 f"[targets.{t.name}]",

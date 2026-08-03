@@ -8,6 +8,9 @@ Subcommands:
   bundle   produce an air-gapped release bundle (+ SHA256SUMS)
   deploy   stand the suite up on this host for a target (use --dry-run to preview)
   status   report health of a deployed target
+
+Optional infra (SecCert, SecSSO) can be dropped with ``--without seccert,secsso`` when you
+already run that infrastructure.
 """
 
 from __future__ import annotations
@@ -37,6 +40,10 @@ def _root(args) -> Path:
     return Path(args.manifest).resolve().parent
 
 
+def _without(args) -> list[str]:
+    return [s.strip() for s in getattr(args, "without", "").split(",") if s.strip()]
+
+
 def _expected_assets(root: Path, target: str) -> list[Path]:
     if target == macos.NAME:
         return [root / "deploy/macos/compose.yaml"]
@@ -57,8 +64,10 @@ def cmd_verify(args) -> int:
     root = _root(args)
     print(f"✓ manifest valid — suite {m.suite} ({m.released}): {m.description}")
     for c in m.components.values():
-        print(f"    {c.name:<12} {c.ref:<10} {c.repo}")
-    print(f"  targets: {', '.join(m.targets) or '(none)'}")
+        opt = "  (optional)" if c.optional else ""
+        print(f"    {c.name:<12} {c.ref:<8} {c.kind:<8} {c.repo}{opt}")
+    print(f"  optional: {', '.join(m.optionals()) or '(none)'}")
+    print(f"  targets:  {', '.join(m.targets) or '(none)'}")
     missing = [
         str(f.relative_to(root))
         for t in m.targets
@@ -76,11 +85,17 @@ def cmd_plan(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
     t = m.target(args.target)
+    selected = m.select(_without(args))
     print(f"suite {m.suite}  →  target {t.name} ({t.kind})")
     print(f"  {t.description}\n")
     print("  components (pinned):")
-    for c in m.components.values():
-        print(f"    - {c.name} @ {c.ref}   [{c.runtime}]   {c.role}")
+    for c in selected.values():
+        tags = [x for x in ("stack" if c.kind == "stack" else "", "optional" if c.optional else "") if x]
+        suffix = f"  ({', '.join(tags)})" if tags else ""
+        print(f"    - {c.name} @ {c.ref}   [{c.runtime or c.kind}]   {c.role}{suffix}")
+    dropped = [n for n in m.components if n not in selected]
+    if dropped:
+        print(f"  dropped (--without): {', '.join(dropped)}")
     print("\n  steps:")
     for i, step in enumerate(mod.PLAN, 1):
         print(f"    {i}. {step}")
@@ -89,15 +104,17 @@ def cmd_plan(args) -> int:
 
 def cmd_fetch(args) -> int:
     m = Manifest.load(args.manifest)
-    common.fetch(m, Path(args.work), only=args.component)
+    selected = m.select(_without(args))
+    common.fetch(m, Path(args.work), only=args.component, include=set(selected))
     return 0
 
 
 def cmd_build(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
-    common.fetch(m, Path(args.work))
-    mod.build(m, Path(args.work), Path(args.out), root=_root(args))
+    without = _without(args)
+    common.fetch(m, Path(args.work), include=set(m.select(without)))
+    mod.build(m, Path(args.work), Path(args.out), root=_root(args), without=without)
     return 0
 
 
@@ -105,7 +122,8 @@ def cmd_bundle(args) -> int:
     from . import bundle
 
     m = Manifest.load(args.manifest)
-    bundle.build_bundle(m, args.target, Path(args.work), Path(args.out), root=_root(args))
+    bundle.build_bundle(m, args.target, Path(args.work), Path(args.out),
+                        root=_root(args), without=_without(args))
     return 0
 
 
@@ -117,6 +135,7 @@ def cmd_deploy(args) -> int:
         tls=args.tls, configure_hosts=args.configure_hosts,
         trust_ca=args.trust_ca, assume_yes=args.yes,
         hf_token=args.hf_token, model_dir=args.model_dir,
+        without=_without(args),
     )
     return 0
 
@@ -135,12 +154,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="out", help="artifact/bundle output dir (default: ./out)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def _without_arg(sp):
+        sp.add_argument("--without", default="",
+                        help="comma-separated optional components to drop (e.g. seccert,secsso)")
+
     sub.add_parser("verify", help="validate manifest + target assets").set_defaults(fn=cmd_verify)
 
     for name in ("plan", "build", "deploy", "status"):
         sp = sub.add_parser(name, help=f"{name} a target")
         sp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
         sp.set_defaults(fn=globals()[f"cmd_{name}"])
+        if name != "status":
+            _without_arg(sp)
     sub.choices["deploy"].add_argument(
         "--dry-run", action="store_true", help="print the steps without executing them"
     )
@@ -177,10 +202,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")
     fp.add_argument("--component", help="only fetch this component")
+    _without_arg(fp)
     fp.set_defaults(fn=cmd_fetch)
 
     bp = sub.add_parser("bundle", help="produce an air-gapped release bundle")
     bp.add_argument("target", help="deploy target")
+    _without_arg(bp)
     bp.set_defaults(fn=cmd_bundle)
 
     return p

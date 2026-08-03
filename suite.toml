@@ -1,34 +1,73 @@
 # SecDeploy release manifest — the suite "bill of materials".
 # A suite version pins one compatible, tested set of component tags. Deploying a
 # suite version gives you exactly this combination on any target.
+#
+# kind:     "service" (built from pinned source) | "stack" (compose deploy of upstream)
+# optional: droppable with `secdeploy deploy <target> --without <name>` when you already
+#           run that infrastructure (e.g. an existing CA or IdP).
 
-suite = "1.0.0"
-released = "2026-07-30"
+suite = "1.1.0"
+released = "2026-07-31"
 description = "SecRouter secure-AI suite"
 
+# ── Identity & trust (optional infra) ──
 [components.seccert]
 repo = "secrouter/seccert"
 ref = "v1.0.0"
+kind = "service"
+optional = true
 runtime = "python>=3.11"
 role = "internal ACME certificate authority (stands up first — issues the suite's certs)"
 
+[components.secsso]
+repo = "secrouter/secsso"
+ref = "v1.0.0"
+kind = "stack"
+optional = true
+role = "single sign-on (Authentik) — drop it when you have Okta/Entra/Keycloak"
+
+# ── Inference ──
+[components.secllm]
+repo = "secrouter/secllm"
+ref = "v1.0.0"
+kind = "service"
+runtime = "python>=3.11 + NVIDIA GPU"
+role = "local inference — vLLM control plane (SecRouter routes to it)"
+
+# ── Gateway ──
 [components.secrouter]
 repo = "secrouter/secrouter"
 ref = "v1.0.0"
+kind = "service"
 runtime = "node>=24"
 role = "governed AI gateway"
+
+# ── Agents & collaboration ──
+[components.secagent]
+repo = "secrouter/secagent"
+ref = "v0.1.0"
+kind = "service"
+runtime = "python>=3.11"
+role = "agentic harness (pi) — MR review, analysis, chat-ops"
+
+[components.secchat]
+repo = "secrouter/secchat"
+ref = "v1.0.0"
+kind = "stack"
+role = "team chat + chat-ops (Mattermost) — bridges to SecAgent"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
 ref = "v0.8.2"
+kind = "service"
 runtime = "python>=3.11"
-role = "transcription (optional; native/MLX on macOS, faster-whisper on Fedora)"
+role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
 
 # Deploy targets. `kind` selects the mechanism the CLI uses.
 [targets.macos]
 kind = "compose"
-description = "MacBook Pro M-series — Docker Compose via Colima (SecRouter + SecCert); SecRecorder runs native (MLX/Metal)"
+description = "MacBook Pro M-series — Docker Compose via Colima (services + stacks); SecRecorder native (MLX/Metal)"
 
 [targets.fedora-fips]
 kind = "systemd-native"
-description = "FIPS-mode Fedora host — native hardened systemd services linking the system OpenSSL FIPS provider"
+description = "FIPS-mode Fedora host — native hardened systemd services (+ Podman for stack components)"

@@ -46,21 +46,26 @@ PLAN = [
 ]
 
 
-def build(manifest: Manifest, work: Path, out: Path, root: Path) -> None:
+def build(manifest: Manifest, work: Path, out: Path, root: Path,
+          without: list[str] | None = None) -> None:
     from .common import require_checkouts
 
+    without = without or []
     require_checkouts(manifest, work)
     # SecRouter — Node build → dist/
-    sr = work / "secrouter"
-    if P.which("npm"):
-        P.run(["npm", "ci", "--prefix", str(sr)], check=False) or P.run(
-            ["npm", "install", "--prefix", str(sr)], check=False
-        )
-        P.run(["npm", "run", "build", "--prefix", str(sr)])
-    else:
-        P.warn("npm not found — SecRouter must be built on the Fedora host (node>=24)")
+    if "secrouter" not in without:
+        sr = work / "secrouter"
+        if P.which("npm"):
+            P.run(["npm", "ci", "--prefix", str(sr)], check=False) or P.run(
+                ["npm", "install", "--prefix", str(sr)], check=False
+            )
+            P.run(["npm", "run", "build", "--prefix", str(sr)])
+        else:
+            P.warn("npm not found — SecRouter must be built on the Fedora host (node>=24)")
     # SecCert + SecRecorder — uv venvs
     for name in ("seccert", "secrecorder"):
+        if name in without:
+            continue
         proj = work / name
         if P.which("uv") and (proj / "pyproject.toml").exists():
             P.run(["uv", "sync", "--project", str(proj)])
@@ -69,14 +74,16 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path) -> None:
     P.log("native build complete (SecRouter dist + SecCert/SecRecorder venvs)")
 
 
-def _deploy_steps(manifest: Manifest, work: Path, root: Path) -> list[tuple[list[str], str]]:
+def _deploy_steps(manifest: Manifest, work: Path, root: Path,
+                  without: list[str] | None = None) -> list[tuple[list[str], str]]:
+    services = [s for s in SERVICES if s not in (without or [])]
     preflight = root / "deploy/fedora-fips/fips-preflight.sh"
     unit_dir = root / "deploy/fedora-fips/systemd"
     steps: list[tuple[list[str], str]] = [
         (["bash", str(preflight)], "FIPS preflight (fail-closed)"),
     ]
     # users + dirs
-    for svc in SERVICES:
+    for svc in services:
         user = f"secsuite-{svc}"
         steps.append((
             ["bash", "-c", f"getent passwd {user} >/dev/null || "
@@ -88,26 +95,30 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path) -> list[tuple[list
     steps.append((["install", "-d", "-m", "755", str(OPT)], f"code dir {OPT}"))
     steps.append((["install", "-d", "-m", "750", str(ETC)], f"config dir {ETC}"))
     # code
-    for svc in SERVICES:
+    for svc in services:
         steps.append((["bash", "-c", f"rm -rf {OPT}/{svc} && cp -a {work}/{svc} {OPT}/{svc}"],
                       f"install {svc} code → {OPT}/{svc}"))
     # env files (don't clobber existing)
-    for svc in SERVICES:
+    for svc in services:
         ex = root / f"deploy/fedora-fips/{svc}.env.example"
         steps.append((["bash", "-c", f"test -f {ETC}/{svc}.env || install -m 640 {ex} {ETC}/{svc}.env"],
                       f"config {ETC}/{svc}.env (from example if absent)"))
-    # units
-    steps.append((["bash", "-c", f"install -m 644 {unit_dir}/*.service {unit_dir}/*.target {UNITS}/"],
-                  "install systemd units"))
+    # units — only the selected services, plus the suite target
+    for svc in services:
+        steps.append((["install", "-m", "644", str(unit_dir / f"{svc}.service"), f"{UNITS}/"],
+                      f"install {svc}.service"))
+    steps.append((["install", "-m", "644", str(unit_dir / "secsuite.target"), f"{UNITS}/"],
+                  "install secsuite.target"))
     steps.append((["systemctl", "daemon-reload"], "systemd daemon-reload"))
     steps.append((["systemctl", "enable", "--now", "secsuite.target"], "enable + start the suite"))
-    # trust anchor
-    steps.append((
-        ["bash", "-c",
-         "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:47001/ca.crt "
-         f"-o {ANCHORS}/secsuite-seccert-root.pem && break; sleep 1; done && update-ca-trust"],
-        "add SecCert root to the host trust store",
-    ))
+    # trust anchor (only if SecCert is part of this deploy)
+    if "seccert" in services:
+        steps.append((
+            ["bash", "-c",
+             "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:47001/ca.crt "
+             f"-o {ANCHORS}/secsuite-seccert-root.pem && break; sleep 1; done && update-ca-trust"],
+            "add SecCert root to the host trust store",
+        ))
     return steps
 
 
@@ -122,6 +133,7 @@ def deploy(
     assume_yes: bool = False,
     hf_token: str | None = None,
     model_dir: str | None = None,
+    without: list[str] | None = None,
 ) -> None:
     if hf_token or model_dir:
         P.warn("--hf-token/--model-dir are macOS-only — on fedora-fips, set HF_TOKEN/"
@@ -129,7 +141,7 @@ def deploy(
     if tls or configure_hosts or trust_ca:
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
                "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
-    steps = _deploy_steps(manifest, work, root)
+    steps = _deploy_steps(manifest, work, root, without=without)
     if dry_run:
         print(f"# fedora-fips deploy plan — suite {manifest.suite} (run as root on the Fedora host)")
         for cmd, desc in steps:
@@ -144,7 +156,8 @@ def deploy(
         P.die("fedora-fips deploy must run as root (systemd unit + trust-store install)")
     from .common import require_checkouts
 
-    require_checkouts(manifest, work)
+    services = [s for s in SERVICES if s not in (without or [])]
+    require_checkouts(manifest, work, include=set(services))
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)
