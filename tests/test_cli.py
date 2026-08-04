@@ -60,7 +60,7 @@ resources = ["gpu1", "gpu2"]
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
-    assert "suite 1.2.0" in out
+    assert "suite 1.3.0" in out
     assert "optional: seccert, secsso, secdns" in out
     assert "target assets present" in out
 
@@ -120,7 +120,7 @@ def test_bundle_per_resource(tmp_path):
     assert rc == 0
     import tarfile
 
-    tarball = out / "secsuite-1.2.0-macos-gpu.tar.gz"
+    tarball = out / "secsuite-1.3.0-macos-gpu.tar.gz"
     assert tarball.exists()
     names = tarfile.open(tarball).getnames()
     assert any(n.endswith("addressing/secdns.zone") for n in names)

@@ -9,8 +9,8 @@
 # optional: droppable with `secdeploy deploy <target> --without <name>` when you already
 #           run that infrastructure (e.g. an existing CA or IdP).
 
-suite = "1.2.0"
-released = "2026-08-03"
+suite = "1.3.0"
+released = "2026-08-04"
 description = "SecRouter secure-AI suite"
 
 # ── Identity & trust (optional infra) ──
@@ -46,7 +46,7 @@ role = "internal DNS — resolves the suite's *.internal names (drop it when you
 # ── Inference ──
 [components.secllm]
 repo = "secrouter/secllm"
-ref = "v1.0.0"
+ref = "v1.1.0"
 kind = "service"
 tier = "inference"
 port = 11400
@@ -56,7 +56,7 @@ role = "local inference — vLLM control plane (SecRouter routes to it)"
 # ── Gateway ──
 [components.secrouter]
 repo = "secrouter/secrouter"
-ref = "v1.0.0"
+ref = "v1.1.0"
 kind = "service"
 tier = "gateway"
 port = 47002
