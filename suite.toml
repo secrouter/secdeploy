@@ -3,11 +3,15 @@
 # suite version gives you exactly this combination on any target.
 #
 # kind:     "service" (built from pinned source) | "stack" (compose deploy of upstream)
-# tier:     placement tier — identity | inference | gateway | collab. The site topology
+# tier:     placement tier — identity | inference | gateway | collab | edge. The site topology
 #           (topology.toml) assigns each tier to a compute resource; see docs/topology.md.
 # port:     primary inbound port, used to build the component's peer URL for addressing.
 # optional: droppable with `secdeploy deploy <target> --without <name>` when you already
 #           run that infrastructure (e.g. an existing CA or IdP).
+# fronted:  true when secproxy (the edge tier) puts this HTTP service behind its :443 front
+#           door instead of the component's own port — see topology.py's `is_fronted`. Never
+#           set on secllm (inference must dial direct, never through the proxy), secdns (not
+#           HTTP), or secproxy itself.
 
 suite = "1.4.1"
 released = "2026-08-04"
@@ -31,6 +35,7 @@ kind = "stack"
 tier = "identity"
 port = 9000
 optional = true
+fronted = true
 role = "single sign-on (Authentik) — drop it when you have Okta/Entra/Keycloak"
 
 [components.secdns]
@@ -60,6 +65,7 @@ ref = "v1.1.0"
 kind = "service"
 tier = "gateway"
 port = 47002
+fronted = true
 runtime = "node>=24"
 role = "governed AI gateway"
 
@@ -70,6 +76,7 @@ ref = "v0.2.1"
 kind = "service"
 tier = "collab"
 port = 47007
+fronted = true
 runtime = "python>=3.11"
 role = "agentic harness (pi) — MR review, analysis, chat-ops"
 
@@ -79,6 +86,7 @@ ref = "v1.0.0"
 kind = "stack"
 tier = "collab"
 port = 8065
+fronted = true
 role = "team chat + chat-ops (Mattermost) — bridges to SecAgent"
 
 [components.secrecorder]
@@ -87,8 +95,20 @@ ref = "v0.8.2"
 kind = "service"
 tier = "collab"
 port = 47003
+fronted = true
 runtime = "python>=3.11"
 role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
+
+# ── Edge (optional infra) ──
+[components.secproxy]
+repo = "secrouter/secproxy"
+ref = "v0.1.0"
+kind = "service"
+tier = "edge"
+port = 443
+optional = true
+runtime = "caddy (upstream image)"
+role = "edge reverse proxy — one HTTPS front door (:443) for the suite's web/API services"
 
 # Deploy targets. `kind` selects the mechanism the CLI uses.
 [targets.macos]

@@ -58,6 +58,33 @@ resource = "core"
 resources = ["gpu1", "gpu2"]
 """
 
+# identity + gateway + collab + edge (secproxy) all on 'core'; inference on 'gpu' — the
+# fronting axis in play: the 6 fronted components should resolve/address via the proxy.
+EDGE_SPLIT = """
+domain = "sec.internal"
+upstream_dns = ["1.1.1.1"]
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+[resources.gpu]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.edge]
+resource = "core"
+[groups.inference]
+resource = "gpu"
+"""
+
+FRONTED = ("secsso", "secrouter", "secagent", "secchat", "secrecorder")
+
 
 def _manifest() -> Manifest:
     return Manifest.load(ROOT / "suite.toml")
@@ -154,6 +181,109 @@ def test_env_for_wires_peers_not_self(tmp_path):
     assert "SECROUTER_URL" not in env
 
 
+# ── fronting axis: secproxy (edge tier) fronts the 6 HTTP services on :443 ──────────────
+def test_proxy_address_none_when_edge_unplaced(tmp_path):
+    # GPU_SPLIT has no [groups.edge] at all — the common case today, and every fixture that
+    # predates secproxy.
+    topo = _topo(tmp_path, GPU_SPLIT)
+    assert topo._proxy_address() is None
+
+
+def test_proxy_address_resolves_the_edge_resource(tmp_path):
+    topo = _topo(tmp_path, EDGE_SPLIT)
+    assert topo._proxy_address() == "10.0.0.5"
+
+
+def test_is_fronted_true_for_the_six_when_secproxy_placed(tmp_path):
+    topo = _topo(tmp_path, EDGE_SPLIT)
+    for name in FRONTED:
+        assert topo.is_fronted(name)
+    # never fronted, regardless of placement: the CA must stay a direct trust anchor (Caddy
+    # bootstraps its certs from it), inference must dial direct, secdns isn't HTTP, and secproxy
+    # doesn't front itself
+    for name in ("seccert", "secllm", "secdns", "secproxy"):
+        assert not topo.is_fronted(name)
+
+
+def test_is_fronted_false_for_everyone_when_secproxy_unplaced(tmp_path):
+    # GPU_SPLIT: same manifest (fronted flags still set), but secproxy/edge isn't placed here —
+    # fronting only takes effect once secproxy is actually deployed.
+    topo = _topo(tmp_path, GPU_SPLIT)
+    for name in FRONTED:
+        assert not topo.is_fronted(name)
+
+
+def test_zone_fronted_components_resolve_to_the_proxy(tmp_path):
+    topo = _topo(tmp_path, EDGE_SPLIT)
+    zone = {fqdn: addr for fqdn, _rtype, addr in topo.zone()}
+    for name in FRONTED:
+        assert zone[f"{name}.sec.internal"] == "10.0.0.5"  # the proxy's resource (core)
+    # never-fronted components keep their OWN resource address
+    assert zone["secllm.sec.internal"] == "10.0.0.6"  # gpu — direct, unaffected by fronting
+    assert zone["secdns.sec.internal"] == "10.0.0.5"  # happens to be on core too, but DIRECT
+    assert zone["secproxy.sec.internal"] == "10.0.0.5"  # secproxy addresses itself directly
+
+
+def test_urls_fronted_components_drop_the_port(tmp_path):
+    topo = _topo(tmp_path, EDGE_SPLIT)
+    urls = topo.urls()
+    assert urls["SECROUTER"] == "https://secrouter.sec.internal"
+    assert urls["SECSSO"] == "https://secsso.sec.internal"
+    assert urls["SECAGENT"] == "https://secagent.sec.internal"
+    assert urls["SECCHAT"] == "https://secchat.sec.internal"
+    assert urls["SECRECORDER"] == "https://secrecorder.sec.internal"
+    # never fronted — keep their explicit port (seccert = the CA, a direct trust anchor)
+    assert urls["SECCERT"] == "https://seccert.sec.internal:47001"
+    assert urls["SECLLM"] == "https://secllm.sec.internal:11400"
+    assert urls["SECDNS"] == "https://secdns.sec.internal:53"
+    assert urls["SECPROXY"] == "https://secproxy.sec.internal:443"
+
+
+def test_instance_urls_secllm_stays_direct_and_ported_when_fronting_is_active(tmp_path):
+    """CRITICAL: SecLLM must NEVER be addressed through secproxy — inference traffic has to
+    dial SecRouter directly, even when everything else in this same topology is fronted."""
+    topo = _topo(tmp_path, EDGE_SPLIT)
+    assert topo.instance_urls("secllm", path="/v1") == ["https://secllm.sec.internal:11400/v1"]
+
+
+def test_env_for_secrouter_peers_are_bare_fronted_urls_but_secllm_pool_stays_direct(tmp_path):
+    topo = _topo(tmp_path, EDGE_SPLIT)
+    env = topo.env_for("secrouter")
+    assert env["SECCERT_URL"] == "https://seccert.sec.internal:47001"  # CA is direct, not fronted
+    assert env["SECAGENT_URL"] == "https://secagent.sec.internal"
+    # SECROUTER_SECLLM_ENDPOINTS (the backend pool) stays DIRECT + ported no matter what
+    assert env["SECROUTER_SECLLM_ENDPOINTS"] == "https://secllm.sec.internal:11400/v1"
+
+
+def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
+    """A topology.toml with no ``[groups.edge]`` section (every fixture/site that predates
+    secproxy) must produce EXACTLY the same zone + urls secdeploy generated before secproxy
+    existed — is_fronted() is False for everyone, so nothing routes through a proxy that
+    isn't placed. Pinned to the literal pre-secproxy values (captured from this same GPU_SPLIT
+    fixture before the fronting axis existed), not just a handful of ``in`` checks."""
+    topo = _topo(tmp_path, GPU_SPLIT)
+    assert topo.zone() == [
+        ("seccert.sec.internal", "A", "10.0.0.5"),
+        ("secsso.sec.internal", "A", "10.0.0.5"),
+        ("secdns.sec.internal", "A", "10.0.0.5"),
+        ("secllm.sec.internal", "A", "10.0.0.6"),
+        ("secrouter.sec.internal", "A", "10.0.0.5"),
+        ("secagent.sec.internal", "A", "10.0.0.5"),
+        ("secchat.sec.internal", "A", "10.0.0.5"),
+        ("secrecorder.sec.internal", "A", "10.0.0.5"),
+    ]
+    assert topo.urls() == {
+        "SECCERT": "https://seccert.sec.internal:47001",
+        "SECSSO": "https://secsso.sec.internal:9000",
+        "SECDNS": "https://secdns.sec.internal:53",
+        "SECLLM": "https://secllm.sec.internal:11400",
+        "SECROUTER": "https://secrouter.sec.internal:47002",
+        "SECAGENT": "https://secagent.sec.internal:47007",
+        "SECCHAT": "https://secchat.sec.internal:8065",
+        "SECRECORDER": "https://secrecorder.sec.internal:47003",
+    }
+
+
 # ── validation: errors ──────────────────────────────────────────────────────────────
 def test_unknown_resource_rejected(tmp_path):
     bad = GPU_SPLIT.replace('[groups.gateway]\nresource = "core"',
@@ -238,6 +368,15 @@ resource = "core"
     topo = _topo(tmp_path, no_identity)
     placement = topo.placement()
     assert "seccert" not in placement and "secsso" not in placement
+    assert "secrouter" in placement
+
+
+def test_secproxy_unplaced_edge_group_omitted_is_allowed(tmp_path):
+    # GPU_SPLIT never declares [groups.edge] — secproxy (optional) is simply unplaced, exactly
+    # like the optional identity components above; still legal, not an error.
+    topo = _topo(tmp_path, GPU_SPLIT)
+    placement = topo.placement()
+    assert "secproxy" not in placement
     assert "secrouter" in placement
 
 

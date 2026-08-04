@@ -14,8 +14,9 @@ from pathlib import Path
 TARGET_KINDS = {"compose", "systemd-native", "image"}
 COMPONENT_KINDS = {"service", "stack"}
 # Placement tiers — a component belongs to exactly one; the site topology assigns each
-# tier to a compute resource (see topology.py).
-TIERS = {"identity", "inference", "gateway", "collab"}
+# tier to a compute resource (see topology.py). "edge" (secproxy, the suite's Caddy reverse
+# proxy) is the newest — see the "fronted" flag below for how it interacts with the others.
+TIERS = {"identity", "inference", "gateway", "collab", "edge"}
 
 
 @dataclass
@@ -24,9 +25,10 @@ class Component:
     repo: str  # "org/name" on GitHub
     ref: str  # git tag/branch/sha to pin
     kind: str = "service"  # "service" (built from source) | "stack" (compose deploy of upstream)
-    tier: str = ""  # placement tier: identity | inference | gateway | collab
+    tier: str = ""  # placement tier: identity | inference | gateway | collab | edge
     port: int = 0  # primary inbound port for peer addressing (0 = no inbound listener)
     optional: bool = False  # optional infra — droppable with `--without`
+    fronted: bool = False  # HTTP service secproxy (Caddy) puts behind :443 — see topology.is_fronted
     runtime: str = ""
     role: str = ""
 
@@ -64,6 +66,7 @@ class Manifest:
                 tier=c.get("tier", ""),
                 port=int(c.get("port", 0)),
                 optional=bool(c.get("optional", False)),
+                fronted=bool(c.get("fronted", False)),
                 runtime=c.get("runtime", ""),
                 role=c.get("role", ""),
             )
@@ -160,6 +163,8 @@ class Manifest:
                 lines.append(f"port = {c.port}")
             if c.optional:
                 lines.append("optional = true")
+            if c.fronted:
+                lines.append("fronted = true")
             if c.runtime:
                 lines.append(f'runtime = "{c.runtime}"')
             lines.append(f'role = "{c.role}"')

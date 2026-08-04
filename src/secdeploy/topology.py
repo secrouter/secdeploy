@@ -2,12 +2,13 @@
 
 ``suite.toml`` is the immutable bill of materials — *what versions*. ``topology.toml`` is
 the operator's *site placement*: the compute resources (hosts) and which predefined tier
-(``identity`` / ``inference`` / ``gateway`` / ``collab``) lands on each. From a manifest +
-topology we derive, deterministically:
+(``identity`` / ``inference`` / ``gateway`` / ``collab`` / ``edge``) lands on each. From a
+manifest + topology we derive, deterministically:
 
 * **placement** — which resource each component runs on (via its tier);
 * **FQDNs** — a stable ``<component>.<domain>`` name per component;
-* **zone** — the A records ``secdns`` serves so those names resolve to the hosting resource;
+* **zone** — the A records ``secdns`` serves so those names resolve to the hosting resource
+  (or, for a FRONTED component, to secproxy's — see :meth:`Topology.is_fronted`);
 * **env** — each component's *peer URLs*, the service-to-service wiring that lets a
   multi-host suite address and talk to itself.
 
@@ -208,6 +209,26 @@ class Topology:
             if resource in self.groups.get(c.tier, [])
         }
 
+    def _proxy_address(self) -> str | None:
+        """The address of the resource the ``edge`` tier (secproxy) is placed on, or ``None``
+        if secproxy/edge isn't placed in this topology at all. Like :meth:`resource_for`, the
+        first resource wins if the edge tier were ever spread across several (secproxy is a
+        single front door in this design, so that shouldn't happen in practice)."""
+        res_list = self.groups.get("edge")
+        if not res_list:
+            return None
+        return self.resources[res_list[0]].address
+
+    def is_fronted(self, component: str) -> bool:
+        """Whether ``component``'s traffic is addressed via secproxy instead of its own
+        resource — true only when the manifest marks it ``fronted`` AND secproxy is actually
+        placed somewhere in this topology. A topology with no ``edge`` tier at all (every
+        topology that predates secproxy, and any without one today) makes this ``False`` for
+        every component, so :meth:`zone`/:meth:`urls`/:meth:`instance_urls` stay
+        byte-identical to their pre-secproxy behavior — fronting only takes effect once
+        secproxy is actually deployed."""
+        return self.manifest.components[component].fronted and self._proxy_address() is not None
+
     def instances(self, component: str) -> list[tuple[str, str, str]]:
         """Every ``(instance_name, resource_name, address)`` for ``component`` — one per
         resource its tier is placed on.
@@ -226,24 +247,41 @@ class Topology:
 
     def zone(self, without: list[str] | None = None) -> list[tuple[str, str, str]]:
         """DNS records secdns serves: (fqdn, "A", resource address) — one per placed
-        *instance*, so a multi-resource tier gets one A record per instance."""
+        *instance*, so a multi-resource tier gets one A record per instance.
+
+        A FRONTED component (see :meth:`is_fronted`) resolves to secproxy's address instead
+        of its own backend resource — secproxy is the suite's one HTTPS front door, so peers
+        (and secdns clients) reach the fronted FQDN straight at it, and it routes to the real
+        backend by Host header (see ``wiring.caddyfile_text``). Unaffected when secproxy isn't
+        placed in this topology at all — every component keeps resolving to its own resource,
+        exactly as before secproxy existed."""
         records: list[tuple[str, str, str]] = []
+        edge_addr = self._proxy_address()
         for name, c in self.manifest.select(without).items():
             if c.tier not in self.groups:
                 continue
+            proxy_addr = edge_addr if self.is_fronted(name) else None
             for instance_name, _res, addr in self.instances(name):
-                records.append((self.fqdn(instance_name), "A", addr))
+                records.append(
+                    (self.fqdn(instance_name), "A", proxy_addr if proxy_addr is not None else addr)
+                )
         return records
 
     def urls(self, without: list[str] | None = None, scheme: str = "https") -> dict[str, str]:
         """Peer base URLs keyed by upper-cased component name, for single-instance addressable
         (port>0) peers. A component whose tier spans multiple resources has no single URL —
-        use :meth:`instance_urls` (e.g. ``SECROUTER_SECLLM_ENDPOINTS``) for those instead."""
-        return {
-            name.upper(): f"{scheme}://{self.fqdn(name)}:{c.port}"
-            for name, c in self.manifest.select(without).items()
-            if c.port and len(self.groups.get(c.tier, [])) == 1
-        }
+        use :meth:`instance_urls` (e.g. ``SECROUTER_SECLLM_ENDPOINTS``) for those instead.
+
+        A FRONTED component (see :meth:`is_fronted`) gets a bare ``https://<fqdn>`` — secproxy
+        always terminates :443, so the port is implied — instead of ``https://<fqdn>:<port>``.
+        """
+        result: dict[str, str] = {}
+        for name, c in self.manifest.select(without).items():
+            if not c.port or len(self.groups.get(c.tier, [])) != 1:
+                continue
+            suffix = "" if self.is_fronted(name) else f":{c.port}"
+            result[name.upper()] = f"{scheme}://{self.fqdn(name)}{suffix}"
+        return result
 
     def instance_urls(
         self, component: str, without: list[str] | None = None,
@@ -251,14 +289,20 @@ class Topology:
     ) -> list[str]:
         """Every instance's base URL for ``component`` (one per resource its tier is placed
         on) — e.g. the SecLLM backend pool SecRouter load-balances/fails over across. Empty
-        if ``component`` isn't selected or has no inbound port."""
+        if ``component`` isn't selected or has no inbound port.
+
+        A FRONTED instance (see :meth:`is_fronted`) gets a bare ``https://<fqdn>`` (443
+        implied); otherwise ``https://<fqdn>:<port>`` as before. SecLLM is never fronted
+        (inference must dial direct, never through the proxy), so its pool stays direct+ported
+        regardless of what else is fronted in this topology."""
         if component not in self.manifest.select(without):
             return []
         port = self.manifest.components[component].port
         if not port:
             return []
+        suffix = "" if self.is_fronted(component) else f":{port}"
         return [
-            f"{scheme}://{self.fqdn(name)}:{port}{path}"
+            f"{scheme}://{self.fqdn(name)}{suffix}{path}"
             for name, _res, _addr in self.instances(component)
         ]
 
@@ -270,10 +314,16 @@ class Topology:
         """Environment for ``component``: its own identity plus every *other* peer's URL.
 
         Keys: ``SEC_DOMAIN``, ``SELF_FQDN``, ``SELF_PORT`` (if it listens), and
-        ``<PEER>_URL`` for each single-instance addressable peer (e.g. ``SECLLM_URL``).
-        SecRouter additionally gets ``SECROUTER_SECLLM_ENDPOINTS`` — the comma-joined base URL
-        of *every* SecLLM instance (one when inference is on a single resource, several when
-        it's spread across many) — since a single ``SECLLM_URL`` can't represent a pool.
+        ``<PEER>_URL`` for each single-instance addressable peer (e.g. ``SECLLM_URL``). A
+        FRONTED peer (see :meth:`is_fronted` — seccert/secsso/secrouter/secagent/secchat/
+        secrecorder, once secproxy is placed) gets a bare ``https://<fqdn>`` (443 implied) via
+        :meth:`urls`; every other peer keeps ``https://<fqdn>:<port>``. Backward-compatible: a
+        topology with no ``edge`` tier placed makes every peer URL identical to before secproxy
+        existed. SecRouter additionally gets ``SECROUTER_SECLLM_ENDPOINTS`` — the comma-joined
+        base URL of *every* SecLLM instance (one when inference is on a single resource,
+        several when it's spread across many) — since a single ``SECLLM_URL`` can't represent
+        a pool; SecLLM is never fronted (inference must dial direct, never through the proxy),
+        so this stays direct+ported no matter what else is fronted.
 
         ``secllm_token``/``secrouter_egress_file`` fold ``SECROUTER_SECLLM_TOKEN`` (the shared
         SecRouter<->SecLLM bearer token) / ``SECROUTER_EGRESS_FILE`` (the installed egress

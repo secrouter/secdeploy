@@ -9,7 +9,9 @@ import pytest
 from secdeploy.manifest import Manifest
 
 ROOT = Path(__file__).resolve().parents[1]
-ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "secchat", "secrecorder"}
+ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "secchat", "secrecorder",
+       "secproxy"}
+FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder"}
 
 
 def test_load_shipped_manifest():
@@ -26,10 +28,11 @@ def test_kinds_and_optional_flags():
     assert m.components["secsso"].kind == "stack"
     assert m.components["secchat"].kind == "stack"
     assert m.components["secrouter"].kind == "service"
-    assert m.optionals() == ["seccert", "secsso", "secdns"]
+    assert m.optionals() == ["seccert", "secsso", "secdns", "secproxy"]
     assert m.components["seccert"].optional and m.components["secsso"].optional
     assert m.components["secdns"].optional and m.components["secdns"].kind == "service"
     assert not m.components["secrouter"].optional
+    assert m.components["secproxy"].optional and m.components["secproxy"].kind == "service"
 
 
 def test_select_drops_optionals():
@@ -61,8 +64,18 @@ def test_tiers_and_ports():
     assert m.components["secdns"].tier == "identity"
     assert m.components["secdns"].port == 53
     assert m.components["secchat"].tier == "collab"
+    assert m.components["secproxy"].tier == "edge"
+    assert m.components["secproxy"].port == 443
     # every component is tiered
     assert all(c.tier for c in m.components.values())
+
+
+# ── fronted axis: which components secproxy (Caddy) puts behind :443 ────────────────────
+def test_fronted_flags_exactly_the_six():
+    m = Manifest.load(ROOT / "suite.toml")
+    assert {name for name, c in m.components.items() if c.fronted} == FRONTED
+    for name in ("secllm", "secdns", "secproxy"):
+        assert not m.components[name].fronted
 
 
 def test_roundtrip_serialization(tmp_path):
@@ -78,6 +91,13 @@ def test_roundtrip_serialization(tmp_path):
     assert reloaded.components["secrouter"].tier == "gateway"
     assert reloaded.components["secrouter"].port == 47002
     assert reloaded.components["seccert"].port == 47001
+    # the fronted axis and the new edge component round-trip too
+    assert reloaded.components["secrouter"].fronted
+    assert not reloaded.components["secllm"].fronted
+    assert reloaded.components["secproxy"].tier == "edge"
+    assert reloaded.components["secproxy"].port == 443
+    assert reloaded.components["secproxy"].optional
+    assert not reloaded.components["secproxy"].fronted
 
 
 def test_invalid_repo_and_ref_rejected(tmp_path):

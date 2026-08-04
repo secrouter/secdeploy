@@ -58,6 +58,60 @@ resource = "core"
 resources = ["gpu1", "gpu2"]
 """
 
+# GPU_SPLIT plus secproxy (edge tier) on 'core' — the fronting axis in play.
+EDGE_SPLIT = """
+domain = "sec.internal"
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+[resources.gpu]
+target = "macos"
+address = "10.0.0.6"
+capabilities = ["gpu"]
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.edge]
+resource = "core"
+[groups.inference]
+resource = "gpu"
+"""
+
+# MULTI_INFERENCE plus secproxy on 'core' — fronting alongside a multi-resource (2-instance)
+# SecLLM pool, to confirm the Caddyfile generator isn't confused by a multi-resource tier
+# elsewhere in the same topology.
+EDGE_MULTI_INFERENCE = """
+domain = "sec.internal"
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+[resources.gpu1]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+[resources.gpu2]
+target = "fedora-fips"
+address = "10.0.0.7"
+capabilities = ["fips", "gpu"]
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.edge]
+resource = "core"
+[groups.inference]
+resources = ["gpu1", "gpu2"]
+"""
+
+FRONTED = ("secsso", "secrouter", "secagent", "secchat", "secrecorder")
+
 
 def _manifest() -> Manifest:
     return Manifest.load(ROOT / "suite.toml")
@@ -72,6 +126,18 @@ def _topo(tmp_path) -> Topology:
 def _multi_topo(tmp_path) -> Topology:
     p = tmp_path / "topology-multi.toml"
     p.write_text(MULTI_INFERENCE)
+    return Topology.load(p, _manifest())
+
+
+def _edge_topo(tmp_path) -> Topology:
+    p = tmp_path / "topology-edge.toml"
+    p.write_text(EDGE_SPLIT)
+    return Topology.load(p, _manifest())
+
+
+def _edge_multi_topo(tmp_path) -> Topology:
+    p = tmp_path / "topology-edge-multi.toml"
+    p.write_text(EDGE_MULTI_INFERENCE)
     return Topology.load(p, _manifest())
 
 
@@ -148,6 +214,89 @@ def test_write_addressing(tmp_path):
     env = written["env"]
     assert set(env) == {"secllm"}
     assert Path(env["secllm"]).exists()
+
+
+# ── caddyfile_text: secproxy's Caddyfile (fronts the 6 HTTP services on :443) ───────────
+def test_caddyfile_text_site_blocks_for_exactly_the_six(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.caddyfile_text(topo)
+    for name in FRONTED:
+        assert f"{name}.sec.internal {{" in text
+    # never fronted, regardless of placement (the CA stays a direct trust anchor)
+    assert "seccert.sec.internal {" not in text
+    assert "secllm.sec.internal {" not in text
+    assert "secdns.sec.internal {" not in text
+    assert "secproxy.sec.internal {" not in text
+
+
+def test_caddyfile_text_reverse_proxy_targets_are_correct(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.caddyfile_text(topo)
+    assert "secsso.sec.internal {\n\treverse_proxy 10.0.0.5:9000\n}" in text
+    assert "secrouter.sec.internal {\n\treverse_proxy 10.0.0.5:47002\n}" in text
+    assert "secagent.sec.internal {\n\treverse_proxy 10.0.0.5:47007\n}" in text
+    assert "secchat.sec.internal {\n\treverse_proxy 10.0.0.5:8065\n}" in text
+    assert "secrecorder.sec.internal {\n\treverse_proxy 10.0.0.5:47003\n}" in text
+
+
+def test_caddyfile_text_acme_ca_points_at_seccert_directory(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.caddyfile_text(topo)
+    assert "acme_ca http://seccert.sec.internal:47001/acme/directory" in text
+    # the global options block comes before any site block
+    assert text.index("acme_ca") < text.index("secsso.sec.internal {")
+
+
+def test_caddyfile_text_deterministic_manifest_order(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.caddyfile_text(topo)
+    order = [name for name in FRONTED if f"{name}.sec.internal {{" in text]
+    positions = [text.index(f"{name}.sec.internal {{") for name in order]
+    assert positions == sorted(positions)
+    assert order == list(FRONTED)  # manifest order: secsso, secrouter, secagent, secchat, secrecorder
+
+
+def test_caddyfile_text_no_site_blocks_when_secproxy_unplaced(tmp_path):
+    # GPU_SPLIT has no [groups.edge] — secproxy isn't deployed, so nothing is fronted; the
+    # function still renders (acme_ca is unconditional on seccert being present), just with no
+    # site blocks — the placement gating lives in write_addressing, not here.
+    topo = _topo(tmp_path)
+    text = wiring.caddyfile_text(topo)
+    for name in FRONTED:
+        assert f"{name}.sec.internal {{" not in text
+
+
+def test_caddyfile_text_multi_resource_topology_handled(tmp_path):
+    # secproxy fronts the 6 exactly the same way alongside a 2-instance SecLLM pool elsewhere —
+    # the multi-resource inference tier doesn't leak into (or get confused with) the Caddyfile.
+    topo = _edge_multi_topo(tmp_path)
+    text = wiring.caddyfile_text(topo)
+    for name in FRONTED:
+        assert f"{name}.sec.internal {{" in text
+        assert f"reverse_proxy 10.0.0.5:{topo.manifest.components[name].port}" in text
+    assert "secllm" not in text
+    assert "secllm-gpu1" not in text and "secllm-gpu2" not in text
+
+
+def test_write_addressing_writes_caddyfile_only_when_secproxy_placed_here(tmp_path):
+    topo = _edge_topo(tmp_path)  # secproxy is on 'core' (edge tier)
+    out = tmp_path / "out"
+    written_core = wiring.write_addressing(topo, out, "core")
+    assert "caddyfile" in written_core
+    caddyfile_path = Path(written_core["caddyfile"])
+    assert caddyfile_path == out / "Caddyfile"
+    assert caddyfile_path.read_text() == wiring.caddyfile_text(topo)
+
+    written_gpu = wiring.write_addressing(topo, out, "gpu")  # secllm only, not secproxy
+    assert "caddyfile" not in written_gpu
+
+
+def test_write_addressing_no_caddyfile_when_secproxy_not_in_topology(tmp_path):
+    topo = _topo(tmp_path)  # GPU_SPLIT: no edge group at all
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "core")
+    assert "caddyfile" not in written
+    assert not (out / "Caddyfile").exists()
 
 
 # ── multi-instance inference: SecRouter's backend pool (SECROUTER_SECLLM_ENDPOINTS) ─────

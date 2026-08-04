@@ -37,7 +37,9 @@ def test_single_host_preset(tmp_path):
     topo = Topology.load(dest, _manifest())
     assert topo.domain == "sec.internal" and topo.upstream_dns == ["1.1.1.1"]
     assert list(topo.resources) == ["local"]
-    assert topo.groups == {t: ["local"] for t in ("identity", "inference", "gateway", "collab")}
+    assert topo.groups == {
+        t: ["local"] for t in ("identity", "inference", "gateway", "collab", "edge")
+    }
 
 
 def test_gpu_split_preset(tmp_path):
@@ -65,12 +67,14 @@ def test_custom_preset(tmp_path):
         "custom", "2",
         "a", "fedora-fips", "10.0.0.1", "", "",       # resource a
         "b", "macos", "10.0.0.2", "", "gpu",          # resource b (has gpu)
-        "a", "b", "a", "b",                            # identity→a inference→b gateway→a collab→b
+        "a", "b", "a", "b", "a",  # identity→a inference→b gateway→a collab→b edge→a
     ]
     result = configure.run(_manifest(), dest=dest, input_fn=_driver(answers), out=lambda *_: None)
     assert result == dest
     topo = Topology.load(dest, _manifest())
-    assert topo.groups == {"identity": ["a"], "inference": ["b"], "gateway": ["a"], "collab": ["b"]}
+    assert topo.groups == {
+        "identity": ["a"], "inference": ["b"], "gateway": ["a"], "collab": ["b"], "edge": ["a"],
+    }
 
 
 def test_aborts_without_overwrite(tmp_path):

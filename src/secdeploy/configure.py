@@ -15,7 +15,7 @@ from .manifest import Manifest
 from .topology import DEFAULT_DOMAIN, Resource, Topology
 
 # Tiers, in the order we place them (and the order the suite naturally layers in).
-TIER_ORDER = ["identity", "inference", "gateway", "collab"]
+TIER_ORDER = ["identity", "inference", "gateway", "collab", "edge"]
 # Tiers that may spread across several resources (N-way placement) — currently just inference
 # (N SecLLM instances); the rest are single-resource-only in the wizard.
 MULTI_RESOURCE_TIERS = {"inference"}
