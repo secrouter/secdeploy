@@ -62,6 +62,25 @@ layering to install SecAgent's generated addressing env into. See
 turnkey standup; on macOS, source `out/addressing/env/secagent.env` yourself before running the
 printed command if you want the generated wiring.
 
+### Internal DNS (`*.internal`) on macOS
+
+A single-host eval has no topology and no `.internal` names — reach everything at
+`localhost:<port>` (see [Verify](#verify)). With a `topology.toml`, though, the suite's
+`<component>.<domain>` hostnames **do** work on macOS; it isn't a Linux-only feature:
+
+- **SecDNS runs natively** (a service on `:53`, like SecRecorder). `deploy macos` prints the
+  `sudo … secdns serve` command for you to run — it isn't auto-started.
+- **`deploy macos --configure-resolver`** writes `/etc/resolver/<domain>` pointing that domain
+  at SecDNS — macOS's native per-domain resolver — so `secrouter.<domain>` and friends resolve
+  on the host.
+
+It is **eval-grade**, though: those native services (SecDNS, SecLLM, SecAgent) are run-commands
+you start yourself rather than managed units; SecLLM runs `SECLLM_BACKEND=mock` (no GPU
+passthrough into Colima, so no real inference); the generated wiring env isn't auto-applied to
+the containers (see the limitation above); and `/etc/resolver` is host-side, so the containers
+still resolve peers through the Colima VM / `host.docker.internal`. For managed, auto-started
+services and real inference, use `fedora-fips`.
+
 SecRecorder (optional, native):
 
 ```bash
