@@ -16,7 +16,7 @@ FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder"}
 
 def test_load_shipped_manifest():
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.suite == "1.4.1"
+    assert m.suite == "1.5.0"
     assert ALL <= set(m.components)
     assert m.components["secrecorder"].ref == "v0.8.2"
     assert m.components["secagent"].ref == "v0.2.1"

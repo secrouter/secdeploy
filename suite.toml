@@ -13,7 +13,7 @@
 #           set on secllm (inference must dial direct, never through the proxy), secdns (not
 #           HTTP), or secproxy itself.
 
-suite = "1.4.1"
+suite = "1.5.0"
 released = "2026-08-04"
 description = "SecRouter secure-AI suite"
 
