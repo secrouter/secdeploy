@@ -6,9 +6,27 @@ backend can't run inside Docker on macOS.
 
 ## Prerequisites
 
+On a clean Mac, start from zero — Command Line Tools, then Homebrew, then the tools
+secdeploy drives. You don't install Python separately: `uv` runs secdeploy and
+provisions the right Python for it.
+
 ```bash
-brew install colima docker uv ffmpeg   # ffmpeg: SecRecorder transcoding (build macos also self-installs it)
-colima start                           # Docker daemon on Apple Silicon
+xcode-select --install                      # Command Line Tools (compiler, git)
+
+# Homebrew, if you don't already have it (https://brew.sh):
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+eval "$(/opt/homebrew/bin/brew shellenv)"   # put brew on PATH (Apple Silicon)
+
+brew install colima docker uv ffmpeg        # ffmpeg: SecRecorder transcoding (build macos self-installs it too)
+colima start                                # Docker daemon on Apple Silicon
+```
+
+Then get secdeploy — it runs from its checkout via `uv` (no separate Python install):
+
+```bash
+git clone https://github.com/secrouter/secdeploy
+cd secdeploy
+uv run secdeploy verify                     # sanity-check the manifest + toolchain
 ```
 
 ## Deploy
