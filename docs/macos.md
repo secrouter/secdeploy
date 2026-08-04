@@ -36,6 +36,14 @@ What `deploy macos` does:
 > on macOS it stays generated-but-unapplied. Use `fedora-fips` (or hand-edit `compose.yaml` to
 > mount the file yourself) for anything beyond a single-host eval.
 
+`deploy macos --with-agent` (with a `topology.toml` placing SecAgent here) is the same story:
+it prints a native `secagent chat serve` run command (mirroring SecRecorder/secdns/SecLLM's own
+native notes below) rather than installing anything — macOS has no systemd-style env-file
+layering to install SecAgent's generated addressing env into. See
+[SecAgent and Mattermost](fedora-fips.md#secagent-and-mattermost) for the real (fedora-fips)
+turnkey standup; on macOS, source `out/addressing/env/secagent.env` yourself before running the
+printed command if you want the generated wiring.
+
 SecRecorder (optional, native):
 
 ```bash

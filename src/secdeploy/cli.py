@@ -57,6 +57,7 @@ def _expected_assets(root: Path, target: str) -> list[Path]:
             d / "systemd/seccert.service",
             d / "systemd/secllm.service",
             d / "systemd/secrouter.service",
+            d / "systemd/secagent.service",
             d / "systemd/secrecorder.service",
         ]
     return []
@@ -195,7 +196,7 @@ def cmd_deploy(args) -> int:
         hf_token=args.hf_token, model_dir=args.model_dir,
         without=without, configure_resolver=args.configure_resolver,
         topology=topo if from_file else None, resource=resource, out=Path(args.out),
-        with_inference=args.with_inference,
+        with_inference=args.with_inference, with_agent=args.with_agent,
     )
     return 0
 
@@ -292,6 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: off — the DNS/env wiring for SecLLM's backend pool is always generated; "
              "this additionally installs + starts the secllm service). fedora-fips only; macOS "
              "prints a native run command instead (see docs/macos.md)",
+    )
+    sub.choices["deploy"].add_argument(
+        "--with-agent", action="store_true", dest="with_agent",
+        help="also stand up SecAgent's Mattermost chat-ops bridge (`secagent chat serve`) on "
+             "the resource where the collab tier is placed here (default: off — the peer-wiring "
+             "env pointing SecAgent's LLM traffic at SecRouter is always generated; this "
+             "additionally installs pi + secagent and starts the secagent service). "
+             "fedora-fips only; macOS prints a native note instead (see docs/fedora-fips.md)",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

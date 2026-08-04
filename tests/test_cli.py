@@ -384,3 +384,72 @@ def test_deploy_fedora_dry_run_secllm_only_resource_no_secrouter_addressing_env_
                  "--with-inference", "--topology", str(tp), "--resource", "gpu1"]) == 0
     out = capsys.readouterr().out
     assert "secrouter-addressing.env" not in out
+
+
+# ── --with-agent: SecAgent + Mattermost chat-ops turnkey standup ────────────────────────
+def test_deploy_fedora_with_agent_dry_run_shows_the_whole_turnkey(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # 'core' hosts identity (secsso) + gateway (secrouter) + collab (secagent, secchat)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--with-agent", "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    # 1. the secagent unit
+    assert "install secagent.service" in out
+    # 2. pi install
+    assert "install pi (coding agent runtime) globally" in out
+    assert "npm install -g @earendil-works/pi-coding-agent" in out
+    # 3. the generated addressing env
+    assert "install generated secagent addressing env" in out
+    assert "addressing/env/secagent.env" in out
+    assert "/etc/secsuite/secagent-addressing.env" in out
+    # pi's models.json install step
+    assert "install pi models.json" in out
+    assert "/var/lib/secsuite/secagent/.pi/agent/models.json" in out
+    # 4. the secchat.sh bot mint step
+    assert "bootstrap/secchat.sh bot" in out
+    assert "SECAGENT_MATTERMOST__BOT_TOKEN" in out
+    # 5. the secrouter oidc config
+    assert "SecRouter OIDC config fragment" in out
+    assert "secrouter-oidc.json" in out
+    assert "svc-secagent" in out
+
+
+def test_deploy_fedora_plain_dry_run_shows_none_of_the_agent_turnkey(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)  # same topology, --with-agent simply omitted
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "secagent.service" not in out
+    assert "pi-coding-agent" not in out
+    assert "secagent-addressing.env" not in out
+    assert "secagent-pi-models" not in out
+    assert "secchat.sh bot" not in out
+    assert "SecRouter OIDC config fragment" not in out
+
+
+def test_deploy_fedora_with_agent_single_host_unchanged(capsys):
+    # --with-agent without a topology.toml is still single-host mode — secagent stays opt-out,
+    # exactly like --with-inference/secllm (steps 1-3's wiring has nothing to generate either).
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--with-agent"]) == 0
+    out = capsys.readouterr().out
+    assert "secagent.service" not in out
+    assert "pi-coding-agent" not in out
+
+
+def test_deploy_fedora_with_agent_needs_secagent_placed_here(tmp_path, capsys):
+    # --with-agent set, topology active, but secagent isn't placed on THIS resource (gpu hosts
+    # only the inference tier in GPU_SPLIT) — the whole turnkey stays off here.
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--with-agent", "--topology", str(tp), "--resource", "gpu"]) == 0
+    out = capsys.readouterr().out
+    assert "secagent" not in out.lower()
+
+
+def test_deploy_fedora_with_agent_verify_lists_secagent_service(capsys):
+    assert main(["--manifest", MANIFEST, "verify"]) == 0
+    out = capsys.readouterr().out
+    assert "target assets present" in out  # secagent.service ships, so verify still passes clean

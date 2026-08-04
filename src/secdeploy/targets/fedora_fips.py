@@ -18,6 +18,7 @@ This module is written to also be callable by an image builder (Proxmox qcow2/LX
 
 from __future__ import annotations
 
+import json
 import platform
 from pathlib import Path
 
@@ -39,13 +40,24 @@ ANCHORS = Path("/etc/pki/ca-trust/source/anchors")
 # topology places it here; it is only deployed with a topology (it needs a generated zone).
 # secllm (local inference) likewise only stands up with a topology, and additionally needs
 # --with-inference (it's a heavyweight GPU service, so standing it up is opt-in — see deploy()).
-SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secrecorder")
+# secagent (chat-ops) follows the exact same split as secllm: standing up the SERVICE (this
+# tuple, the pi/systemd install steps below) needs --with-agent, but the generated wiring
+# itself (write_addressing's secagent branch, in wiring.py/topology.py) is placement-only,
+# unconditional on the flag — a redeploy that later turns --with-agent on picks up an env
+# that was already being generated (harmlessly unused) rather than appearing from nothing.
+SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder")
 SECDNS_ZONE = VAR / "secdns" / "secdns.zone"  # where the secdns service reads its zone
 SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_EGRESS_FILE target
 # The generated peer-wiring env (pool/token/egress-file path) — layered onto the operator's own
 # secrouter.env via a SECOND EnvironmentFile= in secrouter.service (see that unit + deploy()
 # below), a DISTINCT path from ETC/secrouter.env so it never clobbers the operator's config.
 SECROUTER_ADDRESSING_ENV = ETC / "secrouter-addressing.env"
+# Same two-file layering for secagent (see secagent.service) — generated LLM/SecSSO/Mattermost
+# wiring + webhook secret, distinct from the operator-filled ETC/secagent.env.
+SECAGENT_ADDRESSING_ENV = ETC / "secagent-addressing.env"
+# pi's system-wide models.json for the secsuite-secagent service user (HOME=VAR/secagent, per
+# its useradd --home-dir below) — the SERVICE (api-key) auth mode; see wiring.secagent_pi_models_json.
+SECAGENT_PI_MODELS = VAR / "secagent" / ".pi" / "agent" / "models.json"
 
 PLAN = [
     "Preflight: verify the host is in FIPS mode + the OpenSSL FIPS provider is active (fail closed)",
@@ -77,8 +89,8 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
             P.run(["npm", "run", "build", "--prefix", str(sr)])
         else:
             P.warn("npm not found — SecRouter must be built on the Fedora host (node>=24)")
-    # SecCert + SecRecorder + secdns + secllm — uv venvs
-    for name in ("seccert", "secrecorder", "secdns", "secllm"):
+    # SecCert + SecRecorder + secdns + secllm + secagent — uv venvs
+    for name in ("seccert", "secrecorder", "secdns", "secllm", "secagent"):
         if name in without:
             continue
         proj = work / name
@@ -86,7 +98,7 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
             P.run(["uv", "sync", "--project", str(proj)])
         else:
             P.warn(f"uv not found or {name} missing pyproject — build on the Fedora host")
-    P.log("native build complete (SecRouter dist + SecCert/SecRecorder/secdns/secllm venvs)")
+    P.log("native build complete (SecRouter dist + SecCert/SecRecorder/secdns/secllm/secagent venvs)")
 
 
 def _deploy_steps(manifest: Manifest, work: Path, root: Path,
@@ -165,6 +177,34 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
             f"install generated secrouter addressing env → {SECROUTER_ADDRESSING_ENV} "
             "(pool/token/egress-file — layered onto secrouter.env via systemd EnvironmentFile=)",
         ))
+    # secagent (--with-agent) — pi (the agent runtime) is a global npm tool, not part of any
+    # pinned checkout; install it alongside secagent's own code. Then the generated addressing
+    # env (LLM/SecSSO/Mattermost wiring + webhook secret), layered onto secagent.env via a
+    # second EnvironmentFile= exactly like secrouter's above — always refreshed, fully derived.
+    # Finally pi's own models.json (service api-key auth — see wiring.secagent_pi_models_json),
+    # installed under the service user's HOME (VAR/secagent/.pi/agent), also always refreshed.
+    if "secagent" in services and addr_dir is not None:
+        steps.append((
+            ["npm", "install", "-g", "@earendil-works/pi-coding-agent"],
+            "install pi (coding agent runtime) globally",
+        ))
+        steps.append((
+            ["install", "-m", "640", str(addr_dir / "env" / "secagent.env"),
+             str(SECAGENT_ADDRESSING_ENV)],
+            f"install generated secagent addressing env → {SECAGENT_ADDRESSING_ENV} "
+            "(LLM/SecSSO/Mattermost wiring + webhook secret — layered via systemd EnvironmentFile=)",
+        ))
+        steps.append((
+            ["install", "-d", "-m", "750", "-o", "secsuite-secagent", "-g", "secsuite-secagent",
+             str(SECAGENT_PI_MODELS.parent)],
+            f"pi config dir {SECAGENT_PI_MODELS.parent}",
+        ))
+        steps.append((
+            ["bash", "-c", f"test -f {addr_dir}/secagent-pi-models.json && "
+             f"install -m 644 -o secsuite-secagent -g secsuite-secagent "
+             f"{addr_dir}/secagent-pi-models.json {SECAGENT_PI_MODELS} || true"],
+            f"install pi models.json (service api-key auth) → {SECAGENT_PI_MODELS}",
+        ))
     # units — only the selected services, plus the suite target
     for svc in services:
         steps.append((["install", "-m", "644", str(unit_dir / f"{svc}.service"), f"{UNITS}/"],
@@ -201,6 +241,7 @@ def deploy(
     resource: str | None = None,
     out: Path | None = None,
     with_inference: bool = False,
+    with_agent: bool = False,
 ) -> None:
     if hf_token or model_dir:
         P.warn("--hf-token/--model-dir are macOS-only — on fedora-fips, set HF_TOKEN/"
@@ -213,7 +254,8 @@ def deploy(
     # topology (it needs a generated zone); single-host (no topology) is byte-identical. secllm
     # additionally needs --with-inference: the DNS + peer-env wiring (steps 1-3) always reflects
     # the inference tier's placement, but standing up the (heavyweight, GPU) service itself is
-    # opt-in.
+    # opt-in. secagent additionally needs --with-agent — UNLIKE secllm, its generated wiring is
+    # ALSO gated by the flag (see the SERVICES comment above), so this single check covers both.
     placed = set(topology.components_on(resource, without)) if topology is not None else None
 
     def _include(svc: str) -> bool:
@@ -222,6 +264,8 @@ def deploy(
         if svc == "secdns" and topology is None:
             return False
         if svc == "secllm" and (topology is None or not with_inference):
+            return False
+        if svc == "secagent" and (topology is None or not with_agent):
             return False
         return placed is None or svc in placed
 
@@ -233,8 +277,28 @@ def deploy(
     # Neither step here is confirm()-gated (unlike their macOS counterparts), so "the step is in
     # the plan" and "the step happened" coincide once a real run reaches the end without dying.
     trust_anchor_added = "seccert" in services
+    secagent_enabled = "secagent" in services
     addr_dir = (Path(out) / "addressing") if (topology is not None and out is not None) else None
     steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir)
+
+    # SecAgent's Mattermost bot token is minted on the SecChat host, not this one, and
+    # `mmctl token generate` produces a fresh, non-idempotent token with no machine-readable
+    # output contract secdeploy could safely parse across hosts — so this stays a printed
+    # operator step (mirrors targets/common.py's deploy_stacks .env-from-example pattern)
+    # rather than an automated cross-host fetch. Same note whether dry-run or real.
+    secagent_bot_note = (
+        "mint the SecAgent Mattermost bot token: on the SecChat host, run "
+        "`bash bootstrap/secchat.sh bot`, copy the printed token, and set it as "
+        f"SECAGENT_MATTERMOST__BOT_TOKEN in {ETC}/secagent.env"
+    )
+    # SecRouter's OIDC config fragment (security.oidc.issuer/jwksUri/serviceSubjects) — not a
+    # turnkey env var like SECROUTER_EGRESS_FILE (SecRouter's FREEROUTER_CONFIG is hand-authored
+    # JSON), so write_addressing() writes it as a documented fragment for the operator to merge
+    # rather than installing it anywhere. It's generated whenever SecRouter+SecSSO are co-placed
+    # (--with-agent or not — same placement-only precedent as the rest of write_addressing), but
+    # only SURFACED here (dry-run/log) when --with-agent is set, since it's specifically about
+    # authorizing svc-secagent and would be noise otherwise.
+    oidc_preview = wiring.secrouter_oidc_config(topology, without) if topology is not None else {}
 
     # Optional: point this host's resolver at secdns for the internal domain.
     resolver_configured = False
@@ -263,6 +327,13 @@ def deploy(
             print(f"  · {desc}\n      {' '.join(cmd)}")
         if stacks:
             common.deploy_stacks(work, stacks, dry_run=True)
+        if secagent_enabled and "secchat" in stacks:
+            print(f"  · {secagent_bot_note}")
+        if secagent_enabled and oidc_preview:
+            oidc_path = (addr_dir / "secrouter-oidc.json") if addr_dir else None
+            print(f"  · SecRouter OIDC config fragment (merge into security.oidc) would be "
+                  f"written → {oidc_path}: issuer={oidc_preview['issuer']!r}, "
+                  f"serviceSubjects={oidc_preview['serviceSubjects']!r}")
         if out is not None:
             note = audit.dry_run_note(
                 out, NAME, resource, component_count=len(services) + len(stacks),
@@ -292,12 +363,33 @@ def deploy(
             # independent token.
             api_token = wiring.secllm_shared_token(addr_dir)
             (addr_dir / "secllm.env").write_text(wiring.secllm_env_text(api_token=api_token))
+        if secagent_enabled:
+            # pi's models.json (service api-key auth) — generated from secagent's OWN checked-
+            # out example (never hardcoded here, so secdeploy can't drift from secagent's
+            # actual model catalog), with the real SecRouter URL substituted and apiKey added.
+            models_example = work / "secagent" / "pi" / "models.secrouter.example.json"
+            secrouter_url = topology.urls(without).get("SECROUTER")
+            if models_example.exists() and secrouter_url:
+                example = json.loads(models_example.read_text())
+                models = wiring.secagent_pi_models_json(example, f"{secrouter_url}/v1")
+                (addr_dir / "secagent-pi-models.json").write_text(json.dumps(models, indent=2) + "\n")
+            elif not models_example.exists():
+                P.warn(f"{models_example} not found — pi models.json will not be generated "
+                       "(expected secagent's checkout to carry pi/models.secrouter.example.json)")
+            else:
+                P.warn("secagent: SecRouter has no addressable URL in this topology — "
+                       "skipping pi models.json generation")
+        if secagent_enabled and written.get("oidc"):
+            P.log(f"SecRouter OIDC config fragment written → {written['oidc']} "
+                  "(merge into security.oidc — see docs/fedora-fips.md)")
         P.log(f"addressing artifacts written → {addr_dir}")
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)
     if stacks:
         common.deploy_stacks(work, stacks, dry_run=False)
+    if secagent_enabled and "secchat" in stacks:
+        P.warn(secagent_bot_note)
     if out is not None:
         # CMMC audit evidence: what landed on this resource + which security-relevant
         # authorizations (trust anchor / resolver / SecLLM inference auth) this run made —
@@ -308,13 +400,14 @@ def deploy(
             manifest, topology, resource, out,
             target=NAME, services=services, shas=shas, stacks=stacks,
             flags={
-                "with_inference": with_inference, "tls": tls, "trust_ca": trust_ca,
-                "configure_resolver": configure_resolver, "without": without,
+                "with_inference": with_inference, "with_agent": with_agent, "tls": tls,
+                "trust_ca": trust_ca, "configure_resolver": configure_resolver, "without": without,
             },
             addressing=written,
             trust_anchor_added=trust_anchor_added,
             resolver_configured=resolver_configured,
             secllm_auth_enabled=(addr_dir is not None),
+            secagent_enabled=secagent_enabled,
         )
         P.log(f"deploy audit artifact written → {audit_path}")
     P.log("suite deployed — check `secdeploy status fedora-fips`")

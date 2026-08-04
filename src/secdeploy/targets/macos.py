@@ -291,6 +291,7 @@ def deploy(
     resource: str | None = None,
     out: Path | None = None,
     with_inference: bool = False,
+    with_agent: bool = False,
 ) -> None:
     without = without or []
     # Topology placement: only bring up the components placed on `resource` (single-host
@@ -300,16 +301,18 @@ def deploy(
     def _here(name: str) -> bool:
         return placed is None or name in placed
 
-    # Components on THIS resource this run — same secdns/secllm gating as fedora_fips._include
-    # (secdns needs a topology; secllm additionally needs --with-inference). Used for the
-    # deploy audit artifact (audit.py) — recorded regardless of whether secdeploy itself starts
-    # the process (SecRecorder is always just a printed run command on macOS, never a managed
-    # service), since the audit's job is "what's part of this deploy", not "what secdeploy ran".
+    # Components on THIS resource this run — same secdns/secllm/secagent gating as
+    # fedora_fips._include (secdns needs a topology; secllm/secagent additionally need
+    # --with-inference/--with-agent). Used for the deploy audit artifact (audit.py) — recorded
+    # regardless of whether secdeploy itself starts the process (SecRecorder/secagent are
+    # always just a printed run command on macOS, never a managed service), since the audit's
+    # job is "what's part of this deploy", not "what secdeploy ran".
     services = [
-        n for n in ("secdns", "seccert", "secllm", "secrouter", "secrecorder")
+        n for n in ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder")
         if n not in without
         and (n != "secdns" or topology is not None)
         and (n != "secllm" or (topology is not None and with_inference))
+        and (n != "secagent" or (topology is not None and with_agent))
         and _here(n)
     ]
 
@@ -370,6 +373,24 @@ def deploy(
             P.warn(f"secllm is native on macOS (no GPU passthrough into Colima) — start it "
                    f"(GPU-free eval via SECLLM_BACKEND=mock) with: {secllm_cmd}")
 
+    # secagent's Mattermost chat-ops bridge — KNOWN EVAL LIMITATION, not fixed here: fedora-fips
+    # gets a real systemd install (two layered EnvironmentFile=, see docs/fedora-fips.md); macOS
+    # has no equivalent service-manager env-file layering (compose.yaml has none either — same
+    # gap as SecRouter's own addressing env, see docs/macos.md), so this is a native-run note
+    # only, mirroring secdns/secllm's own notes above. The generated addressing env
+    # (write_addressing()'s secagent branch — LLM/SecSSO/Mattermost wiring + webhook secret)
+    # still lands in out/addressing/env/secagent.env either way; an operator running this
+    # manually can source it themselves.
+    if with_agent and topology is not None and _here("secagent"):
+        chat_cmd = "uv run --project work/secagent secagent chat serve --port 8070"
+        if dry_run:
+            print(f"  · (--with-agent) secagent: run natively (known eval limitation — no "
+                  f"macOS service install, see docs/macos.md) → {chat_cmd}")
+        else:
+            P.warn("secagent chat-ops has no macOS service install (known eval limitation — "
+                   f"see docs/macos.md) — start it manually, e.g. sourcing the generated "
+                   f"addressing env: {chat_cmd}")
+
     # Optional: point this host's resolver at secdns for the internal domain.
     resolver_configured = False
     if configure_resolver and topology is not None:
@@ -398,13 +419,14 @@ def deploy(
             manifest, topology, resource, out,
             target=NAME, services=services, shas=shas, stacks=stacks,
             flags={
-                "with_inference": with_inference, "tls": tls, "trust_ca": trust_ca,
-                "configure_resolver": configure_resolver, "without": without,
+                "with_inference": with_inference, "with_agent": with_agent, "tls": tls,
+                "trust_ca": trust_ca, "configure_resolver": configure_resolver, "without": without,
             },
             addressing=written,
             trust_anchor_added=trust_anchor_added,
             resolver_configured=resolver_configured,
             secllm_auth_enabled=(written is not None),
+            secagent_enabled=("secagent" in services),
         )
         P.log(f"deploy audit artifact written → {audit_path}")
 

@@ -265,6 +265,7 @@ class Topology:
     def env_for(
         self, component: str, without: list[str] | None = None, scheme: str = "https",
         *, secllm_token: str | None = None, secrouter_egress_file: str | None = None,
+        secagent_webhook_secret: str | None = None,
     ) -> dict[str, str]:
         """Environment for ``component``: its own identity plus every *other* peer's URL.
 
@@ -280,12 +281,26 @@ class Topology:
         ``wiring.secrouter_egress_rules``. Both are secrets/paths a caller supplies rather than
         topology-derived data, unlike everything else this method computes, and (like
         ``SECROUTER_SECLLM_ENDPOINTS``) only apply to ``component == "secrouter"``.
+
+        SecAgent gets its own dedicated block (``SECAGENT_LLM__*``/``SECAGENT_SECSSO__*``/
+        ``SECAGENT_MATTERMOST__*`` — secagent's pydantic-settings nested-env convention,
+        double-underscore-delimited, distinct from the generic ``<PEER>_URL`` keys above which
+        secagent's own config loader simply ignores): the LLM endpoint always points at
+        SecRouter (never directly at SecLLM, so chat-triggered inference stays governed/
+        audited), the SecSSO token endpoint and Mattermost URL are derived the same way as any
+        other peer URL, and a handful of suite-wide conventions are fixed (client_id
+        ``"secagent"``, team ``"secrouter"`` — matching secchat's own bootstrap script,
+        ``SECAGENT_LLM__API_KEY="!secagent token"`` — never a secret, a resolved-at-request-time
+        command, ``SECAGENT_LLM__MODEL="balanced"``, audit enabled). ``secagent_webhook_secret``
+        (see ``wiring.secagent_webhook_secret``) is the one piece secagent needs that isn't
+        derivable from the topology, so — like ``secllm_token`` above — a caller supplies it.
         """
         c = self.manifest.components[component]
         env: dict[str, str] = {"SEC_DOMAIN": self.domain, "SELF_FQDN": self.fqdn(component)}
         if c.port:
             env["SELF_PORT"] = str(c.port)
-        for key, url in self.urls(without, scheme).items():
+        peer_urls = self.urls(without, scheme)
+        for key, url in peer_urls.items():
             if key == component.upper():
                 continue
             env[f"{key}_URL"] = url
@@ -297,6 +312,23 @@ class Topology:
                 env["SECROUTER_SECLLM_TOKEN"] = secllm_token
             if secrouter_egress_file:
                 env["SECROUTER_EGRESS_FILE"] = secrouter_egress_file
+        if component == "secagent":
+            secrouter_url = peer_urls.get("SECROUTER")
+            if secrouter_url:
+                env["SECAGENT_LLM__BASE_URL"] = f"{secrouter_url}/v1"
+            secsso_url = peer_urls.get("SECSSO")
+            if secsso_url:
+                env["SECAGENT_SECSSO__TOKEN_URL"] = f"{secsso_url}/application/o/token/"
+            secchat_url = peer_urls.get("SECCHAT")
+            if secchat_url:
+                env["SECAGENT_MATTERMOST__URL"] = secchat_url
+            env["SECAGENT_SECSSO__CLIENT_ID"] = "secagent"
+            env["SECAGENT_MATTERMOST__TEAM"] = "secrouter"
+            env["SECAGENT_LLM__API_KEY"] = "!secagent token"
+            env["SECAGENT_LLM__MODEL"] = "balanced"
+            env["SECAGENT_AUDIT__ENABLED"] = "true"
+            if secagent_webhook_secret:
+                env["SECAGENT_MATTERMOST__WEBHOOK_SECRET"] = secagent_webhook_secret
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────

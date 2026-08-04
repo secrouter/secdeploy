@@ -374,6 +374,194 @@ def test_write_addressing_secrouter_egress_path_override(tmp_path):
     assert Path(written["egress"]).exists()
 
 
+# ── secrouter_oidc_config: security.oidc fragment for SecSSO issuer_mode: global ────────
+def test_secrouter_oidc_config_shape(tmp_path):
+    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier)
+    oidc = wiring.secrouter_oidc_config(topo)
+    assert oidc == {
+        "issuer": "https://secsso.sec.internal:9000/",
+        "audience": "secrouter",
+        "jwksUri": "https://secsso.sec.internal:9000/application/o/secrouter/jwks/",
+        "serviceSubjects": ["svc-secagent"],
+    }
+
+
+def test_secrouter_oidc_config_empty_without_secsso(tmp_path):
+    crafted = (
+        'suite = "1"\n'
+        '[components.secrouter]\nrepo = "o/secrouter"\nref = "v1"\ntier = "gateway"\nport = 47002\n'
+        '[targets.fedora-fips]\nkind = "systemd-native"\n'
+    )
+    mpath = tmp_path / "suite.toml"
+    mpath.write_text(crafted)
+    m = Manifest.load(mpath)
+    topo_text = (
+        'domain = "sec.internal"\n'
+        '[resources.core]\ntarget = "fedora-fips"\naddress = "10.0.0.5"\n'
+        '[groups.gateway]\nresource = "core"\n'
+    )
+    tp = tmp_path / "topology.toml"
+    tp.write_text(topo_text)
+    topo = Topology.load(tp, m)
+    assert wiring.secrouter_oidc_config(topo) == {}
+
+
+def test_secrouter_oidc_config_json_serializable(tmp_path):
+    topo = _topo(tmp_path)
+    oidc = wiring.secrouter_oidc_config(topo)
+    assert json.loads(json.dumps(oidc)) == oidc
+
+
+# ── secagent_pi_models_json: adapt the example for pi's service (api-key) auth mode ─────
+def test_secagent_pi_models_json_substitutes_base_url_and_api_key():
+    example = {
+        "_comment": ["KIMI GUARD: registers ONLY the secrouter provider"],
+        "providers": {
+            "secrouter": {
+                "baseUrl": "https://secrouter.<domain>:47002/v1",
+                "models": [{"id": "gemma-3-12b-it", "name": "Gemma 3 12B (SecRouter)"}],
+            }
+        },
+    }
+    result = wiring.secagent_pi_models_json(example, "https://secrouter.sec.internal:47002/v1")
+    provider = result["providers"]["secrouter"]
+    assert provider["baseUrl"] == "https://secrouter.sec.internal:47002/v1"
+    assert provider["apiKey"] == "!secagent token"
+    # model catalog + comment pass through unchanged
+    assert provider["models"] == example["providers"]["secrouter"]["models"]
+    assert result["_comment"] == example["_comment"]
+    # pure function — the input is untouched
+    assert "apiKey" not in example["providers"]["secrouter"]
+
+
+def test_secagent_pi_models_json_never_introduces_kimi():
+    example = {"providers": {"secrouter": {"baseUrl": "https://secrouter.<domain>:47002/v1"}}}
+    result = wiring.secagent_pi_models_json(example, "https://secrouter.sec.internal:47002/v1")
+    assert "kimi" not in json.dumps(result).lower()
+    assert set(result["providers"]) == {"secrouter"}  # no provider added, none removed
+
+
+def test_secagent_pi_models_json_handles_multiple_providers():
+    example = {"providers": {
+        "a": {"baseUrl": "https://a.example/v1"},
+        "b": {"baseUrl": "https://b.example/v1"},
+    }}
+    result = wiring.secagent_pi_models_json(example, "https://secrouter.sec.internal:47002/v1")
+    assert result["providers"]["a"]["baseUrl"] == "https://secrouter.sec.internal:47002/v1"
+    assert result["providers"]["b"]["baseUrl"] == "https://secrouter.sec.internal:47002/v1"
+    assert result["providers"]["a"]["apiKey"] == "!secagent token"
+    assert result["providers"]["b"]["apiKey"] == "!secagent token"
+
+
+def test_secagent_pi_models_json_against_real_shipped_example():
+    # Exercises the REAL file from the sibling secagent checkout (not a hardcoded fixture),
+    # so this catches drift if that file's shape ever changes. Skips gracefully if the
+    # sibling checkout isn't present.
+    example_path = ROOT.parent / "secagent" / "pi" / "models.secrouter.example.json"
+    if not example_path.exists():
+        pytest.skip("secagent checkout not present alongside secdeploy")
+    example = json.loads(example_path.read_text())
+    result = wiring.secagent_pi_models_json(example, "https://secrouter.sec.internal:47002/v1")
+    assert result["providers"]["secrouter"]["baseUrl"] == "https://secrouter.sec.internal:47002/v1"
+    assert result["providers"]["secrouter"]["apiKey"] == "!secagent token"
+    # No provider named/keyed "kimi" was ADDED (the real example's _comment legitimately
+    # *mentions* Kimi, by name, to document that it's excluded — that's expected pass-through
+    # text, not a provider entry, so this checks provider KEYS specifically, not the raw dump).
+    assert "kimi" not in {k.lower() for k in result.get("providers", {})}
+
+
+# ── secagent_webhook_secret: cached-on-disk, redeploy-stable ─────────────────────────────
+def test_secagent_webhook_secret_persists_and_is_reused(tmp_path):
+    out = tmp_path / "out"
+    t1 = wiring.secagent_webhook_secret(out)
+    t2 = wiring.secagent_webhook_secret(out)
+    assert t1 == t2
+    assert (out / "secagent-webhook-secret").read_text().strip() == t1
+
+
+def test_secagent_webhook_secret_distinct_from_secllm_shared_token(tmp_path):
+    out = tmp_path / "out"
+    assert wiring.secagent_webhook_secret(out) != wiring.secllm_shared_token(out)
+
+
+# ── Topology.env_for: the secagent branch ────────────────────────────────────────────────
+def test_env_for_secagent_llm_points_at_secrouter(tmp_path):
+    topo = _topo(tmp_path)
+    env = topo.env_for("secagent")
+    assert env["SECAGENT_LLM__BASE_URL"] == "https://secrouter.sec.internal:47002/v1"
+    assert env["SECAGENT_LLM__API_KEY"] == "!secagent token"
+    assert env["SECAGENT_LLM__MODEL"] == "balanced"
+
+
+def test_env_for_secagent_secsso_and_mattermost(tmp_path):
+    topo = _topo(tmp_path)
+    env = topo.env_for("secagent")
+    assert env["SECAGENT_SECSSO__TOKEN_URL"] == \
+        "https://secsso.sec.internal:9000/application/o/token/"
+    assert env["SECAGENT_SECSSO__CLIENT_ID"] == "secagent"
+    assert env["SECAGENT_MATTERMOST__URL"] == "https://secchat.sec.internal:8065"
+    assert env["SECAGENT_MATTERMOST__TEAM"] == "secrouter"
+    assert env["SECAGENT_AUDIT__ENABLED"] == "true"
+
+
+def test_env_for_secagent_webhook_secret_only_when_given(tmp_path):
+    topo = _topo(tmp_path)
+    assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET" not in topo.env_for("secagent")
+    env = topo.env_for("secagent", secagent_webhook_secret="whs-123")
+    assert env["SECAGENT_MATTERMOST__WEBHOOK_SECRET"] == "whs-123"
+
+
+def test_env_for_non_secagent_never_gets_secagent_only_keys(tmp_path):
+    topo = _topo(tmp_path)
+    # NOTE: secrouter's env legitimately gets a generic "SECAGENT_URL" peer entry (secagent
+    # is just another addressable peer) — that's pre-existing, unrelated behavior. What must
+    # NOT leak onto a non-secagent component is the double-underscore-delimited, secagent
+    # pydantic-settings keys this feature adds.
+    env = topo.env_for("secrouter", secagent_webhook_secret="whs-123")
+    assert "SECAGENT_URL" in env  # sanity: the generic peer entry IS present
+    assert not any("__" in k and k.startswith("SECAGENT_") for k in env)
+    assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET" not in env
+
+
+# ── write_addressing: secagent env + secrouter-oidc.json integration ────────────────────
+def test_write_addressing_secagent_env_has_full_wiring(tmp_path):
+    topo = _topo(tmp_path)  # secagent + secrouter + secsso + secchat all on 'core'
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "core")
+    text = Path(written["env"]["secagent"]).read_text()
+    assert "SECAGENT_LLM__BASE_URL=https://secrouter.sec.internal:47002/v1" in text
+    assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET=" in text
+    token_line = next(
+        ln for ln in text.splitlines() if ln.startswith("SECAGENT_MATTERMOST__WEBHOOK_SECRET=")
+    )
+    assert token_line.split("=", 1)[1] == wiring.secagent_webhook_secret(out)
+
+
+def test_write_addressing_writes_secrouter_oidc_json(tmp_path):
+    topo = _topo(tmp_path)
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "core")
+    assert "oidc" in written
+    oidc_path = Path(written["oidc"])
+    assert oidc_path == out / "secrouter-oidc.json"
+    assert json.loads(oidc_path.read_text()) == wiring.secrouter_oidc_config(topo)
+
+
+def test_write_addressing_no_oidc_json_when_secrouter_not_here(tmp_path):
+    topo = _topo(tmp_path)
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "gpu")  # secllm-only resource
+    assert "oidc" not in written
+
+
+def test_write_addressing_secagent_env_absent_when_secagent_not_here(tmp_path):
+    topo = _topo(tmp_path)
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "gpu")
+    assert "secagent" not in written["env"]
+    assert not (out / "secagent-webhook-secret").exists()
+
+
 def test_write_addressing_shared_token_matches_secllm_and_secrouter(tmp_path):
     topo = _topo(tmp_path)  # secrouter on 'core', secllm on 'gpu'
     out = tmp_path / "out"
