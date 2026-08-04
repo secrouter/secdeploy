@@ -238,8 +238,8 @@ above.
   it to that resource's `ssh` endpoint, and deploys it remotely. `--dry-run` prints the runbook.
 - **`secdns` is stood up** on the host where the `identity` tier lands (Fedora systemd unit /
   macOS native), fed by the generated zone + env — so the internal names actually resolve.
-- **`secproxy` is stood up** on the host where the `edge` tier lands (Fedora systemd unit
-  running Caddy natively; a container on macOS), fed by the generated `Caddyfile` — no
+- **`secproxy` is stood up** on the host where the `edge` tier lands (Fedora systemd unit /
+  macOS native, both running Caddy), fed by the generated `Caddyfile` — no
   `--with-*` flag needed, same as `secdns`. See
   [Reverse proxy](#reverse-proxy-secproxy) above and
   [SecProxy (edge reverse proxy)](fedora-fips.md#secproxy-edge-reverse-proxy).

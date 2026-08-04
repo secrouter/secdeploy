@@ -93,6 +93,26 @@ def _ensure_certbot() -> None:
         P.warn("certbot not found and brew is unavailable — install certbot manually for --tls")
 
 
+def _ensure_caddy() -> None:
+    """secproxy runs natively on macOS (see module docstring) — it needs the `caddy` binary
+    on PATH. Same idiom as _ensure_certbot() above, and likewise only invoked when secproxy is
+    actually being stood up (never during --dry-run — see its native-run note in deploy()).
+    Homebrew's caddy formula doesn't keep older major.minor releases installable side by side
+    the way fedora-fips's @caddy/caddy COPR does (see targets/fedora_fips.py), so this can't
+    pin the 2.8 line the way that one does — it installs whatever `brew install caddy`
+    currently resolves to; see docs/macos.md for a pinned-version alternative."""
+    if P.which("caddy"):
+        return
+    if P.which("brew"):
+        P.warn("caddy not found — installing via brew (required for secproxy)")
+        P.run(["brew", "install", "caddy"], check=False)
+        if not P.which("caddy"):
+            P.warn("caddy install did not complete — cannot run secproxy natively")
+    else:
+        P.warn("caddy not found and brew is unavailable — install caddy manually for secproxy "
+               "(https://caddyserver.com/docs/install)")
+
+
 def _configure_hosts(assume_yes: bool = False) -> None:
     """Map host.docker.internal to loopback on the Mac itself, so host-side clients (curl,
     browsers) can reach SecRecorder using the same hostname its SecCert cert was issued for —
@@ -303,16 +323,19 @@ def deploy(
 
     # Components on THIS resource this run — same secdns/secllm/secagent gating as
     # fedora_fips._include (secdns needs a topology; secllm/secagent additionally need
-    # --with-inference/--with-agent). Used for the deploy audit artifact (audit.py) — recorded
-    # regardless of whether secdeploy itself starts the process (SecRecorder/secagent are
-    # always just a printed run command on macOS, never a managed service), since the audit's
-    # job is "what's part of this deploy", not "what secdeploy ran".
+    # --with-inference/--with-agent). secproxy follows secdns's simpler rule exactly —
+    # topology-only, no --with-* flag (see its native-run note in deploy() below). Used for
+    # the deploy audit artifact (audit.py) — recorded regardless of whether secdeploy itself
+    # starts the process (SecRecorder/secagent/secproxy are always just a printed run command
+    # on macOS, never a managed service), since the audit's job is "what's part of this
+    # deploy", not "what secdeploy ran".
     services = [
-        n for n in ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder")
+        n for n in ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder", "secproxy")
         if n not in without
         and (n != "secdns" or topology is not None)
         and (n != "secllm" or (topology is not None and with_inference))
         and (n != "secagent" or (topology is not None and with_agent))
+        and (n != "secproxy" or topology is not None)
         and _here(n)
     ]
 
@@ -390,6 +413,26 @@ def deploy(
             P.warn("secagent chat-ops has no macOS service install (known eval limitation — "
                    f"see docs/macos.md) — start it manually, e.g. sourcing the generated "
                    f"addressing env: {chat_cmd}")
+
+    # secproxy runs natively on macOS too — the key simplification for this target (see module
+    # docstring): Caddy binds directly to the host, so it reaches every OTHER backend the same
+    # way any host process does — containers publish their ports to the host (compose.yaml's
+    # `ports:`), and every native service here (secdns/secllm/secagent above) already listens on
+    # the host — sidestepping the container/host boundary the --tls certbot flow has to cross
+    # via host.docker.internal. Topology-gated only, no --with-* flag, exactly like secdns
+    # above: secproxy is the suite's default front door the moment a topology places the edge
+    # tier here. The Caddyfile it points at was already written earlier in this function by
+    # write_addressing() (whenever a topology is active and this isn't a dry-run). Caddy binds
+    # :443/:80, so — like secdns's :53 — starting it needs sudo.
+    if topology is not None and _here("secproxy"):
+        caddyfile = (Path(out) / "addressing/Caddyfile") if out else Path("out/addressing/Caddyfile")
+        secproxy_cmd = f"sudo caddy run --config {caddyfile}"
+        if dry_run:
+            print(f"  · secproxy: run natively on :443/:80 → {secproxy_cmd}")
+        else:
+            _ensure_caddy()
+            P.warn(f"secproxy (Caddy) runs natively on macOS — start it (needs :443/:80) "
+                   f"with: {secproxy_cmd}")
 
     # Optional: point this host's resolver at secdns for the internal domain.
     resolver_configured = False

@@ -71,7 +71,7 @@ def test_tiers_and_ports():
 
 
 # ── fronted axis: which components secproxy (Caddy) puts behind :443 ────────────────────
-def test_fronted_flags_exactly_the_six():
+def test_fronted_flags_exactly_the_five():
     m = Manifest.load(ROOT / "suite.toml")
     assert {name for name, c in m.components.items() if c.fronted} == FRONTED
     for name in ("secllm", "secdns", "secproxy"):

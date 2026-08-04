@@ -63,6 +63,13 @@ EDGE_SPLIT = GPU_SPLIT + """
 resource = "core"
 """
 
+# GPU_SPLIT plus secproxy (edge tier) on 'gpu' — the MACOS resource this time (EDGE_SPLIT above
+# puts it on 'core', a fedora-fips resource) — exercises the macOS native-Caddy standup.
+MACOS_EDGE_SPLIT = GPU_SPLIT + """
+[groups.edge]
+resource = "gpu"
+"""
+
 
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
@@ -278,6 +285,28 @@ resource = "mac"
                  "--topology", str(tp), "--resource", "mac"]) == 0
     out = capsys.readouterr().out
     assert "secdns: run natively" in out
+
+
+# ── secproxy on macOS: native Caddy (not a container — see targets/macos.py's module
+#    docstring), gated on topology placement only, exactly like secdns above ─────────────
+def test_deploy_macos_topology_secproxy_native(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MACOS_EDGE_SPLIT)  # gpu (macos) holds the edge tier → secproxy
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--topology", str(tp), "--resource", "gpu"]) == 0
+    out = capsys.readouterr().out
+    assert "secproxy: run natively on :443/:80" in out
+    assert "sudo caddy run --config" in out
+    assert "addressing/Caddyfile" in out
+
+
+def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):
+    # no topology → single-host mode → secproxy is topology-gated, same rule as secdns —
+    # byte-identical to every pre-secproxy macOS deploy.
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "secproxy" not in out.lower()
+    assert "caddy" not in out.lower()
 
 
 def test_deploy_fedora_configure_resolver_local(tmp_path, capsys):

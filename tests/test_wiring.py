@@ -216,8 +216,8 @@ def test_write_addressing(tmp_path):
     assert Path(env["secllm"]).exists()
 
 
-# ── caddyfile_text: secproxy's Caddyfile (fronts the 6 HTTP services on :443) ───────────
-def test_caddyfile_text_site_blocks_for_exactly_the_six(tmp_path):
+# ── caddyfile_text: secproxy's Caddyfile (fronts the 5 HTTP services on :443) ───────────
+def test_caddyfile_text_site_blocks_for_exactly_the_five(tmp_path):
     topo = _edge_topo(tmp_path)
     text = wiring.caddyfile_text(topo)
     for name in FRONTED:
@@ -267,7 +267,7 @@ def test_caddyfile_text_no_site_blocks_when_secproxy_unplaced(tmp_path):
 
 
 def test_caddyfile_text_multi_resource_topology_handled(tmp_path):
-    # secproxy fronts the 6 exactly the same way alongside a 2-instance SecLLM pool elsewhere —
+    # secproxy fronts the 5 exactly the same way alongside a 2-instance SecLLM pool elsewhere —
     # the multi-resource inference tier doesn't leak into (or get confused with) the Caddyfile.
     topo = _edge_multi_topo(tmp_path)
     text = wiring.caddyfile_text(topo)

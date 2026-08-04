@@ -59,7 +59,7 @@ resources = ["gpu1", "gpu2"]
 """
 
 # identity + gateway + collab + edge (secproxy) all on 'core'; inference on 'gpu' — the
-# fronting axis in play: the 6 fronted components should resolve/address via the proxy.
+# fronting axis in play: the 5 fronted components should resolve/address via the proxy.
 EDGE_SPLIT = """
 domain = "sec.internal"
 upstream_dns = ["1.1.1.1"]
@@ -181,7 +181,7 @@ def test_env_for_wires_peers_not_self(tmp_path):
     assert "SECROUTER_URL" not in env
 
 
-# ── fronting axis: secproxy (edge tier) fronts the 6 HTTP services on :443 ──────────────
+# ── fronting axis: secproxy (edge tier) fronts the 5 HTTP services on :443 ──────────────
 def test_proxy_address_none_when_edge_unplaced(tmp_path):
     # GPU_SPLIT has no [groups.edge] at all — the common case today, and every fixture that
     # predates secproxy.
@@ -194,7 +194,7 @@ def test_proxy_address_resolves_the_edge_resource(tmp_path):
     assert topo._proxy_address() == "10.0.0.5"
 
 
-def test_is_fronted_true_for_the_six_when_secproxy_placed(tmp_path):
+def test_is_fronted_true_for_the_five_when_secproxy_placed(tmp_path):
     topo = _topo(tmp_path, EDGE_SPLIT)
     for name in FRONTED:
         assert topo.is_fronted(name)
