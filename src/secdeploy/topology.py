@@ -53,7 +53,7 @@ class Topology:
     domain: str
     upstream_dns: list[str]
     resources: dict[str, Resource]
-    groups: dict[str, str]  # tier -> resource name
+    groups: dict[str, list[str]]  # tier -> resource names (usually one; several for N-way tiers)
     manifest: Manifest
     path: Path | None = None
     warnings: list[str] = field(default_factory=list)
@@ -74,7 +74,8 @@ class Topology:
             for name, r in (data.get("resources") or {}).items()
         }
         groups = {
-            tier: g["resource"] for tier, g in (data.get("groups") or {}).items()
+            tier: list(g["resources"]) if "resources" in g else [g["resource"]]
+            for tier, g in (data.get("groups") or {}).items()
         }
         topo = Topology(
             domain=data.get("domain", DEFAULT_DOMAIN),
@@ -102,7 +103,7 @@ class Topology:
             domain=domain,
             upstream_dns=[],
             resources={name: resource},
-            groups={tier: name for tier in TIERS},
+            groups={tier: [name] for tier in TIERS},
             manifest=manifest,
         )
         topo.validate()
@@ -126,95 +127,159 @@ class Topology:
             for cap in r.capabilities:
                 if cap not in KNOWN_CAPABILITIES:
                     warnings.append(f"resource {r.name!r}: unrecognized capability {cap!r}")
-        # every group must point at a real resource
-        for tier, res in self.groups.items():
-            if res not in self.resources:
-                errors.append(f"group {tier!r} → unknown resource {res!r}")
+        # every group must point at real resources (a tier may list several)
+        for tier, res_list in self.groups.items():
+            for res in res_list:
+                if res not in self.resources:
+                    errors.append(f"group {tier!r} → unknown resource {res!r}")
         # every REQUIRED component's tier must be placed; optional-but-unplaced is allowed
         # (it simply won't be deployed, like an implicit --without).
         for c in self.manifest.components.values():
-            if c.tier not in self.groups:
+            res_list = self.groups.get(c.tier) or []
+            if not res_list:
                 if not c.optional:
                     errors.append(
                         f"component {c.name!r} (tier {c.tier!r}) is not placed on any resource"
                     )
                 continue
-            res = self.groups[c.tier]
-            if c.tier == "inference" and res in self.resources and not self.resources[res].has("gpu"):
-                warnings.append(
-                    f"inference tier is on resource {res!r} which declares no 'gpu' capability — "
-                    f"{c.name} inference will be CPU-bound (slow/unsupported)"
-                )
-        # no two components sharing a resource may collide on a port
-        by_resource: dict[str, dict[int, str]] = {}
-        for name, res in self.placement().items():
-            port = self.manifest.components[name].port
-            if not port:
-                continue
-            seen = by_resource.setdefault(res, {})
-            if port in seen:
-                errors.append(
-                    f"resource {res!r}: port {port} used by both {seen[port]!r} and {name!r}"
-                )
-            else:
-                seen[port] = name
+            if c.tier == "inference":
+                for res in res_list:
+                    if res in self.resources and not self.resources[res].has("gpu"):
+                        warnings.append(
+                            f"inference tier is on resource {res!r} which declares no 'gpu' "
+                            f"capability — {c.name} inference will be CPU-bound (slow/unsupported)"
+                        )
+        # no two components sharing a resource may collide on a port (checked per resource, so
+        # a tier spread across several resources is fine — each instance owns its own host)
+        for rname in self.resources:
+            seen: dict[int, str] = {}
+            for name, c in self.components_on(rname).items():
+                if not c.port:
+                    continue
+                if c.port in seen:
+                    errors.append(
+                        f"resource {rname!r}: port {c.port} used by both {seen[c.port]!r} and {name!r}"
+                    )
+                else:
+                    seen[c.port] = name
         self.warnings = warnings
         if errors:
             raise ValueError("invalid topology:\n  - " + "\n  - ".join(errors))
 
     # ── derivations ────────────────────────────────────────────────────────────────
     def placement(self, without: list[str] | None = None) -> dict[str, str]:
-        """Map each enabled, placed component → the resource name it runs on."""
+        """Map each enabled, placed component → the (primary) resource name it runs on.
+
+        For a tier spread across multiple resources this is the first one — enough for
+        callers that just need a single representative resource (e.g. locating secdns).
+        Multi-instance-aware code (peer URLs, the DNS zone) uses :meth:`instances` instead,
+        which enumerates every resource a tier is placed on.
+        """
         return {
-            name: self.groups[c.tier]
+            name: self.groups[c.tier][0]
             for name, c in self.manifest.select(without).items()
-            if c.tier in self.groups
+            if self.groups.get(c.tier)
         }
 
     def resource_for(self, component: str) -> Resource:
         tier = self.manifest.components[component].tier
-        if tier not in self.groups:
+        res_list = self.groups.get(tier) or []
+        if not res_list:
             raise KeyError(f"component {component!r} (tier {tier!r}) is not placed")
-        return self.resources[self.groups[tier]]
+        return self.resources[res_list[0]]
 
-    def fqdn(self, component: str) -> str:
-        return f"{component}.{self.domain}"
+    def fqdn(self, name: str) -> str:
+        """The stable FQDN for ``name`` — a bare component name, or an instance name from
+        :meth:`instances` (e.g. ``secllm-gpu1``) for a tier spread across several resources."""
+        return f"{name}.{self.domain}"
 
     def components_on(
         self, resource: str, without: list[str] | None = None
     ) -> dict[str, Component]:
-        """The enabled components placed on ``resource`` (after optional ``--without`` drops)."""
-        placement = self.placement(without)
+        """The enabled components placed on ``resource`` (after optional ``--without`` drops).
+
+        A component is "on" ``resource`` if ``resource`` is in its tier's resource list — a
+        tier spread across several resources (e.g. inference → gpu1, gpu2) places its
+        component on EACH of them, one instance per resource.
+        """
         return {
             name: c
             for name, c in self.manifest.select(without).items()
-            if placement.get(name) == resource
+            if resource in self.groups.get(c.tier, [])
         }
 
+    def instances(self, component: str) -> list[tuple[str, str, str]]:
+        """Every ``(instance_name, resource_name, address)`` for ``component`` — one per
+        resource its tier is placed on.
+
+        A tier on ONE resource yields a single instance named after the bare component
+        (unchanged FQDN, e.g. ``secllm``); a tier spread across MANY resources yields one
+        instance per resource, named ``<component>-<resource>`` (e.g. ``secllm-gpu1``,
+        ``secllm-gpu2``) so each gets a distinct, stable FQDN. SecLLM is the motivating case —
+        stateless, so N instances need no coordination — but this works for any tier.
+        """
+        tier = self.manifest.components[component].tier
+        res_list = self.groups.get(tier, [])
+        if len(res_list) <= 1:
+            return [(component, res, self.resources[res].address) for res in res_list]
+        return [(f"{component}-{res}", res, self.resources[res].address) for res in res_list]
+
     def zone(self, without: list[str] | None = None) -> list[tuple[str, str, str]]:
-        """DNS records secdns serves: (fqdn, "A", resource address) for each placed component."""
+        """DNS records secdns serves: (fqdn, "A", resource address) — one per placed
+        *instance*, so a multi-resource tier gets one A record per instance."""
         records: list[tuple[str, str, str]] = []
-        for name, res in self.placement(without).items():
-            records.append((self.fqdn(name), "A", self.resources[res].address))
+        for name, c in self.manifest.select(without).items():
+            if c.tier not in self.groups:
+                continue
+            for instance_name, _res, addr in self.instances(name):
+                records.append((self.fqdn(instance_name), "A", addr))
         return records
 
     def urls(self, without: list[str] | None = None, scheme: str = "https") -> dict[str, str]:
-        """Peer base URLs keyed by upper-cased component name, for addressable (port>0) peers."""
-        placed = self.placement(without)
+        """Peer base URLs keyed by upper-cased component name, for single-instance addressable
+        (port>0) peers. A component whose tier spans multiple resources has no single URL —
+        use :meth:`instance_urls` (e.g. ``SECROUTER_SECLLM_ENDPOINTS``) for those instead."""
         return {
-            name.upper(): f"{scheme}://{self.fqdn(name)}:{self.manifest.components[name].port}"
-            for name in placed
-            if self.manifest.components[name].port
+            name.upper(): f"{scheme}://{self.fqdn(name)}:{c.port}"
+            for name, c in self.manifest.select(without).items()
+            if c.port and len(self.groups.get(c.tier, [])) == 1
         }
 
+    def instance_urls(
+        self, component: str, without: list[str] | None = None,
+        scheme: str = "https", path: str = "",
+    ) -> list[str]:
+        """Every instance's base URL for ``component`` (one per resource its tier is placed
+        on) — e.g. the SecLLM backend pool SecRouter load-balances/fails over across. Empty
+        if ``component`` isn't selected or has no inbound port."""
+        if component not in self.manifest.select(without):
+            return []
+        port = self.manifest.components[component].port
+        if not port:
+            return []
+        return [
+            f"{scheme}://{self.fqdn(name)}:{port}{path}"
+            for name, _res, _addr in self.instances(component)
+        ]
+
     def env_for(
-        self, component: str, without: list[str] | None = None, scheme: str = "https"
+        self, component: str, without: list[str] | None = None, scheme: str = "https",
+        *, secllm_token: str | None = None, secrouter_egress_file: str | None = None,
     ) -> dict[str, str]:
         """Environment for ``component``: its own identity plus every *other* peer's URL.
 
         Keys: ``SEC_DOMAIN``, ``SELF_FQDN``, ``SELF_PORT`` (if it listens), and
-        ``<PEER>_URL`` for each addressable peer (e.g. ``SECLLM_URL``). Phase 3 targets pick
-        the subset each component actually consumes; this is the full, deterministic map.
+        ``<PEER>_URL`` for each single-instance addressable peer (e.g. ``SECLLM_URL``).
+        SecRouter additionally gets ``SECROUTER_SECLLM_ENDPOINTS`` — the comma-joined base URL
+        of *every* SecLLM instance (one when inference is on a single resource, several when
+        it's spread across many) — since a single ``SECLLM_URL`` can't represent a pool.
+
+        ``secllm_token``/``secrouter_egress_file`` fold ``SECROUTER_SECLLM_TOKEN`` (the shared
+        SecRouter<->SecLLM bearer token) / ``SECROUTER_EGRESS_FILE`` (the installed egress
+        allow-list path) into SecRouter's env when given — see ``wiring.secllm_shared_token`` /
+        ``wiring.secrouter_egress_rules``. Both are secrets/paths a caller supplies rather than
+        topology-derived data, unlike everything else this method computes, and (like
+        ``SECROUTER_SECLLM_ENDPOINTS``) only apply to ``component == "secrouter"``.
         """
         c = self.manifest.components[component]
         env: dict[str, str] = {"SEC_DOMAIN": self.domain, "SELF_FQDN": self.fqdn(component)}
@@ -224,6 +289,14 @@ class Topology:
             if key == component.upper():
                 continue
             env[f"{key}_URL"] = url
+        if component == "secrouter":
+            endpoints = self.instance_urls("secllm", without, scheme, path="/v1")
+            if endpoints:
+                env["SECROUTER_SECLLM_ENDPOINTS"] = ",".join(endpoints)
+            if secllm_token:
+                env["SECROUTER_SECLLM_TOKEN"] = secllm_token
+            if secrouter_egress_file:
+                env["SECROUTER_EGRESS_FILE"] = secrouter_egress_file
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────
@@ -249,8 +322,11 @@ class Topology:
                 out.append(f'ssh = "{r.ssh}"')
             out.append(f"capabilities = {_arr(r.capabilities)}")
             out.append("")
-        for tier, res in self.groups.items():
+        for tier, res_list in self.groups.items():
             out.append(f'[groups.{tier}]')
-            out.append(f'resource = "{res}"')
+            if len(res_list) == 1:
+                out.append(f'resource = "{res_list[0]}"')
+            else:
+                out.append(f"resources = {_arr(res_list)}")
             out.append("")
         return "\n".join(out).rstrip() + "\n"

@@ -31,6 +31,31 @@ resource = "core"
 resource = "gpu"
 """
 
+# inference spread across TWO fedora-fips resources — N SecLLM instances for --with-inference.
+MULTI_INFERENCE = """
+domain = "sec.internal"
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+[resources.gpu1]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+[resources.gpu2]
+target = "fedora-fips"
+address = "10.0.0.7"
+capabilities = ["fips", "gpu"]
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.inference]
+resources = ["gpu1", "gpu2"]
+"""
+
 
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
@@ -161,6 +186,39 @@ def test_deploy_fedora_single_host_excludes_secdns(capsys):
     out = capsys.readouterr().out
     assert "secdns.service" not in out
     assert "seccert.service" in out
+    assert "secllm.service" not in out  # --with-inference wasn't passed
+
+
+def test_deploy_with_inference_stands_up_secllm(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MULTI_INFERENCE)  # gpu1/gpu2 (fedora-fips) hold the inference tier
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--with-inference", "--topology", str(tp), "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" in out
+    assert "secllm.env" in out
+    assert "secsuite-secllm" in out
+    # gpu1 hosts only the inference tier — no other resource's services leak in
+    assert "seccert.service" not in out
+    assert "secrouter.service" not in out
+
+
+def test_deploy_without_with_inference_omits_secllm(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MULTI_INFERENCE)  # same topology/resource as above, flag just omitted
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" not in out
+
+
+def test_deploy_with_inference_needs_a_topology(capsys):
+    # --with-inference without a topology.toml is still single-host mode — secllm stays opt-out
+    # (steps 1-3's DNS/env wiring has nothing to generate without a topology either)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--with-inference"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" not in out
 
 
 def test_deploy_macos_topology_secdns_native(tmp_path, capsys):
@@ -243,3 +301,86 @@ def test_roadmap_target_rejected():
 def test_unknown_target_exits():
     with pytest.raises(SystemExit):
         main(["--manifest", MANIFEST, "plan", "nope"])
+
+
+# ── deploy audit artifacts (CMMC audit evidence — see secdeploy.audit) ──────────────────
+def test_deploy_dry_run_mentions_audit_artifact_fedora_single_host(capsys):
+    # no --topology → single-host mode → resource label is "local" (Topology.single_host's
+    # conventional name — see secdeploy.audit.SINGLE_HOST_RESOURCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "audit:" in out
+    assert "deploy-fedora-fips-local.json" in out
+
+
+def test_deploy_dry_run_mentions_audit_artifact_macos_single_host(capsys):
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "audit:" in out
+    assert "deploy-macos-local.json" in out
+
+
+def test_deploy_dry_run_mentions_audit_artifact_with_topology_resource(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "deploy-fedora-fips-core.json" in out
+
+
+def test_deploy_dry_run_audit_note_reflects_trust_anchor_flag(capsys):
+    # seccert is on this (single-host) resource → the trust-anchor step is in the fedora-fips
+    # plan → the audit preview should say so.
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "trust_anchor=yes" in out
+
+
+def test_deploy_dry_run_audit_note_no_trust_anchor_without_seccert(capsys):
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--without", "seccert"]) == 0
+    out = capsys.readouterr().out
+    assert "trust_anchor=no" in out
+
+
+def test_deploy_dry_run_no_file_written(tmp_path, capsys):
+    # --dry-run must stay side-effect-light: no out/ directory (let alone out/audit/) appears.
+    out_dir = tmp_path / "out"
+    assert main(["--manifest", MANIFEST, "--out", str(out_dir),
+                 "deploy", "fedora-fips", "--dry-run"]) == 0
+    assert not out_dir.exists()
+
+
+# ── secrouter-addressing.env: layering the generated pool/token/egress wiring onto the live
+#    secrouter.env via secrouter.service's second EnvironmentFile= ──────────────────────
+def test_deploy_fedora_dry_run_pool_topology_shows_secrouter_addressing_env_install(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MULTI_INFERENCE)  # 'core' hosts the gateway tier (secrouter)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "install generated secrouter addressing env" in out
+    assert "install -m 640" in out
+    # both the source (staged addressing env) and the destination (installed, DISTINCT from
+    # /etc/secsuite/secrouter.env) appear in the printed command
+    assert "addressing/env/secrouter.env" in out
+    assert "/etc/secsuite/secrouter-addressing.env" in out
+
+
+def test_deploy_fedora_dry_run_single_host_no_secrouter_addressing_env_install(capsys):
+    # no topology.toml → single-host mode → no generated addressing at all (unchanged)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "secrouter-addressing.env" not in out
+
+
+def test_deploy_fedora_dry_run_secllm_only_resource_no_secrouter_addressing_env_install(tmp_path, capsys):
+    # topology IS active, but SecRouter isn't placed on THIS resource (gpu1 hosts only secllm)
+    # — the addressing-env install is gated on "secrouter in services", same as the egress file.
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MULTI_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--with-inference", "--topology", str(tp), "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "secrouter-addressing.env" not in out

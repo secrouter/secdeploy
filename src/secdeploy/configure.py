@@ -16,6 +16,9 @@ from .topology import DEFAULT_DOMAIN, Resource, Topology
 
 # Tiers, in the order we place them (and the order the suite naturally layers in).
 TIER_ORDER = ["identity", "inference", "gateway", "collab"]
+# Tiers that may spread across several resources (N-way placement) — currently just inference
+# (N SecLLM instances); the rest are single-resource-only in the wizard.
+MULTI_RESOURCE_TIERS = {"inference"}
 
 
 def _ask(input_fn: Callable[[str], str], prompt: str, default: str = "") -> str:
@@ -31,9 +34,22 @@ def _ask_choice(input_fn, out, prompt: str, choices: list[str], default: str) ->
         out(f"  please choose one of: {', '.join(choices)}")
 
 
-def _ask_resource(input_fn, out, manifest: Manifest, name_default: str,
-                  target_default: str, caps_default: str = "") -> Resource:
-    name = _ask(input_fn, "  resource name", name_default)
+def _ask_multi_choice(input_fn, out, prompt: str, choices: list[str], default: str) -> list[str]:
+    """Like :func:`_ask_choice` but accepts a comma-separated list — for a tier spread across
+    several resources (e.g. inference → gpu1, gpu2). A single choice yields a one-element list."""
+    while True:
+        raw = _ask(input_fn, f"{prompt} ({'/'.join(choices)}, comma-separated for multiple)", default)
+        picked = [n.strip() for n in raw.split(",") if n.strip()]
+        bad = [n for n in picked if n not in choices]
+        if picked and not bad:
+            return picked
+        out(f"  please choose one or more of: {', '.join(choices)}"
+            + (f" (unknown: {', '.join(bad)})" if bad else ""))
+
+
+def _ask_resource_fields(input_fn, out, manifest: Manifest, name: str,
+                         target_default: str, caps_default: str = "") -> Resource:
+    """Ask everything but the name for a resource (name already decided by the caller)."""
     target = _ask_choice(input_fn, out, "  deploy target", list(manifest.targets), target_default)
     address = _ask(input_fn, "  address (IP/hostname peers use)", "127.0.0.1")
     ssh = _ask(input_fn, "  ssh endpoint for remote push (blank = none)", "")
@@ -42,6 +58,12 @@ def _ask_resource(input_fn, out, manifest: Manifest, name_default: str,
         name=name, target=target, address=address, ssh=ssh,
         capabilities=[c.strip() for c in caps.split(",") if c.strip()],
     )
+
+
+def _ask_resource(input_fn, out, manifest: Manifest, name_default: str,
+                  target_default: str, caps_default: str = "") -> Resource:
+    name = _ask(input_fn, "  resource name", name_default)
+    return _ask_resource_fields(input_fn, out, manifest, name, target_default, caps_default)
 
 
 def run(manifest: Manifest, dest: str | Path = "topology.toml",
@@ -54,22 +76,28 @@ def run(manifest: Manifest, dest: str | Path = "topology.toml",
     preset = _ask_choice(input_fn, out, "layout", ["single-host", "gpu-split", "custom"], "single-host")
 
     resources: dict[str, Resource] = {}
-    groups: dict[str, str] = {}
+    groups: dict[str, list[str]] = {}
 
     if preset == "single-host":
         out("\nOne host runs everything:")
         r = _ask_resource(input_fn, out, manifest, "local", next(iter(manifest.targets)))
         resources[r.name] = r
-        groups = {t: r.name for t in TIER_ORDER}
+        groups = {t: [r.name] for t in TIER_ORDER}
     elif preset == "gpu-split":
         out("\nCore host — identity + gateway + collaboration:")
         core = _ask_resource(input_fn, out, manifest, "core", "fedora-fips", "fips")
         resources[core.name] = core
-        out("\nGPU host — inference:")
-        gpu = _ask_resource(input_fn, out, manifest, "gpu", "fedora-fips", "fips,gpu")
-        resources[gpu.name] = gpu
-        groups = {"identity": core.name, "gateway": core.name,
-                  "collab": core.name, "inference": gpu.name}
+        out("\nGPU host(s) — inference (comma-separated names for several SecLLM instances, "
+            "e.g. gpu1,gpu2):")
+        gpu_raw = _ask(input_fn, "  resource name(s)", "gpu")
+        gpu_names = [n.strip() for n in gpu_raw.split(",") if n.strip()] or ["gpu"]
+        for gname in gpu_names:
+            if len(gpu_names) > 1:
+                out(f"\nGPU host {gname!r} — inference:")
+            gpu = _ask_resource_fields(input_fn, out, manifest, gname, "fedora-fips", "fips,gpu")
+            resources[gpu.name] = gpu
+        groups = {"identity": [core.name], "gateway": [core.name],
+                  "collab": [core.name], "inference": gpu_names}
     else:  # custom
         try:
             count = max(1, int(_ask(input_fn, "how many compute resources", "2")))
@@ -82,7 +110,10 @@ def run(manifest: Manifest, dest: str | Path = "topology.toml",
         names = list(resources)
         out("\nPlace each tier on a resource:")
         for tier in TIER_ORDER:
-            groups[tier] = _ask_choice(input_fn, out, f"  {tier} →", names, names[0])
+            if tier in MULTI_RESOURCE_TIERS:
+                groups[tier] = _ask_multi_choice(input_fn, out, f"  {tier} →", names, names[0])
+            else:
+                groups[tier] = [_ask_choice(input_fn, out, f"  {tier} →", names, names[0])]
 
     topo = Topology(domain=domain, upstream_dns=upstream, resources=resources,
                     groups=groups, manifest=manifest)

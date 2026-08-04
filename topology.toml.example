@@ -12,7 +12,8 @@
 # Components belong to fixed TIERS (declared in suite.toml); you assign each tier to a
 # resource:
 #   identity   seccert, secsso, secdns   (trust / auth / naming — all optional infra)
-#   inference  secllm                    (wants a resource with the "gpu" capability)
+#   inference  secllm                    (wants a resource with the "gpu" capability; may
+#                                          span SEVERAL resources for N SecLLM instances)
 #   gateway    secrouter
 #   collab     secagent, secchat, secrecorder
 
@@ -49,6 +50,24 @@ resource = "core"
 
 [groups.inference]
 resource = "gpu"
+
+# N-way inference: several SecLLM instances (stateless — no coordination needed between
+# them), one per resource. Each gets its own FQDN (secllm-gpu1, secllm-gpu2, ...) and DNS A
+# record; SecRouter's generated env gets the whole pool as SECROUTER_SECLLM_ENDPOINTS
+# (comma-joined https://<instance-fqdn>:11400/v1 URLs). Swap the single-resource form above
+# for:
+#
+#   [resources.gpu2]
+#   target = "fedora-fips"
+#   address = "10.0.0.7"
+#   capabilities = ["fips", "gpu"]
+#
+#   [groups.inference]
+#   resources = ["gpu", "gpu2"]
+#
+# Standing up each instance's secllm service is opt-in: `secdeploy deploy fedora-fips
+# --resource gpu --with-inference` (off by default — it's a heavyweight GPU service; without
+# the flag, secdeploy still generates the DNS + env wiring above for an externally-run SecLLM).
 
 # ── Single-host variant ──────────────────────────────────────────────────────────────
 # For one machine, define a single resource and point every tier at it:

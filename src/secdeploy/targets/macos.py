@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from . import common
+from .. import audit
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
@@ -30,6 +31,8 @@ PLAN = [
     "Layer HF_TOKEN (deploy/macos/secrets.env or --hf-token) and --model-dir (air-gapped "
     "local models) onto SecRecorder's printed run command, if set",
     "Prepare SecRecorder to run natively via uv (MLX/Metal — not containerized on macOS)",
+    "(--with-inference) Print a native SecLLM run command (no GPU passthrough into Colima — "
+    "GPU-free eval via SECLLM_BACKEND=mock)",
 ]
 
 IMAGES = ("seccert", "secrouter")  # secrecorder is native on macOS
@@ -104,17 +107,20 @@ def _configure_hosts(assume_yes: bool = False) -> None:
     P.run(["sudo", "sh", "-c", f"echo '127.0.0.1 {CERT_HOST}' >> /etc/hosts"])
 
 
-def _configure_resolver(domain: str, dns_ip: str, assume_yes: bool = False) -> None:
+def _configure_resolver(domain: str, dns_ip: str, assume_yes: bool = False) -> bool:
     """Point macOS at secdns for ``domain`` via /etc/resolver/<domain> — the multi-host
     replacement for the /etc/hosts ``host.docker.internal`` trick. macOS routes queries for a
-    domain to the nameserver named in that file."""
+    domain to the nameserver named in that file. Returns whether the resolver was actually
+    pointed at secdns (``False`` if the operator declined the confirm prompt) — the deploy
+    audit artifact (audit.py) records this as a security-relevant authorization."""
     path = f"/etc/resolver/{domain}"
     if not P.confirm(f"Point {domain} at secdns ({dns_ip}) via {path}?", assume_yes):
         P.warn(f"skipped resolver config — {domain} names won't resolve via secdns on this host")
-        return
+        return False
     P.run(["sudo", "mkdir", "-p", "/etc/resolver"])
     P.run(["sudo", "sh", "-c", f"printf 'nameserver {dns_ip}\\n' > {path}"])
     P.log(f"{domain} → secdns {dns_ip} ({path})")
+    return True
 
 
 def _ca_already_trusted(root_pem: Path) -> bool:
@@ -134,24 +140,27 @@ def _ca_already_trusted(root_pem: Path) -> bool:
     ).returncode == 0
 
 
-def _trust_ca_root(root: Path, assume_yes: bool = False) -> None:
+def _trust_ca_root(root: Path, assume_yes: bool = False) -> bool:
     """Add the SecCert root to the macOS System keychain as a trusted root, so browsers/curl
     stop flagging SecRecorder's SecCert-issued cert as untrusted. Same command docs/macos.md
-    already documents for manual use — this just runs it for you, with consent."""
+    already documents for manual use — this just runs it for you, with consent. Returns whether
+    the root ended up trusted (already-trusted counts) — the deploy audit artifact (audit.py)
+    records this as a security-relevant authorization."""
     root_pem = root / "out/seccert-root.pem"
     if not root_pem.exists():
         P.warn(f"{root_pem} not found — deploy SecCert first (root export happens during deploy)")
-        return
+        return False
     if _ca_already_trusted(root_pem):
         P.log("SecCert root already trusted in the System keychain")
-        return
+        return True
     if not P.confirm(f"Trust the SecCert root ({root_pem}) in the System keychain?", assume_yes):
         P.warn("skipped CA trust — browsers/clients will flag SecRecorder's cert as untrusted")
-        return
+        return False
     P.run([
         "sudo", "security", "add-trusted-cert", "-d", "-r", "trustRoot",
         "-k", "/Library/Keychains/System.keychain", str(root_pem),
     ])
+    return True
 
 
 def _read_hf_token(root: Path) -> str | None:
@@ -256,6 +265,12 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
         P.run(["uv", "sync", "--project", str(rec)], check=False)
     else:
         P.warn("uv not found or secrecorder has no pyproject — skipping native SecRecorder prep")
+    # SecLLM (--with-inference, native — no GPU passthrough into Colima): same treatment, so
+    # its printed run command is instant too. Silent skip if absent — it's opt-in, so not
+    # every macOS build needs it.
+    sllm = work / "secllm"
+    if P.which("uv") and (sllm / "pyproject.toml").exists():
+        P.run(["uv", "sync", "--project", str(sllm)], check=False)
     P.log(f"built images: {', '.join(_image(manifest, n) for n in images)}")
 
 
@@ -275,6 +290,7 @@ def deploy(
     topology=None,
     resource: str | None = None,
     out: Path | None = None,
+    with_inference: bool = False,
 ) -> None:
     without = without or []
     # Topology placement: only bring up the components placed on `resource` (single-host
@@ -283,6 +299,19 @@ def deploy(
 
     def _here(name: str) -> bool:
         return placed is None or name in placed
+
+    # Components on THIS resource this run — same secdns/secllm gating as fedora_fips._include
+    # (secdns needs a topology; secllm additionally needs --with-inference). Used for the
+    # deploy audit artifact (audit.py) — recorded regardless of whether secdeploy itself starts
+    # the process (SecRecorder is always just a printed run command on macOS, never a managed
+    # service), since the audit's job is "what's part of this deploy", not "what secdeploy ran".
+    services = [
+        n for n in ("secdns", "seccert", "secllm", "secrouter", "secrecorder")
+        if n not in without
+        and (n != "secdns" or topology is not None)
+        and (n != "secllm" or (topology is not None and with_inference))
+        and _here(n)
+    ]
 
     compose = _compose(root)
     dc = ["docker", "compose"] if dry_run else _compose_cmd()
@@ -300,11 +329,13 @@ def deploy(
     if _here("secrouter"):
         steps.append((dc + ["-f", str(compose), "up", "-d", "secrouter"], "start SecRouter"))
     P.log(f"deploy {NAME} — suite {manifest.suite} (SECSUITE_VERSION passed to compose)")
+    written: dict[str, object] | None = None
     if topology is not None and not dry_run and out is not None:
         written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     if dry_run and topology is not None:
-        here = ", ".join(sorted(s for s in ("seccert", "secrouter", "secrecorder") if _here(s))) or "(none)"
+        watched = ("seccert", "secrouter", "secrecorder") + (("secllm",) if with_inference else ())
+        here = ", ".join(sorted(s for s in watched if _here(s))) or "(none)"
         print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
               f"components here: {here}")
     for cmd, desc in steps:
@@ -325,33 +356,73 @@ def deploy(
         else:
             P.warn(f"secdns runs natively on macOS — start it (needs :53) with: {secdns_cmd}")
 
+    # secllm runs natively on macOS too (no GPU passthrough into Colima) — only when a topology
+    # places it here AND --with-inference is set (a heavyweight GPU service is opt-in, like
+    # secdns/SecRecorder's native-run notes above). GPU-free eval uses SECLLM_BACKEND=mock
+    # instead of vllm.
+    if with_inference and topology is not None and _here("secllm"):
+        port = manifest.components["secllm"].port
+        secllm_cmd = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND=mock "
+                      f"uv run --project work/secllm secllm serve")
+        if dry_run:
+            print(f"  · (--with-inference) secllm: run natively (GPU-free eval) → {secllm_cmd}")
+        else:
+            P.warn(f"secllm is native on macOS (no GPU passthrough into Colima) — start it "
+                   f"(GPU-free eval via SECLLM_BACKEND=mock) with: {secllm_cmd}")
+
     # Optional: point this host's resolver at secdns for the internal domain.
+    resolver_configured = False
     if configure_resolver and topology is not None:
         dns_ip = wiring.secdns_address_for(topology, resource, without)
         if dns_ip and dry_run:
             print(f"  · (--configure-resolver) point {topology.domain} at secdns {dns_ip} "
                   f"via /etc/resolver/{topology.domain} (sudo, asks first)")
         elif dns_ip:
-            _configure_resolver(topology.domain, dns_ip, assume_yes)
+            resolver_configured = _configure_resolver(topology.domain, dns_ip, assume_yes)
         elif not dry_run:
             P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
 
     # Stack components (SecSSO / SecChat) — brought up via their own bootstrap where placed.
-    if topology is not None:
-        stacks = sorted(n for n in placed
-                        if manifest.components[n].kind == "stack" and n not in without)
-        if stacks:
-            common.deploy_stacks(work, stacks, dry_run=dry_run)
+    stacks = sorted(n for n in (placed or set())
+                    if manifest.components[n].kind == "stack" and n not in without) \
+        if topology is not None else []
+    if stacks:
+        common.deploy_stacks(work, stacks, dry_run=dry_run)
+
+    def _write_audit(trust_anchor_added: bool) -> None:
+        """CMMC audit evidence for this deploy — see audit.py. A no-op on dry-run/no --out."""
+        if dry_run or out is None:
+            return
+        shas = common.resolved_shas(manifest, work)
+        audit_path = audit.write_deploy_audit(
+            manifest, topology, resource, out,
+            target=NAME, services=services, shas=shas, stacks=stacks,
+            flags={
+                "with_inference": with_inference, "tls": tls, "trust_ca": trust_ca,
+                "configure_resolver": configure_resolver, "without": without,
+            },
+            addressing=written,
+            trust_anchor_added=trust_anchor_added,
+            resolver_configured=resolver_configured,
+            secllm_auth_enabled=(written is not None),
+        )
+        P.log(f"deploy audit artifact written → {audit_path}")
 
     # SecRecorder runs natively on macOS — only when it's placed on this resource.
     if not _here("secrecorder"):
         if dry_run:
             _print_ca_dry_run(configure_hosts, trust_ca)
+            if out is not None:
+                note = audit.dry_run_note(
+                    out, NAME, resource, component_count=len(services) + len(stacks),
+                    trust_anchor=trust_ca, resolver=resolver_configured,
+                )
+                print(f"  · {note}")
             return
         if configure_hosts:
             _configure_hosts(assume_yes)
-        if trust_ca:
-            _trust_ca_root(root, assume_yes)
+        trust_anchor_added = trust_ca and _trust_ca_root(root, assume_yes)
+        _write_audit(trust_anchor_added)
         P.log(f"SecRecorder not placed on resource {resource!r} — skipping on this host")
         return
 
@@ -365,12 +436,17 @@ def deploy(
                   f"{_tls_run_cmd(live / 'fullchain.pem', live / 'privkey.pem', model_env)}")
         else:
             print(f"  · SecRecorder: run natively → {run_cmd}")
+        if out is not None:
+            note = audit.dry_run_note(
+                out, NAME, resource, component_count=len(services) + len(stacks),
+                trust_anchor=trust_ca, resolver=resolver_configured,
+            )
+            print(f"  · {note}")
         return
 
     if configure_hosts:
         _configure_hosts(assume_yes)
-    if trust_ca:
-        _trust_ca_root(root, assume_yes)
+    trust_anchor_added = trust_ca and _trust_ca_root(root, assume_yes)
 
     if tls:
         cert = _issue_secrecorder_cert(root)
@@ -378,9 +454,11 @@ def deploy(
             certfile, keyfile = cert
             P.log(f"SecRecorder cert ready (SecCert-issued): {certfile}")
             P.warn(f"SecRecorder is native on macOS — start it with TLS: {_tls_run_cmd(certfile, keyfile, model_env)}")
+            _write_audit(trust_anchor_added)
             return
         P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
     P.warn(f"SecRecorder is native on macOS — start it with: {run_cmd}")
+    _write_audit(trust_anchor_added)
 
 
 def _print_ca_dry_run(configure_hosts: bool, trust_ca: bool) -> None:

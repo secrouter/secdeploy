@@ -1,10 +1,11 @@
 [Unit]
-Description=SecRouter secure-AI suite (secdns + SecCert + SecRouter + SecRecorder)
+Description=SecRouter secure-AI suite (secdns + SecCert + SecLLM + SecRouter + SecRecorder)
 Documentation=https://github.com/secrouter/secdeploy
-# secdns (internal DNS) and SecCert (CA) come up first; SecRecorder is optional. Any unit
-# not installed on this host is simply skipped (Wants= is a weak dependency).
-Wants=secdns.service seccert.service secrouter.service secrecorder.service
-After=secdns.service seccert.service
+# secdns (internal DNS), SecCert (CA), and SecLLM (inference backend) come up first;
+# SecRecorder is optional. Any unit not installed on this host is simply skipped (Wants= is a
+# weak dependency) — e.g. secllm.service is only installed with --with-inference.
+Wants=secdns.service seccert.service secllm.service secrouter.service secrecorder.service
+After=secdns.service seccert.service secllm.service
 
 [Install]
 WantedBy=multi-user.target

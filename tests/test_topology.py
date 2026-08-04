@@ -32,6 +32,32 @@ resource = "core"
 resource = "gpu"
 """
 
+# inference spread across TWO resources — N SecLLM instances, one per GPU host.
+MULTI_INFERENCE = """
+domain = "sec.internal"
+upstream_dns = ["1.1.1.1"]
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+[resources.gpu1]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+[resources.gpu2]
+target = "fedora-fips"
+address = "10.0.0.7"
+capabilities = ["fips", "gpu"]
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.inference]
+resources = ["gpu1", "gpu2"]
+"""
+
 
 def _manifest() -> Manifest:
     return Manifest.load(ROOT / "suite.toml")
@@ -70,6 +96,43 @@ def test_gpu_split_with_without(tmp_path):
     assert "secrouter" in on_core
 
 
+# ── multi-resource tiers (N SecLLM instances) ────────────────────────────────────────
+def test_multi_resource_inference_yields_two_instances(tmp_path):
+    topo = _topo(tmp_path, MULTI_INFERENCE)
+    instances = topo.instances("secllm")
+    assert len(instances) == 2
+    by_name = {name: (res, addr) for name, res, addr in instances}
+    assert by_name == {
+        "secllm-gpu1": ("gpu1", "10.0.0.6"),
+        "secllm-gpu2": ("gpu2", "10.0.0.7"),
+    }
+
+
+def test_multi_resource_inference_components_on_each_resource(tmp_path):
+    topo = _topo(tmp_path, MULTI_INFERENCE)
+    assert set(topo.components_on("gpu1")) == {"secllm"}
+    assert set(topo.components_on("gpu2")) == {"secllm"}
+    assert "secllm" not in topo.components_on("core")
+    assert not topo.warnings  # both gpu resources declare the 'gpu' capability
+
+
+def test_multi_resource_inference_zone_has_distinct_fqdns(tmp_path):
+    topo = _topo(tmp_path, MULTI_INFERENCE)
+    zone = topo.zone()
+    assert ("secllm-gpu1.sec.internal", "A", "10.0.0.6") in zone
+    assert ("secllm-gpu2.sec.internal", "A", "10.0.0.7") in zone
+    # the bare (unsuffixed) component name is not a record of its own when there are 2+ instances
+    assert not any(fqdn == "secllm.sec.internal" for fqdn, _rtype, _addr in zone)
+    assert topo.fqdn("secllm-gpu1") == "secllm-gpu1.sec.internal"
+    assert topo.fqdn("secllm-gpu2") == "secllm-gpu2.sec.internal"
+
+
+def test_multi_resource_inference_single_instance_naming_unchanged(tmp_path):
+    """One resource still yields the bare, unsuffixed instance name (byte-identical FQDN)."""
+    topo = _topo(tmp_path, GPU_SPLIT)
+    assert topo.instances("secllm") == [("secllm", "gpu", "10.0.0.6")]
+
+
 # ── addressing derivations ──────────────────────────────────────────────────────────
 def test_fqdn_and_zone(tmp_path):
     topo = _topo(tmp_path, GPU_SPLIT)
@@ -86,7 +149,7 @@ def test_env_for_wires_peers_not_self(tmp_path):
     assert env["SEC_DOMAIN"] == "sec.internal"
     assert env["SELF_PORT"] == "47002"
     # peers get URLs pointing at their hosting resource; self is excluded
-    assert env["SECLLM_URL"] == "https://secllm.sec.internal:47004"
+    assert env["SECLLM_URL"] == "https://secllm.sec.internal:11400"
     assert env["SECCERT_URL"] == "https://seccert.sec.internal:47001"
     assert "SECROUTER_URL" not in env
 

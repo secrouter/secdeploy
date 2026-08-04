@@ -55,6 +55,7 @@ def _expected_assets(root: Path, target: str) -> list[Path]:
             d / "systemd/secsuite.target",
             d / "systemd/secdns.service",
             d / "systemd/seccert.service",
+            d / "systemd/secllm.service",
             d / "systemd/secrouter.service",
             d / "systemd/secrecorder.service",
         ]
@@ -194,6 +195,7 @@ def cmd_deploy(args) -> int:
         hf_token=args.hf_token, model_dir=args.model_dir,
         without=without, configure_resolver=args.configure_resolver,
         topology=topo if from_file else None, resource=resource, out=Path(args.out),
+        with_inference=args.with_inference,
     )
     return 0
 
@@ -283,6 +285,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--configure-resolver", action="store_true", dest="configure_resolver",
         help="point this host's resolver at secdns for the internal domain (macOS /etc/resolver, "
              "Fedora systemd-resolved) — asks first; the multi-host replacement for --configure-hosts",
+    )
+    sub.choices["deploy"].add_argument(
+        "--with-inference", action="store_true", dest="with_inference",
+        help="also stand up SecLLM on every resource where the inference tier is placed here "
+             "(default: off — the DNS/env wiring for SecLLM's backend pool is always generated; "
+             "this additionally installs + starts the secllm service). fedora-fips only; macOS "
+             "prints a native run command instead (see docs/macos.md)",
     )
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")

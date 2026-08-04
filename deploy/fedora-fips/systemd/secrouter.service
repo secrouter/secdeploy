@@ -13,6 +13,12 @@ User=secsuite-secrouter
 Group=secsuite-secrouter
 WorkingDirectory=/opt/secsuite/secrouter
 EnvironmentFile=/etc/secsuite/secrouter.env
+# secdeploy-generated topology wiring (SecLLM pool/token/egress allow-list path) — present only
+# when a topology.toml placed SecRouter + a SecLLM pool here; the leading '-' makes it optional
+# so single-host / no-topology deploys (no such file) are unaffected. systemd applies multiple
+# EnvironmentFile= directives in listed order with later files overriding same-named keys, so
+# this — being second — is authoritative over secrouter.env for any key both define.
+EnvironmentFile=-/etc/secsuite/secrouter-addressing.env
 # SecRouter is a zero-runtime-dependency Node app (node:sqlite builtin; needs Node >= 24).
 ExecStart=/usr/bin/node /opt/secsuite/secrouter/dist/server.js
 Restart=on-failure

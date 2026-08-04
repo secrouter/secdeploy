@@ -23,6 +23,18 @@ What `deploy macos` does:
 1. `docker compose up -d seccert` and wait for `http://localhost:47001/health`.
 2. Save the CA trust anchor to `out/seccert-root.pem`.
 3. `docker compose up -d secrouter`.
+4. Write a deploy audit artifact to `out/audit/` (CMMC audit evidence — see
+   [Deployment audit artifacts](fedora-fips.md#deployment-audit-artifacts)).
+
+> **Known eval limitation:** with a `topology.toml` in play, secdeploy still generates
+> SecRouter's pool/token/egress wiring (`SECROUTER_SECLLM_ENDPOINTS`/`_TOKEN`/
+> `SECROUTER_EGRESS_FILE`) into `out/addressing/env/secrouter.env` — but nothing installs it
+> into the running container: `compose.yaml` only sets `SECROUTER_HOST`/`SECROUTER_PORT`
+> today, with no bind-mount or env-file passthrough for the generated addressing. On
+> fedora-fips this same wiring *is* applied (a second `EnvironmentFile=` in `secrouter.service`
+> — see [Getting the generated wiring into the running service](fedora-fips.md#getting-the-generated-wiring-into-the-running-service));
+> on macOS it stays generated-but-unapplied. Use `fedora-fips` (or hand-edit `compose.yaml` to
+> mount the file yourself) for anything beyond a single-host eval.
 
 SecRecorder (optional, native):
 

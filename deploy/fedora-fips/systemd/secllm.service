@@ -1,0 +1,35 @@
+[Unit]
+Description=SecLLM — local inference control plane (vLLM)
+Documentation=https://github.com/secrouter/secllm
+After=network-online.target
+Wants=network-online.target
+PartOf=secsuite.target
+Before=secrouter.service
+
+[Service]
+Type=simple
+User=secsuite-secllm
+Group=secsuite-secllm
+WorkingDirectory=/opt/secsuite/secllm
+EnvironmentFile=/etc/secsuite/secllm.env
+ExecStart=/opt/secsuite/secllm/.venv/bin/secllm serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Hardening (kept lenient enough for the GPU/ML runtime — no PrivateDevices, same as secrecorder)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/secsuite/secllm
+
+[Install]
+WantedBy=secsuite.target

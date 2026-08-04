@@ -49,7 +49,7 @@ repo = "secrouter/secllm"
 ref = "v1.0.0"
 kind = "service"
 tier = "inference"
-port = 47004
+port = 11400
 runtime = "python>=3.11 + NVIDIA GPU"
 role = "local inference — vLLM control plane (SecRouter routes to it)"
 
