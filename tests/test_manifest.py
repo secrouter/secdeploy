@@ -14,10 +14,10 @@ ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "seccha
 
 def test_load_shipped_manifest():
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.suite == "1.3.0"
+    assert m.suite == "1.4.0"
     assert ALL <= set(m.components)
     assert m.components["secrecorder"].ref == "v0.8.2"
-    assert m.components["secagent"].ref == "v0.1.0"
+    assert m.components["secagent"].ref == "v0.2.0"
     assert set(m.targets) == {"macos", "fedora-fips"}
 
 

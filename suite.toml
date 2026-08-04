@@ -9,7 +9,7 @@
 # optional: droppable with `secdeploy deploy <target> --without <name>` when you already
 #           run that infrastructure (e.g. an existing CA or IdP).
 
-suite = "1.3.0"
+suite = "1.4.0"
 released = "2026-08-04"
 description = "SecRouter secure-AI suite"
 
@@ -66,7 +66,7 @@ role = "governed AI gateway"
 # ── Agents & collaboration ──
 [components.secagent]
 repo = "secrouter/secagent"
-ref = "v0.1.0"
+ref = "v0.2.0"
 kind = "service"
 tier = "collab"
 port = 47007
