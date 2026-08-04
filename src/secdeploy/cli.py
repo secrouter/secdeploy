@@ -59,6 +59,7 @@ def _expected_assets(root: Path, target: str) -> list[Path]:
             d / "systemd/secrouter.service",
             d / "systemd/secagent.service",
             d / "systemd/secrecorder.service",
+            d / "systemd/secproxy.service",
         ]
     return []
 

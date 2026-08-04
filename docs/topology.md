@@ -22,6 +22,7 @@ tier to a **compute resource** (a host). Multiple tiers may share one resource.
 | `inference` | secllm | wants a resource with the `gpu` capability; may span **several** resources |
 | `gateway` | secrouter | the governed AI gateway |
 | `collab` | secagent, secchat, secrecorder | agents + human collaboration |
+| `edge` | secproxy | optional — the suite's one HTTPS front door (`:443`); see [Reverse proxy](#reverse-proxy-secproxy) below |
 
 Because the tier→component mapping lives in the manifest, you never hand-list components in
 `topology.toml` — you place *tiers*, which keeps placement stable across suite upgrades.
@@ -154,6 +155,36 @@ an explicit SecRouter **egress allow-list** (`out/addressing/secrouter-egress.js
 [SecRouter egress allow-list](fedora-fips.md#secrouter-egress-allow-list) and
 [Shared SecRouter and SecLLM inference token](fedora-fips.md#shared-secrouter-and-secllm-inference-token).
 
+### Reverse proxy (secproxy)
+
+Placing the `edge` tier stands up **secproxy** — [Caddy](https://caddyserver.com) — as the
+suite's one HTTPS front door on **:443**. `suite.toml` marks certain HTTP components
+`fronted` (today: secsso, secrouter, secagent, secchat, secrecorder); once secproxy is placed
+anywhere in the topology, `Topology.is_fronted()` flips to `True` for exactly those
+components, and their FQDNs resolve straight to secproxy's address instead of their own
+resource's (see `zone()`/`urls()`) — you reach `https://<service>.<domain>` instead of
+`https://<service>.<domain>:<port>`.
+
+Three components are **deliberately never fronted**, reached directly at their own
+`host:port` regardless of whether secproxy is placed:
+
+- **seccert** — the CA secproxy bootstraps its own certificate *from*; it can't sit behind
+  the very front door it issues certs for.
+- **secllm** — inference traffic must dial direct, never hop through the proxy.
+- **secdns** — not HTTP; nothing here for a reverse proxy to terminate.
+
+(secproxy never fronts itself either.)
+
+Fronting only takes effect once secproxy is actually placed: a topology with **no**
+`[groups.edge]` section — every topology that predates secproxy, and any that simply omits it
+— is byte-identical to before secproxy existed, since `is_fronted()` is `False` for everyone
+without it. SecDeploy generates secproxy's entire configuration, a `Caddyfile`, from this same
+placement data (one global `acme_ca` option pointing at SecCert's ACME directory, plus one
+`reverse_proxy` site block per fronted, placed instance) — see
+[secproxy's own README](https://github.com/secrouter/secproxy) for what it fronts and why, and
+[SecProxy (edge reverse proxy)](fedora-fips.md#secproxy-edge-reverse-proxy) for how it's
+deployed and the generated `Caddyfile`'s installed path.
+
 ## Validation
 
 `secdeploy verify [--topology <file>]` validates the topology against the manifest and prints
@@ -207,6 +238,11 @@ above.
   it to that resource's `ssh` endpoint, and deploys it remotely. `--dry-run` prints the runbook.
 - **`secdns` is stood up** on the host where the `identity` tier lands (Fedora systemd unit /
   macOS native), fed by the generated zone + env — so the internal names actually resolve.
+- **`secproxy` is stood up** on the host where the `edge` tier lands (Fedora systemd unit
+  running Caddy natively; a container on macOS), fed by the generated `Caddyfile` — no
+  `--with-*` flag needed, same as `secdns`. See
+  [Reverse proxy](#reverse-proxy-secproxy) above and
+  [SecProxy (edge reverse proxy)](fedora-fips.md#secproxy-edge-reverse-proxy).
 - **`deploy <target> --configure-resolver`** points this host's resolver at secdns for the
   internal domain (macOS `/etc/resolver/<domain>`, Fedora systemd-resolved) — the multi-host
   replacement for the `--configure-hosts` `/etc/hosts` trick. It asks before touching the host.

@@ -45,7 +45,13 @@ ANCHORS = Path("/etc/pki/ca-trust/source/anchors")
 # itself (write_addressing's secagent branch, in wiring.py/topology.py) is placement-only,
 # unconditional on the flag — a redeploy that later turns --with-agent on picks up an env
 # that was already being generated (harmlessly unused) rather than appearing from nothing.
-SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder")
+# secproxy (the edge reverse proxy) follows the same topology-only rule as secdns — no
+# --with-* flag, since it's the suite's default front door once a topology exists (see
+# _include below). It's last in this tuple: Caddy's own automatic HTTPS dials SecCert's ACME
+# directory and its Host-routed site blocks depend on secdns for name resolution, so it makes
+# sense for it to come up after its backends here — though the REAL start ordering is enforced
+# by secproxy.service's own After=, not by this tuple (which only orders the install loops below).
+SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder", "secproxy")
 SECDNS_ZONE = VAR / "secdns" / "secdns.zone"  # where the secdns service reads its zone
 SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_EGRESS_FILE target
 # The generated peer-wiring env (pool/token/egress-file path) — layered onto the operator's own
@@ -58,6 +64,10 @@ SECAGENT_ADDRESSING_ENV = ETC / "secagent-addressing.env"
 # pi's system-wide models.json for the secsuite-secagent service user (HOME=VAR/secagent, per
 # its useradd --home-dir below) — the SERVICE (api-key) auth mode; see wiring.secagent_pi_models_json.
 SECAGENT_PI_MODELS = VAR / "secagent" / ".pi" / "agent" / "models.json"
+# Where secproxy reads its Caddyfile — installed from the topology-generated addr_dir/Caddyfile
+# (wiring.write_addressing's "caddyfile" output). No secret in it (unlike SecLLM's admin token),
+# so — like the secdns zone — it's refreshed unconditionally on every deploy, never test -f guarded.
+SECPROXY_CADDYFILE = ETC / "Caddyfile"
 
 PLAN = [
     "Preflight: verify the host is in FIPS mode + the OpenSSL FIPS provider is active (fail closed)",
@@ -124,9 +134,11 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
     for svc in services:
         steps.append((["bash", "-c", f"rm -rf {OPT}/{svc} && cp -a {work}/{svc} {OPT}/{svc}"],
                       f"install {svc} code → {OPT}/{svc}"))
-    # env files from examples (don't clobber) — secdns/secllm instead get a generated env below
+    # env files from examples (don't clobber) — secdns/secllm instead get a generated env below;
+    # secproxy needs no env file at all — its only configuration is the generated Caddyfile
+    # installed below (Caddy takes no other environment-driven config from secdeploy).
     for svc in services:
-        if svc in ("secdns", "secllm"):
+        if svc in ("secdns", "secllm", "secproxy"):
             continue
         ex = root / f"deploy/fedora-fips/{svc}.env.example"
         steps.append((["bash", "-c", f"test -f {ETC}/{svc}.env || install -m 640 {ex} {ETC}/{svc}.env"],
@@ -205,6 +217,39 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              f"{addr_dir}/secagent-pi-models.json {SECAGENT_PI_MODELS} || true"],
             f"install pi models.json (service api-key auth) → {SECAGENT_PI_MODELS}",
         ))
+    # secproxy needs the Caddy RUNTIME itself. Unlike every other entry in SERVICES, there is
+    # no secproxy source checkout to build here — Caddy is an upstream Go binary (see
+    # secproxy's own README/Dockerfile) — so, mirroring the idempotent "ensure user"/"ensure
+    # X" idiom used throughout this function, this step is a no-op if Caddy is already on
+    # PATH (e.g. pre-mirrored into a closed-network host's local dnf repo) and otherwise
+    # installs it from Caddy's OFFICIAL Fedora/RHEL package — the @caddy/caddy COPR
+    # (https://copr.fedorainfracloud.org/coprs/@caddy/caddy/), Caddy's own documented install
+    # path for Fedora/RHEL — pinned to the 2.8 line to match secproxy's Dockerfile (FROM
+    # caddy:2.8-alpine). A native binary + dedicated systemd unit (not a podman container)
+    # was chosen deliberately: secproxy's manifest `kind` is "service" (like secdns), not
+    # "stack" (secsso/secchat's podman/compose path, a wholly separate deploy_stacks()
+    # mechanism — see targets/common.py); podman would also make binding :443/:80 with
+    # AmbientCapabilities=CAP_NET_BIND_SERVICE — the exact mechanism secdns uses for :53 —
+    # far less direct across a container boundary. See
+    # docs/fedora-fips.md#secproxy-edge-reverse-proxy for the full rationale.
+    if "secproxy" in services:
+        steps.append((
+            ["bash", "-c", "command -v caddy >/dev/null || "
+             "(dnf install -y 'dnf-command(copr)' && dnf copr enable -y @caddy/caddy && "
+             "dnf install -y 'caddy-2.8*')"],
+            "ensure Caddy runtime is installed (pinned to the 2.8 line, via the @caddy/caddy COPR)",
+        ))
+    # secproxy — install the topology-generated Caddyfile (the suite's edge reverse-proxy
+    # config; see wiring.caddyfile_text/write_addressing). Unconditional refresh, exactly like
+    # the secdns zone above — it carries no secret (Caddy's own ACME account/cert material
+    # lives under its state dir, never in this file), so a redeploy after topology.toml changes
+    # (a fronted service added/moved) takes effect immediately.
+    if "secproxy" in services and addr_dir is not None:
+        steps.append((
+            ["install", "-m", "644", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
+             str(addr_dir / "Caddyfile"), str(SECPROXY_CADDYFILE)],
+            f"install generated Caddyfile → {SECPROXY_CADDYFILE}",
+        ))
     # units — only the selected services, plus the suite target
     for svc in services:
         steps.append((["install", "-m", "644", str(unit_dir / f"{svc}.service"), f"{UNITS}/"],
@@ -256,6 +301,9 @@ def deploy(
     # the inference tier's placement, but standing up the (heavyweight, GPU) service itself is
     # opt-in. secagent additionally needs --with-agent — UNLIKE secllm, its generated wiring is
     # ALSO gated by the flag (see the SERVICES comment above), so this single check covers both.
+    # secproxy follows secdns's simpler rule exactly — topology-only, no --with-* flag: it's the
+    # suite's default front door the moment an edge tier exists, same as secdns is the default
+    # resolver the moment an identity tier exists.
     placed = set(topology.components_on(resource, without)) if topology is not None else None
 
     def _include(svc: str) -> bool:
@@ -266,6 +314,8 @@ def deploy(
         if svc == "secllm" and (topology is None or not with_inference):
             return False
         if svc == "secagent" and (topology is None or not with_agent):
+            return False
+        if svc == "secproxy" and topology is None:
             return False
         return placed is None or svc in placed
 

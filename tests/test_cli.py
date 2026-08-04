@@ -56,6 +56,13 @@ resource = "core"
 resources = ["gpu1", "gpu2"]
 """
 
+# GPU_SPLIT plus secproxy (edge tier) on 'core' — exercises the fedora-fips secproxy standup
+# (mirrors test_wiring.py's own EDGE_SPLIT fixture for the topology-derivation-level tests).
+EDGE_SPLIT = GPU_SPLIT + """
+[groups.edge]
+resource = "core"
+"""
+
 
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
@@ -187,6 +194,35 @@ def test_deploy_fedora_single_host_excludes_secdns(capsys):
     assert "secdns.service" not in out
     assert "seccert.service" in out
     assert "secllm.service" not in out  # --with-inference wasn't passed
+
+
+# ── secproxy (edge tier — Caddy reverse proxy): topology-gated, exactly like secdns ─────
+def test_deploy_fedora_topology_stands_up_secproxy(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(EDGE_SPLIT)  # core (fedora-fips) holds the edge tier → secproxy
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    # the unit
+    assert "secproxy.service" in out
+    assert "secsuite-secproxy" in out
+    # the Caddy runtime step (pinned binary install — see targets/fedora_fips.py)
+    assert "ensure Caddy runtime is installed" in out
+    assert "caddy-2.8" in out
+    # the generated Caddyfile install
+    assert "install generated Caddyfile" in out
+    assert "/etc/secsuite/Caddyfile" in out
+
+
+def test_deploy_fedora_single_host_excludes_secproxy(capsys):
+    # no topology → single-host → secproxy is NOT stood up (secproxy is topology-gated, same
+    # rule as secdns — byte-identical to every pre-secproxy single-host deploy)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "secproxy.service" not in out
+    assert "ensure Caddy runtime" not in out
+    assert "install generated Caddyfile" not in out
+    assert "seccert.service" in out
 
 
 def test_deploy_with_inference_stands_up_secllm(tmp_path, capsys):
@@ -453,3 +489,20 @@ def test_deploy_fedora_with_agent_verify_lists_secagent_service(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
     assert "target assets present" in out  # secagent.service ships, so verify still passes clean
+
+
+# ── secproxy.service is a fedora-fips expected asset ────────────────────────────────────
+def test_expected_assets_fedora_includes_secproxy_service():
+    from secdeploy.cli import _expected_assets
+
+    assets = _expected_assets(ROOT, "fedora-fips")
+    assert any(p.name == "secproxy.service" for p in assets)
+
+
+def test_verify_fedora_topology_reports_secproxy_placement(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(EDGE_SPLIT)  # core holds the edge tier → secproxy
+    assert main(["--manifest", MANIFEST, "verify", "--topology", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "target assets present" in out  # secproxy.service ships, so verify passes clean
+    assert "secproxy" in out  # listed among 'core's placed components

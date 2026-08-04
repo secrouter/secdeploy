@@ -272,6 +272,91 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
 These values match `secsso.sh`'s own `oidc-config`/`secagent-config` output exactly (both
 derive from the same SecSSO external URL), so the two never disagree.
 
+## SecProxy (edge reverse proxy)
+
+Placing the `edge` tier stands up **secproxy** — [Caddy](https://caddyserver.com) — as the
+suite's one HTTPS front door. Like `secdns`, it needs no `--with-*` flag: it deploys the
+moment a topology places the `edge` tier here.
+
+```bash
+sudo uv run secdeploy deploy fedora-fips --resource <edge-resource> --dry-run
+sudo uv run secdeploy deploy fedora-fips --resource <edge-resource>
+```
+
+### What it fronts
+
+secproxy terminates TLS on **:443** and reverse-proxies by Host header to the real
+`host:port` for the components `suite.toml` marks `fronted`: **secsso, secrouter, secagent,
+secchat, secrecorder**. Three components are deliberately **never** fronted, reached directly
+at their own `host:port` instead: **seccert** (the CA secproxy bootstraps its own cert from —
+it can't sit behind the front door it issues certs for), **secllm** (inference must dial
+direct, never hop through the proxy), and **secdns** (not HTTP). secproxy never fronts
+itself either. See [topology.md#reverse-proxy-secproxy](topology.md#reverse-proxy-secproxy)
+for how placement drives which FQDNs actually resolve through it.
+
+### The generated Caddyfile
+
+SecDeploy generates secproxy's entire configuration from the site topology — a global
+`acme_ca` option pointing Caddy's own ACME client at SecCert's directory, plus one
+`reverse_proxy` site block per fronted, placed component (`wiring.caddyfile_text()`). It is
+written to `out/addressing/Caddyfile` and installed, unconditionally refreshed on every
+redeploy (it carries no secret, exactly like the `secdns` zone), to:
+
+```
+/etc/secsuite/Caddyfile
+```
+
+Don't hand-edit that file — a redeploy overwrites it. Change `topology.toml` and redeploy
+instead. See [secproxy's own `Caddyfile.example`](https://github.com/secrouter/secproxy) for
+the exact shape the generator emits.
+
+### TLS via SecCert
+
+Caddy issues its own certificates — no plugin — against **SecCert**'s ACME directory
+(`http://seccert.<domain>:47001/acme/directory`), one per fronted hostname, auto-renewed well
+ahead of expiry with no operator action. Caddy trusts SecCert's root the same way every other
+suite component on this host does: the system trust store, populated by the
+`update-ca-trust` step in the normal deploy flow above — nothing extra to configure for that.
+
+### The systemd unit
+
+`secproxy.service` (`deploy/fedora-fips/systemd/secproxy.service`) runs Caddy as a dedicated,
+non-root `secsuite-secproxy` user, with the same hardening block as every other unit here
+(`NoNewPrivileges`, `ProtectSystem=strict`, `RestrictAddressFamilies`, etc.) plus
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` to bind the privileged **:443**/**:80** ports
+without root — exactly the mechanism `secdns.service` uses to bind **:53**. It orders itself
+`After=` both `secdns.service` and `seccert.service`: Caddy's automatic HTTPS dials SecCert's
+ACME directory at startup, and its Host-routed site blocks address backends by the names
+secdns serves, so both need to be up first. `ExecReload=/bin/kill -HUP $MAINPID` wires
+`systemctl reload secproxy` to Caddy's own graceful, connection-preserving config reload.
+
+### Installing the Caddy runtime
+
+Unlike every other unit on this page, secproxy has no pinned source checkout to build —
+Caddy is an upstream Go binary (see secproxy's own README/Dockerfile), not something
+`secdeploy build fedora-fips` compiles. `deploy fedora-fips` therefore includes an extra,
+idempotent step — "ensure Caddy runtime is installed" — that is a no-op if `caddy` is already
+on `PATH` (e.g. pre-mirrored into a closed-network host's local `dnf` repository) and
+otherwise installs it from Caddy's own official Fedora/RHEL package, the
+[`@caddy/caddy` COPR](https://copr.fedorainfracloud.org/coprs/@caddy/caddy/), pinned to the
+**2.8** line to match secproxy's own `Dockerfile` (`FROM caddy:2.8-alpine`):
+
+```bash
+dnf install -y 'dnf-command(copr)'
+dnf copr enable -y @caddy/caddy
+dnf install -y 'caddy-2.8*'
+```
+
+A native binary under its own hardened systemd unit was chosen over a Podman container
+deliberately: secproxy's `suite.toml` `kind` is `"service"` (like `secdns`, `secllm`,
+`secrouter`, `secagent`, `secrecorder`), not `"stack"` — the kind reserved for the
+Podman/Compose path (`secsso`/`secchat`, brought up via their own `bootstrap/<name>.sh`, a
+wholly separate mechanism — see `targets/common.py`'s `deploy_stacks`). Running Caddy natively
+also keeps its privileged-port binding identical in spirit to every other native unit here:
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` grants the port bind directly to the Caddy process,
+the same way `secdns.service` binds `:53` — a guarantee that gets considerably murkier once a
+container boundary (and, for rootless Podman, its own port-publishing path) sits in between.
+
 ## 4. Configure
 
 Edit the env files the installer dropped (they don't overwrite existing ones):
