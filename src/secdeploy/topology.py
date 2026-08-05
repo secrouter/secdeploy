@@ -252,7 +252,7 @@ class Topology:
         A FRONTED component (see :meth:`is_fronted`) resolves to secproxy's address instead
         of its own backend resource — secproxy is the suite's one HTTPS front door, so peers
         (and secdns clients) reach the fronted FQDN straight at it, and it routes to the real
-        backend by Host header (see ``wiring.caddyfile_text``). Unaffected when secproxy isn't
+        backend by Host header (see ``wiring.nginx_conf_text``). Unaffected when secproxy isn't
         placed in this topology at all — every component keeps resolving to its own resource,
         exactly as before secproxy existed."""
         records: list[tuple[str, str, str]] = []

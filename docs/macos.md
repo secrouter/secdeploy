@@ -157,41 +157,47 @@ missing one just falls back to that model's default (network) ID with a warning.
 
 ## SecProxy (edge reverse proxy)
 
-Placing the `edge` tier on this Mac stands up **secproxy** — [Caddy](https://caddyserver.com) —
-as the suite's one HTTPS front door, run **natively** here, same as SecDNS/SecLLM/SecAgent
-above — **not** as a container. That's the key simplification for this target: a native Caddy
-binds directly to the host, so it reaches every other backend the same way any other host
-process does — `<topology-address>:<port>` — whether that backend is containerized (SecCert,
-SecRouter publish their ports to the host via `compose.yaml`) or itself native (SecDNS/SecLLM/
-SecAgent). That sidesteps the container/host boundary altogether, instead of crossing it the
-way SecRecorder's `--tls` flow has to via `host.docker.internal` (see
-[SecRecorder over TLS](#secrecorder-over-tls-seccert-issued-cert) above). Like SecDNS, it needs
-no `--with-*` flag — it deploys the moment a topology places the edge tier here:
+Placing the `edge` tier on this Mac stands up **secproxy** — [nginx](https://nginx.org) — as the
+suite's one HTTPS front door, run **natively** here, same as SecDNS/SecLLM/SecAgent above —
+**not** as a container. That's the key simplification for this target: a native nginx binds
+directly to the host, so it reaches every other backend the same way any other host process does
+— `<topology-address>:<port>` — whether that backend is containerized (SecCert, SecRouter publish
+their ports to the host via `compose.yaml`) or itself native (SecDNS/SecLLM/SecAgent). Like
+SecDNS, it needs no `--with-*` flag — it deploys the moment a topology places the edge tier here:
 
 ```bash
 uv run secdeploy deploy macos --dry-run --topology topology.toml --resource <edge-resource>
 uv run secdeploy deploy macos --topology topology.toml --resource <edge-resource>
 ```
 
-`deploy macos` already writes `out/addressing/Caddyfile` whenever a topology is active (the
-same `wiring.write_addressing()`/`wiring.caddyfile_text()` generator fedora-fips uses — see
-[fedora-fips.md#the-generated-caddyfile](fedora-fips.md#the-generated-caddyfile)), and — like
-SecDNS/SecLLM/SecAgent's own native-run notes above — prints the command to run it rather than
-starting it for you:
+nginx is the reverse-proxy runtime on **both** targets — fedora-fips uses the system OpenSSL
+(FIPS-validated in FIPS mode), and macOS runs the same nginx for a non-FIPS eval. `deploy macos`
+writes `out/addressing/secproxy.nginx.conf` whenever a topology is active (the same
+`wiring.write_addressing()`/`wiring.nginx_conf_text()` generator fedora-fips installs — see
+[fedora-fips.md#the-generated-nginx-config](fedora-fips.md#the-generated-nginx-config)), makes
+sure `nginx` is on `PATH` first (installing via `brew install nginx` if missing — the same
+`_ensure_certbot()`-style idiom `--tls` uses for `certbot`), issues the SAN cert (below), and —
+like SecDNS/SecLLM/SecAgent's own native-run notes above — prints the command to run it rather
+than starting it for you:
 
 ```bash
-sudo caddy run --config out/addressing/Caddyfile
+sudo nginx -c out/addressing/secproxy.nginx.conf -g 'daemon off;'
 ```
 
-Caddy binds `:443`/`:80`, so — like SecDNS's `:53` — starting it needs `sudo`. `deploy macos`
-also makes sure `caddy` itself is on `PATH` first, installing it via `brew install caddy` if
-missing (the same `_ensure_certbot()`-style idiom `--tls` already uses for `certbot`) —
-Homebrew's `caddy` formula doesn't keep older major.minor releases installable side by side the
-way fedora-fips's `@caddy/caddy` COPR pins to the 2.8 line (see
-[fedora-fips.md#installing-the-caddy-runtime](fedora-fips.md#installing-the-caddy-runtime)), so
-this installs whatever's currently in homebrew-core rather than a pinned version. For a pinned
-build, install Caddy 2.8.x yourself (e.g. from
-[caddyserver.com/download](https://caddyserver.com/download)) before running `deploy macos`.
+nginx binds `:443`/`:80`, so — like SecDNS's `:53` — starting it needs `sudo`.
+
+> **Eval setup — production paths.** The generated config is the *production* shape: it reads its
+> cert from `/etc/secsuite/secproxy/{fullchain,privkey}.pem` and points nginx's pid/logs/temp +
+> the ACME webroot at the state dir `/var/lib/secsuite/secproxy`. For a local macOS eval, create
+> those dirs and drop the cert in place (running as `sudo`), e.g.:
+>
+> ```bash
+> sudo install -d /var/lib/secsuite/secproxy/tmp /var/lib/secsuite/secproxy/acme /etc/secsuite/secproxy
+> sudo cp out/certbot/config/live/secproxy/{fullchain,privkey}.pem /etc/secsuite/secproxy/
+> ```
+>
+> — or hand-edit the paths in your copy of the generated conf (a one-off local workaround; a
+> redeploy overwrites it).
 
 ### What it fronts
 
@@ -202,34 +208,37 @@ See [fedora-fips.md#what-it-fronts](fedora-fips.md#what-it-fronts) for why.
 
 ### TLS on macOS: the same eval limitation as SecRecorder
 
-The generated Caddyfile points its global `acme_ca` option at SecCert's ACME directory
-unconditionally, so Caddy will try to get itself a real, SecCert-issued certificate for every
-fronted hostname — the same ACME flow SecRecorder's `--tls`/`certbot` path above uses. That
-needs the challenge to actually be reachable: SecDNS serving the fronted FQDNs, and this Mac's
-resolver actually pointed at SecDNS (`--configure-resolver`, or manual `/etc/resolver` setup —
-see [Internal DNS](#internal-dns-internal-on-macos) above) so the name resolves the way SecCert
-expects. Without both in place, Caddy's automatic HTTPS just sits there failing to issue — it
-doesn't fall back to plain HTTP on its own.
+nginx doesn't run its own ACME client — SecDeploy issues it one **SAN certificate** covering
+every fronted FQDN from SecCert via `certbot`, exactly like fedora-fips (see
+[fedora-fips.md#tls-via-seccert-the-deploy-time-san-cert](fedora-fips.md#tls-via-seccert-the-deploy-time-san-cert)),
+just adapted to macOS's container/host boundary the way SecRecorder's `--tls` flow is: the
+HTTP-01 responder runs on the Mac and SecCert (in its container) reaches it on
+`SECCERT_HTTP01_PORT` (see `compose.yaml`).
 
-For a pure local eval with none of that set up, skip ACME entirely instead of fighting it: hand
-add Caddy's own `tls internal` directive (globally, or per site block) to the generated
-`out/addressing/Caddyfile`, which has Caddy mint a self-signed certificate instead of reaching
-for SecCert. Don't expect that edit to survive a redeploy, though — like every other generated
-file here, a redeploy overwrites it; this is a one-off local workaround, not a supported flag.
+That validation needs the challenge to actually be reachable: SecCert must resolve each fronted
+FQDN **to this host, from inside its container** — i.e. SecDNS serving the fronted FQDNs and the
+SecCert container's resolver pointed at SecDNS. On a plain local eval that isn't set up, so
+issuance may not complete (the deploy warns and continues).
+
+For a pure local eval, skip ACME entirely instead of fighting it: drop a **self-signed**
+certificate at `/etc/secsuite/secproxy/{fullchain,privkey}.pem` (e.g. `openssl req -x509 -newkey
+rsa:2048 -nodes -keyout privkey.pem -out fullchain.pem -days 30 -subj /CN=secrouter.<domain>`),
+which nginx serves the same way. Like every other generated file here, don't expect a hand-edited
+conf to survive a redeploy — this is a one-off local workaround, not a supported flag.
 
 ### Known caveat: SecAgent's port
 
-`suite.toml` gives secagent port `47007` — the port the generated Caddyfile's
-`secagent.<domain>` site block reverse-proxies to. But SecAgent's own native run command (both
+`suite.toml` gives secagent port `47007` — the port the generated nginx config's
+`secagent.<domain>` server block reverse-proxies to. But SecAgent's own native run command (both
 here and on fedora-fips — see
 [fedora-fips.md#secagent-and-mattermost](fedora-fips.md#secagent-and-mattermost)) is `secagent
-chat serve --port 8070`, a different port than the one Caddy is told to dial. On a single-Mac
+chat serve --port 8070`, a different port than the one nginx is told to dial. On a single-Mac
 eval running secproxy and SecAgent together, that mismatch means `secagent.<domain>` won't
 actually reach the running `chat serve` process unless you start it on `47007` instead of the
 documented `8070` (`secagent chat serve --port 47007`) — or you accept that the fronted route
 doesn't work end-to-end here and reach SecAgent directly at whatever port it's actually
 listening on instead. This is a pre-existing gap in the port model, not something this native-
-Caddy integration introduces or fixes.
+nginx integration introduces or fixes.
 
 ## Verify
 

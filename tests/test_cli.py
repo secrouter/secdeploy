@@ -64,7 +64,7 @@ resource = "core"
 """
 
 # GPU_SPLIT plus secproxy (edge tier) on 'gpu' — the MACOS resource this time (EDGE_SPLIT above
-# puts it on 'core', a fedora-fips resource) — exercises the macOS native-Caddy standup.
+# puts it on 'core', a fedora-fips resource) — exercises the macOS native-nginx standup.
 MACOS_EDGE_SPLIT = GPU_SPLIT + """
 [groups.edge]
 resource = "gpu"
@@ -74,7 +74,7 @@ resource = "gpu"
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
-    assert "suite 1.5.0" in out
+    assert "suite 1.6.0" in out
     assert "optional: seccert, secsso, secdns" in out
     assert "target assets present" in out
 
@@ -134,7 +134,7 @@ def test_bundle_per_resource(tmp_path):
     assert rc == 0
     import tarfile
 
-    tarball = out / "secsuite-1.5.0-macos-gpu.tar.gz"
+    tarball = out / "secsuite-1.6.0-macos-gpu.tar.gz"
     assert tarball.exists()
     names = tarfile.open(tarball).getnames()
     assert any(n.endswith("addressing/secdns.zone") for n in names)
@@ -203,7 +203,7 @@ def test_deploy_fedora_single_host_excludes_secdns(capsys):
     assert "secllm.service" not in out  # --with-inference wasn't passed
 
 
-# ── secproxy (edge tier — Caddy reverse proxy): topology-gated, exactly like secdns ─────
+# ── secproxy (edge tier — nginx reverse proxy on fedora-fips): topology-gated, like secdns ──
 def test_deploy_fedora_topology_stands_up_secproxy(tmp_path, capsys):
     tp = tmp_path / "topology.toml"
     tp.write_text(EDGE_SPLIT)  # core (fedora-fips) holds the edge tier → secproxy
@@ -213,12 +213,21 @@ def test_deploy_fedora_topology_stands_up_secproxy(tmp_path, capsys):
     # the unit
     assert "secproxy.service" in out
     assert "secsuite-secproxy" in out
-    # the Caddy runtime step (pinned binary install — see targets/fedora_fips.py)
-    assert "ensure Caddy runtime is installed" in out
-    assert "caddy-2.8" in out
-    # the generated Caddyfile install
-    assert "install generated Caddyfile" in out
-    assert "/etc/secsuite/Caddyfile" in out
+    # the nginx runtime step (+ certbot) — no COPR/binary-runtime install anymore
+    assert "install the secproxy runtime (nginx" in out
+    assert "dnf install -y nginx certbot" in out
+    assert "copr" not in out.lower()  # the old COPR binary-runtime install step is gone
+    # the certbot SAN-cert issuance from SecCert — one --cert-name, one -d per fronted FQDN
+    assert "certbot certonly --standalone" in out
+    assert "--cert-name secproxy" in out
+    for name in ("secsso", "secrouter", "secagent", "secchat", "secrecorder"):
+        assert f"-d {name}.sec.internal" in out
+    assert "http://seccert.sec.internal:47001/acme/directory" in out
+    # the cert install (0600 key, owned by the service user) + the generated nginx config install
+    assert "/etc/secsuite/secproxy/fullchain.pem" in out
+    assert "/etc/secsuite/secproxy/privkey.pem" in out
+    assert "install generated nginx config" in out
+    assert "/etc/secsuite/nginx-secproxy.conf" in out
 
 
 def test_deploy_fedora_single_host_excludes_secproxy(capsys):
@@ -227,8 +236,9 @@ def test_deploy_fedora_single_host_excludes_secproxy(capsys):
     assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "secproxy.service" not in out
-    assert "ensure Caddy runtime" not in out
-    assert "install generated Caddyfile" not in out
+    assert "secproxy runtime (nginx" not in out
+    assert "install generated nginx config" not in out
+    assert "certbot certonly" not in out
     assert "seccert.service" in out
 
 
@@ -287,7 +297,7 @@ resource = "mac"
     assert "secdns: run natively" in out
 
 
-# ── secproxy on macOS: native Caddy (not a container — see targets/macos.py's module
+# ── secproxy on macOS: native nginx (not a container — see targets/macos.py's module
 #    docstring), gated on topology placement only, exactly like secdns above ─────────────
 def test_deploy_macos_topology_secproxy_native(tmp_path, capsys):
     tp = tmp_path / "topology.toml"
@@ -295,9 +305,10 @@ def test_deploy_macos_topology_secproxy_native(tmp_path, capsys):
     assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
                  "--topology", str(tp), "--resource", "gpu"]) == 0
     out = capsys.readouterr().out
-    assert "secproxy: run natively on :443/:80" in out
-    assert "sudo caddy run --config" in out
-    assert "addressing/Caddyfile" in out
+    assert "run nginx natively on :443/:80" in out
+    assert "issue a SecCert SAN cert" in out       # the certbot SAN issuance note
+    assert "sudo nginx -c" in out
+    assert "addressing/secproxy.nginx.conf" in out
 
 
 def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):
@@ -306,7 +317,7 @@ def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):
     assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "secproxy" not in out.lower()
-    assert "caddy" not in out.lower()
+    assert "nginx" not in out.lower()
 
 
 def test_deploy_fedora_configure_resolver_local(tmp_path, capsys):

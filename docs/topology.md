@@ -157,7 +157,7 @@ an explicit SecRouter **egress allow-list** (`out/addressing/secrouter-egress.js
 
 ### Reverse proxy (secproxy)
 
-Placing the `edge` tier stands up **secproxy** — [Caddy](https://caddyserver.com) — as the
+Placing the `edge` tier stands up **secproxy** — [nginx](https://nginx.org) — as the
 suite's one HTTPS front door on **:443**. `suite.toml` marks certain HTTP components
 `fronted` (today: secsso, secrouter, secagent, secchat, secrecorder); once secproxy is placed
 anywhere in the topology, `Topology.is_fronted()` flips to `True` for exactly those
@@ -178,12 +178,12 @@ Three components are **deliberately never fronted**, reached directly at their o
 Fronting only takes effect once secproxy is actually placed: a topology with **no**
 `[groups.edge]` section — every topology that predates secproxy, and any that simply omits it
 — is byte-identical to before secproxy existed, since `is_fronted()` is `False` for everyone
-without it. SecDeploy generates secproxy's entire configuration, a `Caddyfile`, from this same
-placement data (one global `acme_ca` option pointing at SecCert's ACME directory, plus one
-`reverse_proxy` site block per fronted, placed instance) — see
-[secproxy's own README](https://github.com/secrouter/secproxy) for what it fronts and why, and
-[SecProxy (edge reverse proxy)](fedora-fips.md#secproxy-edge-reverse-proxy) for how it's
-deployed and the generated `Caddyfile`'s installed path.
+without it. SecDeploy generates secproxy's entire configuration — an nginx config — from this
+same placement data (a `map` for WebSocket upgrades, a `:80` server for the ACME webroot +
+HTTP→HTTPS redirect, and one `:443` `server`/`proxy_pass` block per fronted, placed instance) —
+see [secproxy's own README](https://github.com/secrouter/secproxy) for what it fronts and why,
+and [SecProxy (edge reverse proxy)](fedora-fips.md#secproxy-edge-reverse-proxy) for how it's
+deployed, the deploy-time SecCert SAN cert, and the generated config's installed path.
 
 ## Validation
 
@@ -239,8 +239,8 @@ above.
 - **`secdns` is stood up** on the host where the `identity` tier lands (Fedora systemd unit /
   macOS native), fed by the generated zone + env — so the internal names actually resolve.
 - **`secproxy` is stood up** on the host where the `edge` tier lands (Fedora systemd unit /
-  macOS native, both running Caddy), fed by the generated `Caddyfile` — no
-  `--with-*` flag needed, same as `secdns`. See
+  macOS native, both running nginx), fed by the generated nginx config + a deploy-time SecCert
+  SAN cert — no `--with-*` flag needed, same as `secdns`. See
   [Reverse proxy](#reverse-proxy-secproxy) above and
   [SecProxy (edge reverse proxy)](fedora-fips.md#secproxy-edge-reverse-proxy).
 - **`deploy <target> --configure-resolver`** points this host's resolver at secdns for the

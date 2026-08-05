@@ -274,14 +274,19 @@ derive from the same SecSSO external URL), so the two never disagree.
 
 ## SecProxy (edge reverse proxy)
 
-Placing the `edge` tier stands up **secproxy** — [Caddy](https://caddyserver.com) — as the
-suite's one HTTPS front door. Like `secdns`, it needs no `--with-*` flag: it deploys the
-moment a topology places the `edge` tier here.
+Placing the `edge` tier stands up **secproxy** — [nginx](https://nginx.org) — as the suite's
+one HTTPS front door. Like `secdns`, it needs no `--with-*` flag: it deploys the moment a
+topology places the `edge` tier here.
 
 ```bash
 sudo uv run secdeploy deploy fedora-fips --resource <edge-resource> --dry-run
 sudo uv run secdeploy deploy fedora-fips --resource <edge-resource>
 ```
+
+**Why nginx (and why it's the FIPS choice).** In FIPS mode the crypto boundary is the host's
+OpenSSL FIPS provider. nginx links that **system OpenSSL**, so all edge TLS termination runs
+through the FIPS-validated module — the reason the suite standardized on nginx for its reverse
+proxy. (The macOS eval target runs the same nginx; see [macos.md](macos.md).)
 
 ### What it fronts
 
@@ -294,66 +299,106 @@ direct, never hop through the proxy), and **secdns** (not HTTP). secproxy never 
 itself either. See [topology.md#reverse-proxy-secproxy](topology.md#reverse-proxy-secproxy)
 for how placement drives which FQDNs actually resolve through it.
 
-### The generated Caddyfile
+### The generated nginx config
 
-SecDeploy generates secproxy's entire configuration from the site topology — a global
-`acme_ca` option pointing Caddy's own ACME client at SecCert's directory, plus one
-`reverse_proxy` site block per fronted, placed component (`wiring.caddyfile_text()`). It is
-written to `out/addressing/Caddyfile` and installed, unconditionally refreshed on every
-redeploy (it carries no secret, exactly like the `secdns` zone), to:
+SecDeploy generates secproxy's entire configuration from the site topology
+(`wiring.nginx_conf_text()`) — a complete nginx config (`events`/`http` blocks), containing a
+`map` for WebSocket upgrades, a **:80** server (the ACME HTTP-01 webroot for renewal plus a
+blanket HTTP→HTTPS redirect), and one **:443** `server { … proxy_pass … }` block per fronted,
+placed component, each pointing straight at the backend's real `host:port`. It is written to
+`out/addressing/secproxy.nginx.conf` and installed — unconditionally refreshed on every
+redeploy (it carries no secret, exactly like the `secdns` zone) — to:
 
 ```
-/etc/secsuite/Caddyfile
+/etc/secsuite/nginx-secproxy.conf
 ```
 
-Don't hand-edit that file — a redeploy overwrites it. Change `topology.toml` and redeploy
-instead. See [secproxy's own `Caddyfile.example`](https://github.com/secrouter/secproxy) for
-the exact shape the generator emits.
+nginx runs it as a complete config: `nginx -c /etc/secsuite/nginx-secproxy.conf -g 'daemon
+off;'`. Every writable path (pid, logs, temp dirs, the ACME webroot) lives under the service
+state dir `/var/lib/secsuite/secproxy`, so nothing touches nginx's default (read-only under
+`ProtectSystem=strict`) `/var/log/nginx`, `/var/lib/nginx`, or `/run` paths. Don't hand-edit
+the installed file — a redeploy overwrites it. Change `topology.toml` and redeploy instead. See
+[secproxy's own `nginx-secproxy.conf.example`](https://github.com/secrouter/secproxy) for the
+exact shape the generator emits.
 
-### TLS via SecCert
+### TLS via SecCert (the deploy-time SAN cert)
 
-Caddy issues its own certificates — no plugin — against **SecCert**'s ACME directory
-(`http://seccert.<domain>:47001/acme/directory`), one per fronted hostname, auto-renewed well
-ahead of expiry with no operator action. Caddy trusts SecCert's root the same way every other
-suite component on this host does: the system trust store, populated by the
-`update-ca-trust` step in the normal deploy flow above — nothing extra to configure for that.
+Unlike a self-ACME proxy, nginx does **not** run an ACME client. SecDeploy issues **one SAN
+certificate** covering every fronted FQDN from **SecCert**'s ACME directory
+(`http://seccert.<domain>:47001/acme/directory`) using `certbot --standalone` at deploy time,
+under a single `--cert-name secproxy` with one `-d <fqdn>` per fronted component, and installs
+it to:
+
+```
+/etc/secsuite/secproxy/fullchain.pem
+/etc/secsuite/secproxy/privkey.pem      # 0600, owned by secsuite-secproxy
+```
+
+Every `:443` `server` block reads that same pair (the whole point of one SAN cert). nginx trusts
+SecCert's root the same way every other suite component on this host does: the system trust
+store, populated by the `update-ca-trust` step in the normal deploy flow above — nothing extra
+to configure for that.
+
+### Bootstrap ordering (flagged) and renewal
+
+certbot's HTTP-01 challenge is answered by the `--standalone` responder on **:80**, which
+imposes an ordering assumption worth stating plainly:
+
+- **Port 80 must be free** when certbot runs — so issuance is ordered **before** nginx starts
+  (the cert steps come ahead of `systemctl enable --now secsuite.target`).
+- **SecCert must be reachable** and the **fronted FQDNs must resolve to this proxy host** (via
+  secdns's fronted-axis zone) so SecCert can reach the responder for each of the five names —
+  i.e. secdns up + this host's resolver pointed at it (`--configure-resolver`, or a manual
+  `/etc/resolver`/`/etc/hosts`). On a from-scratch first deploy SecCert may not be configured or
+  running yet, so the issuance step is **non-fatal**: it prints guidance instead of aborting the
+  deploy, and nginx's own `ExecStartPre=nginx -t` then fails closed (secproxy stays down, the
+  rest of the suite is unaffected) until the cert lands. A **redeploy re-issues idempotently**
+  once SecCert is up and names resolve.
+
+**Renewal** reuses the running nginx's `:80` `/.well-known/acme-challenge/` webroot (served out
+of `/var/lib/secsuite/secproxy/acme`), so it does **not** need to stop nginx:
+
+```bash
+certbot renew --webroot -w /var/lib/secsuite/secproxy/acme && nginx -s reload -c /etc/secsuite/nginx-secproxy.conf
+```
+
+Wire that into a `certbot renew` timer (add `--deploy-hook` to re-copy the renewed
+`fullchain.pem`/`privkey.pem` into `/etc/secsuite/secproxy/` and run the `nginx -s reload`).
+This wave issues at deploy time and documents renewal rather than fully automating the timer.
 
 ### The systemd unit
 
-`secproxy.service` (`deploy/fedora-fips/systemd/secproxy.service`) runs Caddy as a dedicated,
+`secproxy.service` (`deploy/fedora-fips/systemd/secproxy.service`) runs nginx as a dedicated,
 non-root `secsuite-secproxy` user, with the same hardening block as every other unit here
 (`NoNewPrivileges`, `ProtectSystem=strict`, `RestrictAddressFamilies`, etc.) plus
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` to bind the privileged **:443**/**:80** ports
-without root — exactly the mechanism `secdns.service` uses to bind **:53**. It orders itself
-`After=` both `secdns.service` and `seccert.service`: Caddy's automatic HTTPS dials SecCert's
-ACME directory at startup, and its Host-routed site blocks address backends by the names
-secdns serves, so both need to be up first. `ExecReload=/bin/kill -HUP $MAINPID` wires
-`systemctl reload secproxy` to Caddy's own graceful, connection-preserving config reload.
+without root — exactly the mechanism `secdns.service` uses to bind **:53**. `ReadWritePaths`
+grants `/var/lib/secsuite/secproxy` (where the generated config points nginx's pid, logs, temp
+dirs, and the ACME webroot). It orders itself `After=` both `secdns.service` and
+`seccert.service`: nginx serves backends by the names secdns resolves, and its cert is issued
+from SecCert, so both need to be up first. `ExecStartPre=nginx -t` validates the config (and
+fails closed if the SecCert-issued cert isn't in place yet); `ExecReload=nginx -s reload` wires
+`systemctl reload secproxy` to nginx's own graceful, connection-preserving config reload.
 
-### Installing the Caddy runtime
+### Installing the nginx runtime
 
-Unlike every other unit on this page, secproxy has no pinned source checkout to build —
-Caddy is an upstream Go binary (see secproxy's own README/Dockerfile), not something
-`secdeploy build fedora-fips` compiles. `deploy fedora-fips` therefore includes an extra,
-idempotent step — "ensure Caddy runtime is installed" — that is a no-op if `caddy` is already
-on `PATH` (e.g. pre-mirrored into a closed-network host's local `dnf` repository) and
-otherwise installs it from Caddy's own official Fedora/RHEL package, the
-[`@caddy/caddy` COPR](https://copr.fedorainfracloud.org/coprs/@caddy/caddy/), pinned to the
-**2.8** line to match secproxy's own `Dockerfile` (`FROM caddy:2.8-alpine`):
+Unlike every other unit on this page, secproxy has no pinned source checkout to build — nginx is
+an upstream package (see secproxy's own README), not something `secdeploy build fedora-fips`
+compiles. `deploy fedora-fips` therefore installs the runtime as a one-time prerequisite (the
+same way node/npm and uv are provisioned for the other units — see the [Runtimes](#2-runtimes)
+step), alongside the `certbot` ACME client that mints the SAN cert above:
 
 ```bash
-dnf install -y 'dnf-command(copr)'
-dnf copr enable -y @caddy/caddy
-dnf install -y 'caddy-2.8*'
+dnf install -y nginx certbot
 ```
 
-A native binary under its own hardened systemd unit was chosen over a Podman container
+A native package under its own hardened systemd unit was chosen over a Podman container
 deliberately: secproxy's `suite.toml` `kind` is `"service"` (like `secdns`, `secllm`,
 `secrouter`, `secagent`, `secrecorder`), not `"stack"` — the kind reserved for the
 Podman/Compose path (`secsso`/`secchat`, brought up via their own `bootstrap/<name>.sh`, a
-wholly separate mechanism — see `targets/common.py`'s `deploy_stacks`). Running Caddy natively
+wholly separate mechanism — see `targets/common.py`'s `deploy_stacks`). Running nginx natively
 also keeps its privileged-port binding identical in spirit to every other native unit here:
-`AmbientCapabilities=CAP_NET_BIND_SERVICE` grants the port bind directly to the Caddy process,
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` grants the port bind directly to the nginx process,
 the same way `secdns.service` binds `:53` — a guarantee that gets considerably murkier once a
 container boundary (and, for rootless Podman, its own port-publishing path) sits in between.
 

@@ -82,7 +82,7 @@ resource = "gpu"
 """
 
 # MULTI_INFERENCE plus secproxy on 'core' — fronting alongside a multi-resource (2-instance)
-# SecLLM pool, to confirm the Caddyfile generator isn't confused by a multi-resource tier
+# SecLLM pool, to confirm the nginx config generator isn't confused by a multi-resource tier
 # elsewhere in the same topology.
 EDGE_MULTI_INFERENCE = """
 domain = "sec.internal"
@@ -216,87 +216,123 @@ def test_write_addressing(tmp_path):
     assert Path(env["secllm"]).exists()
 
 
-# ── caddyfile_text: secproxy's Caddyfile (fronts the 5 HTTP services on :443) ───────────
-def test_caddyfile_text_site_blocks_for_exactly_the_five(tmp_path):
+# ── nginx_conf_text: secproxy's reverse-proxy config (fronts the 5 HTTP services on :443) ──
+CERT_DIR = "/etc/secsuite/secproxy"
+
+
+def test_nginx_conf_text_server_blocks_for_exactly_the_five(tmp_path):
     topo = _edge_topo(tmp_path)
-    text = wiring.caddyfile_text(topo)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
     for name in FRONTED:
-        assert f"{name}.sec.internal {{" in text
-    # never fronted, regardless of placement (the CA stays a direct trust anchor)
-    assert "seccert.sec.internal {" not in text
-    assert "secllm.sec.internal {" not in text
-    assert "secdns.sec.internal {" not in text
-    assert "secproxy.sec.internal {" not in text
+        assert f"server_name {name}.sec.internal;" in text
+    # never fronted, regardless of placement — no :443 server_name for the direct-dial services
+    assert "server_name seccert.sec.internal;" not in text
+    assert "server_name secllm.sec.internal;" not in text
+    assert "server_name secdns.sec.internal;" not in text
+    assert "server_name secproxy.sec.internal;" not in text
 
 
-def test_caddyfile_text_reverse_proxy_targets_are_correct(tmp_path):
+def test_nginx_conf_text_proxy_pass_targets_are_correct(tmp_path):
     topo = _edge_topo(tmp_path)
-    text = wiring.caddyfile_text(topo)
-    assert "secsso.sec.internal {\n\treverse_proxy 10.0.0.5:9000\n}" in text
-    assert "secrouter.sec.internal {\n\treverse_proxy 10.0.0.5:47002\n}" in text
-    assert "secagent.sec.internal {\n\treverse_proxy 10.0.0.5:47007\n}" in text
-    assert "secchat.sec.internal {\n\treverse_proxy 10.0.0.5:8065\n}" in text
-    assert "secrecorder.sec.internal {\n\treverse_proxy 10.0.0.5:47003\n}" in text
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    assert "proxy_pass http://10.0.0.5:9000;" in text      # secsso
+    assert "proxy_pass http://10.0.0.5:47002;" in text     # secrouter
+    assert "proxy_pass http://10.0.0.5:47007;" in text     # secagent
+    assert "proxy_pass http://10.0.0.5:8065;" in text      # secchat
+    assert "proxy_pass http://10.0.0.5:47003;" in text     # secrecorder
 
 
-def test_caddyfile_text_acme_ca_points_at_seccert_directory(tmp_path):
+def test_nginx_conf_text_ssl_cert_paths_use_cert_dir(tmp_path):
     topo = _edge_topo(tmp_path)
-    text = wiring.caddyfile_text(topo)
-    assert "acme_ca http://seccert.sec.internal:47001/acme/directory" in text
-    # the global options block comes before any site block
-    assert text.index("acme_ca") < text.index("secsso.sec.internal {")
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    # one SAN cert covers all five — every :443 block reads the SAME cert_dir
+    assert f"ssl_certificate {CERT_DIR}/fullchain.pem;" in text
+    assert f"ssl_certificate_key {CERT_DIR}/privkey.pem;" in text
+    assert text.count("ssl_certificate ") == len(FRONTED)  # one per fronted server block
+    # cert_dir is a parameter
+    other = wiring.nginx_conf_text(topo, "/opt/tls")
+    assert "ssl_certificate /opt/tls/fullchain.pem;" in other
+    assert CERT_DIR + "/fullchain.pem" not in other
 
 
-def test_caddyfile_text_deterministic_manifest_order(tmp_path):
+def test_nginx_conf_text_websocket_map_and_upgrade_headers(tmp_path):
     topo = _edge_topo(tmp_path)
-    text = wiring.caddyfile_text(topo)
-    order = [name for name in FRONTED if f"{name}.sec.internal {{" in text]
-    positions = [text.index(f"{name}.sec.internal {{") for name in order]
-    assert positions == sorted(positions)
-    assert order == list(FRONTED)  # manifest order: secsso, secrouter, secagent, secchat, secrecorder
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    assert "map $http_upgrade $connection_upgrade {" in text
+    assert "proxy_set_header Upgrade $http_upgrade;" in text
+    assert "proxy_set_header Connection $connection_upgrade;" in text
+    # standard reverse-proxy headers on every fronted block
+    assert text.count("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;") == len(FRONTED)
+    assert text.count("proxy_set_header X-Forwarded-Proto $scheme;") == len(FRONTED)
+    assert text.count("proxy_set_header Host $host;") == len(FRONTED)
 
 
-def test_caddyfile_text_no_site_blocks_when_secproxy_unplaced(tmp_path):
-    # GPU_SPLIT has no [groups.edge] — secproxy isn't deployed, so nothing is fronted; the
-    # function still renders (acme_ca is unconditional on seccert being present), just with no
-    # site blocks — the placement gating lives in write_addressing, not here.
-    topo = _topo(tmp_path)
-    text = wiring.caddyfile_text(topo)
-    for name in FRONTED:
-        assert f"{name}.sec.internal {{" not in text
+def test_nginx_conf_text_port_80_acme_webroot_and_redirect(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    assert "listen 80;" in text and "listen [::]:80;" in text
+    # all five fronted names share the one :80 server (ACME webroot + HTTPS redirect)
+    assert ("server_name secsso.sec.internal secrouter.sec.internal secagent.sec.internal "
+            "secchat.sec.internal secrecorder.sec.internal;") in text
+    assert "location /.well-known/acme-challenge/ {" in text
+    assert "root /var/lib/secsuite/secproxy/acme;" in text
+    assert "return 301 https://$host$request_uri;" in text
 
 
-def test_caddyfile_text_multi_resource_topology_handled(tmp_path):
-    # secproxy fronts the 5 exactly the same way alongside a 2-instance SecLLM pool elsewhere —
-    # the multi-resource inference tier doesn't leak into (or get confused with) the Caddyfile.
+def test_nginx_conf_text_is_a_complete_config_with_http2(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    # complete config (runnable via `nginx -c`): events + http blocks, writable paths in the
+    # state dir (ProtectSystem=strict), and the header pointing at topology.toml
+    assert "events {" in text and "http {" in text
+    assert "pid /var/lib/secsuite/secproxy/nginx.pid;" in text
+    assert "proxy_temp_path /var/lib/secsuite/secproxy/tmp/proxy;" in text
+    assert "edit topology.toml, not this file" in text
+    assert text.count("listen 443 ssl;") == len(FRONTED)
+    assert text.count("http2 on;") == len(FRONTED)
+
+
+def test_nginx_conf_text_deterministic_manifest_order(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    positions = [text.index(f"server_name {name}.sec.internal;") for name in FRONTED]
+    assert positions == sorted(positions)  # manifest order, same as fronted_instances
+
+
+def test_nginx_conf_text_multi_resource_topology_handled(tmp_path):
+    # secproxy fronts the 5 the same way alongside a 2-instance SecLLM pool elsewhere — the
+    # multi-resource inference tier doesn't leak into the nginx config (secllm is never fronted).
     topo = _edge_multi_topo(tmp_path)
-    text = wiring.caddyfile_text(topo)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
     for name in FRONTED:
-        assert f"{name}.sec.internal {{" in text
-        assert f"reverse_proxy 10.0.0.5:{topo.manifest.components[name].port}" in text
+        assert f"server_name {name}.sec.internal;" in text
     assert "secllm" not in text
     assert "secllm-gpu1" not in text and "secllm-gpu2" not in text
 
 
-def test_write_addressing_writes_caddyfile_only_when_secproxy_placed_here(tmp_path):
+def test_write_addressing_writes_nginx_conf_when_secproxy_placed_here(tmp_path):
     topo = _edge_topo(tmp_path)  # secproxy is on 'core' (edge tier)
     out = tmp_path / "out"
     written_core = wiring.write_addressing(topo, out, "core")
-    assert "caddyfile" in written_core
-    caddyfile_path = Path(written_core["caddyfile"])
-    assert caddyfile_path == out / "Caddyfile"
-    assert caddyfile_path.read_text() == wiring.caddyfile_text(topo)
+    assert "nginx_conf" in written_core
+    nginx_path = Path(written_core["nginx_conf"])
+    assert nginx_path == out / "secproxy.nginx.conf"
+    # write_addressing hardcodes the fedora cert dir /etc/secsuite/secproxy
+    assert nginx_path.read_text() == wiring.nginx_conf_text(topo, "/etc/secsuite/secproxy")
+    # the nginx conf is the ONLY reverse-proxy artifact written (secproxy runs nginx on both
+    # targets — there is no separate per-target proxy config)
+    assert set(written_core) == {"zone", "env", "egress", "oidc", "nginx_conf"}
 
     written_gpu = wiring.write_addressing(topo, out, "gpu")  # secllm only, not secproxy
-    assert "caddyfile" not in written_gpu
+    assert "nginx_conf" not in written_gpu
 
 
-def test_write_addressing_no_caddyfile_when_secproxy_not_in_topology(tmp_path):
+def test_write_addressing_no_nginx_conf_when_secproxy_not_in_topology(tmp_path):
     topo = _topo(tmp_path)  # GPU_SPLIT: no edge group at all
     out = tmp_path / "out"
     written = wiring.write_addressing(topo, out, "core")
-    assert "caddyfile" not in written
-    assert not (out / "Caddyfile").exists()
+    assert "nginx_conf" not in written
+    assert not (out / "secproxy.nginx.conf").exists()
 
 
 # ── multi-instance inference: SecRouter's backend pool (SECROUTER_SECLLM_ENDPOINTS) ─────

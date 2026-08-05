@@ -16,7 +16,7 @@ FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder"}
 
 def test_load_shipped_manifest():
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.suite == "1.5.0"
+    assert m.suite == "1.6.0"
     assert ALL <= set(m.components)
     assert m.components["secrecorder"].ref == "v0.8.2"
     assert m.components["secagent"].ref == "v0.2.1"
@@ -70,7 +70,7 @@ def test_tiers_and_ports():
     assert all(c.tier for c in m.components.values())
 
 
-# ── fronted axis: which components secproxy (Caddy) puts behind :443 ────────────────────
+# ── fronted axis: which components secproxy (nginx) puts behind :443 ────────────────────
 def test_fronted_flags_exactly_the_five():
     m = Manifest.load(ROOT / "suite.toml")
     assert {name for name, c in m.components.items() if c.fronted} == FRONTED

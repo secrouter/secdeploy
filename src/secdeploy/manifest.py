@@ -14,7 +14,7 @@ from pathlib import Path
 TARGET_KINDS = {"compose", "systemd-native", "image"}
 COMPONENT_KINDS = {"service", "stack"}
 # Placement tiers — a component belongs to exactly one; the site topology assigns each
-# tier to a compute resource (see topology.py). "edge" (secproxy, the suite's Caddy reverse
+# tier to a compute resource (see topology.py). "edge" (secproxy, the suite's nginx reverse
 # proxy) is the newest — see the "fronted" flag below for how it interacts with the others.
 TIERS = {"identity", "inference", "gateway", "collab", "edge"}
 
@@ -28,7 +28,7 @@ class Component:
     tier: str = ""  # placement tier: identity | inference | gateway | collab | edge
     port: int = 0  # primary inbound port for peer addressing (0 = no inbound listener)
     optional: bool = False  # optional infra — droppable with `--without`
-    fronted: bool = False  # HTTP service secproxy (Caddy) puts behind :443 — see topology.is_fronted
+    fronted: bool = False  # HTTP service secproxy (nginx) puts behind :443 — see topology.is_fronted
     runtime: str = ""
     role: str = ""
 

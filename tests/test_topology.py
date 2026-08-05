@@ -198,7 +198,7 @@ def test_is_fronted_true_for_the_five_when_secproxy_placed(tmp_path):
     topo = _topo(tmp_path, EDGE_SPLIT)
     for name in FRONTED:
         assert topo.is_fronted(name)
-    # never fronted, regardless of placement: the CA must stay a direct trust anchor (Caddy
+    # never fronted, regardless of placement: the CA must stay a direct trust anchor (secproxy
     # bootstraps its certs from it), inference must dial direct, secdns isn't HTTP, and secproxy
     # doesn't front itself
     for name in ("seccert", "secllm", "secdns", "secproxy"):

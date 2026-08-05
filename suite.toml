@@ -13,7 +13,7 @@
 #           set on secllm (inference must dial direct, never through the proxy), secdns (not
 #           HTTP), or secproxy itself.
 
-suite = "1.5.0"
+suite = "1.6.0"
 released = "2026-08-04"
 description = "SecRouter secure-AI suite"
 
@@ -102,12 +102,12 @@ role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
 # ── Edge (optional infra) ──
 [components.secproxy]
 repo = "secrouter/secproxy"
-ref = "v0.1.0"
+ref = "v0.2.0"
 kind = "service"
 tier = "edge"
 port = 443
 optional = true
-runtime = "caddy (upstream image)"
+runtime = "nginx (system package)"
 role = "edge reverse proxy — one HTTPS front door (:443) for the suite's web/API services"
 
 # Deploy targets. `kind` selects the mechanism the CLI uses.

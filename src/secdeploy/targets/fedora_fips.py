@@ -47,10 +47,10 @@ ANCHORS = Path("/etc/pki/ca-trust/source/anchors")
 # that was already being generated (harmlessly unused) rather than appearing from nothing.
 # secproxy (the edge reverse proxy) follows the same topology-only rule as secdns — no
 # --with-* flag, since it's the suite's default front door once a topology exists (see
-# _include below). It's last in this tuple: Caddy's own automatic HTTPS dials SecCert's ACME
-# directory and its Host-routed site blocks depend on secdns for name resolution, so it makes
-# sense for it to come up after its backends here — though the REAL start ordering is enforced
-# by secproxy.service's own After=, not by this tuple (which only orders the install loops below).
+# _include below). It's last in this tuple: nginx's SecCert-issued cert is minted at deploy time
+# and its Host-routed server blocks depend on secdns for name resolution, so it makes sense for
+# it to come up after its backends here — though the REAL start ordering is enforced by
+# secproxy.service's own After=, not by this tuple (which only orders the install loops below).
 SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder", "secproxy")
 SECDNS_ZONE = VAR / "secdns" / "secdns.zone"  # where the secdns service reads its zone
 SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_EGRESS_FILE target
@@ -64,10 +64,16 @@ SECAGENT_ADDRESSING_ENV = ETC / "secagent-addressing.env"
 # pi's system-wide models.json for the secsuite-secagent service user (HOME=VAR/secagent, per
 # its useradd --home-dir below) — the SERVICE (api-key) auth mode; see wiring.secagent_pi_models_json.
 SECAGENT_PI_MODELS = VAR / "secagent" / ".pi" / "agent" / "models.json"
-# Where secproxy reads its Caddyfile — installed from the topology-generated addr_dir/Caddyfile
-# (wiring.write_addressing's "caddyfile" output). No secret in it (unlike SecLLM's admin token),
-# so — like the secdns zone — it's refreshed unconditionally on every deploy, never test -f guarded.
-SECPROXY_CADDYFILE = ETC / "Caddyfile"
+# Where secproxy reads its generated nginx config — installed from addr_dir/secproxy.nginx.conf
+# (wiring.write_addressing's "nginx_conf" output). No secret in it (unlike SecLLM's admin token),
+# so — like the secdns zone — it's refreshed unconditionally on every deploy, never test -f
+# guarded. nginx links the system OpenSSL — FIPS-validated in FIPS mode — which is why the suite
+# standardized on it for the edge TLS termination (macOS runs the same nginx for its eval).
+SECPROXY_NGINX_CONF = ETC / "nginx-secproxy.conf"
+# The SAN cert nginx serves — issued from SecCert by certbot at deploy time (see
+# _issue_secproxy_cert), covering all fronted FQDNs; nginx_conf_text points every :443 server
+# block's ssl_certificate/ssl_certificate_key here. Key lands 0600, owned by secsuite-secproxy.
+SECPROXY_CERT_DIR = ETC / "secproxy"
 
 PLAN = [
     "Preflight: verify the host is in FIPS mode + the OpenSSL FIPS provider is active (fail closed)",
@@ -111,8 +117,69 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     P.log("native build complete (SecRouter dist + SecCert/SecRecorder/secdns/secllm/secagent venvs)")
 
 
+def _issue_secproxy_cert(topology, without: list[str] | None = None) -> list[tuple[list[str], str]]:
+    """Deploy steps that get secproxy ONE SAN certificate from SecCert — covering every fronted,
+    placed FQDN — via ``certbot --standalone``, then install it to the cert dir nginx reads
+    (:data:`SECPROXY_CERT_DIR`). Mirrors ``targets/macos.py``'s ``_issue_secrecorder_cert``'s
+    certbot invocation, but with one ``-d`` per fronted component and a single
+    ``--cert-name secproxy`` (the same fronted set :func:`wiring.nginx_conf_text` emits server
+    blocks for — secproxy/secllm/secdns excluded explicitly, seccert by not being ``fronted``).
+    The fronted set comes from :func:`wiring.fronted_instances` — the SAME source
+    :func:`wiring.nginx_conf_text` builds its :443 server blocks from — so the cert always covers
+    exactly the names nginx serves. Empty when nothing is fronted or SecCert isn't in this
+    topology (nothing to issue, or no CA to issue from).
+
+    BOOTSTRAP ORDERING — flagged, not fully solved this wave (see
+    docs/fedora-fips.md#secproxy-edge-reverse-proxy): certbot's HTTP-01 challenge is answered by
+    this ``--standalone`` responder on **:80**, so it must run BEFORE nginx starts (port 80
+    free — these steps are ordered ahead of ``systemctl enable --now secsuite.target``) and
+    AFTER SecCert is reachable and the fronted FQDNs resolve (via secdns's fronted-axis zone) to
+    this proxy host — i.e. secdns up + this host's resolver pointed at it (``--configure-resolver``
+    or manual ``/etc/resolver``/``/etc/hosts``). On a from-scratch first deploy SecCert may not be
+    configured/running yet, so the issuance is wrapped to be NON-FATAL: it prints guidance instead
+    of aborting the deploy, nginx's own ``nginx -t`` (ExecStartPre) then fails closed until the
+    cert lands, and a redeploy re-issues idempotently. Renewal reuses the running nginx's :80
+    ``/.well-known/acme-challenge`` webroot: ``certbot renew`` (``--webroot`` that dir) +
+    ``nginx -s reload`` — documented, not automated here.
+    """
+    seccert = topology.manifest.select(without).get("seccert")
+    fqdns = [fqdn for fqdn, _addr, _port in wiring.fronted_instances(topology, without)]
+    if not fqdns or seccert is None or not seccert.port:
+        return []
+    acme = f"http://{topology.fqdn('seccert')}:{seccert.port}/acme/directory"
+    cb = VAR / "secproxy" / "certbot"
+    live = cb / "config" / "live" / "secproxy"
+    d_flags = " ".join(f"-d {f}" for f in fqdns)
+    certbot = (
+        f"certbot certonly --standalone --non-interactive --agree-tos "
+        f"--register-unsafely-without-email "
+        f"--config-dir {cb}/config --work-dir {cb}/work --logs-dir {cb}/logs "
+        f"--server {acme} --http-01-port 80 --cert-name secproxy {d_flags}"
+    )
+    guidance = (
+        f"secproxy: certbot SAN-cert issuance did not complete — see {cb}/logs/letsencrypt.log; "
+        f"ensure SecCert is reachable and this host's resolver points at secdns, then redeploy "
+        f"(nginx will not start until {SECPROXY_CERT_DIR}/fullchain.pem exists)"
+    )
+    return [
+        (["bash", "-c", f"{certbot} || echo '{guidance}'"],
+         f"issue secproxy SAN cert from SecCert via certbot --standalone "
+         f"(--cert-name secproxy, {len(fqdns)} -d names: {', '.join(fqdns)})"),
+        (["bash", "-c", f"test -f {live}/fullchain.pem && install -m 644 "
+          f"-o secsuite-secproxy -g secsuite-secproxy "
+          f"{live}/fullchain.pem {SECPROXY_CERT_DIR}/fullchain.pem || true"],
+         f"install secproxy fullchain → {SECPROXY_CERT_DIR}/fullchain.pem"),
+        (["bash", "-c", f"test -f {live}/privkey.pem && install -m 600 "
+          f"-o secsuite-secproxy -g secsuite-secproxy "
+          f"{live}/privkey.pem {SECPROXY_CERT_DIR}/privkey.pem || true"],
+         f"install secproxy privkey (0600, owned by secsuite-secproxy) → "
+         f"{SECPROXY_CERT_DIR}/privkey.pem"),
+    ]
+
+
 def _deploy_steps(manifest: Manifest, work: Path, root: Path,
-                  services: list[str], addr_dir: Path | None = None) -> list[tuple[list[str], str]]:
+                  services: list[str], addr_dir: Path | None = None,
+                  topology=None, without: list[str] | None = None) -> list[tuple[list[str], str]]:
     preflight = root / "deploy/fedora-fips/fips-preflight.sh"
     unit_dir = root / "deploy/fedora-fips/systemd"
     steps: list[tuple[list[str], str]] = [
@@ -135,8 +202,8 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
         steps.append((["bash", "-c", f"rm -rf {OPT}/{svc} && cp -a {work}/{svc} {OPT}/{svc}"],
                       f"install {svc} code → {OPT}/{svc}"))
     # env files from examples (don't clobber) — secdns/secllm instead get a generated env below;
-    # secproxy needs no env file at all — its only configuration is the generated Caddyfile
-    # installed below (Caddy takes no other environment-driven config from secdeploy).
+    # secproxy needs no env file at all — its only configuration is the generated nginx config
+    # installed below (nginx takes no other environment-driven config from secdeploy).
     for svc in services:
         if svc in ("secdns", "secllm", "secproxy"):
             continue
@@ -217,39 +284,47 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              f"{addr_dir}/secagent-pi-models.json {SECAGENT_PI_MODELS} || true"],
             f"install pi models.json (service api-key auth) → {SECAGENT_PI_MODELS}",
         ))
-    # secproxy needs the Caddy RUNTIME itself. Unlike every other entry in SERVICES, there is
-    # no secproxy source checkout to build here — Caddy is an upstream Go binary (see
-    # secproxy's own README/Dockerfile) — so, mirroring the idempotent "ensure user"/"ensure
-    # X" idiom used throughout this function, this step is a no-op if Caddy is already on
-    # PATH (e.g. pre-mirrored into a closed-network host's local dnf repo) and otherwise
-    # installs it from Caddy's OFFICIAL Fedora/RHEL package — the @caddy/caddy COPR
-    # (https://copr.fedorainfracloud.org/coprs/@caddy/caddy/), Caddy's own documented install
-    # path for Fedora/RHEL — pinned to the 2.8 line to match secproxy's Dockerfile (FROM
-    # caddy:2.8-alpine). A native binary + dedicated systemd unit (not a podman container)
-    # was chosen deliberately: secproxy's manifest `kind` is "service" (like secdns), not
-    # "stack" (secsso/secchat's podman/compose path, a wholly separate deploy_stacks()
-    # mechanism — see targets/common.py); podman would also make binding :443/:80 with
-    # AmbientCapabilities=CAP_NET_BIND_SERVICE — the exact mechanism secdns uses for :53 —
-    # far less direct across a container boundary. See
-    # docs/fedora-fips.md#secproxy-edge-reverse-proxy for the full rationale.
+    # secproxy needs the nginx RUNTIME + certbot. Unlike every other entry in SERVICES, there is
+    # no secproxy source checkout to build here — nginx is an upstream package (see secproxy's
+    # own README). nginx is the secproxy runtime specifically FOR FIPS: it links the system
+    # OpenSSL, which is FIPS-validated in FIPS mode (the reason the suite standardized on it for
+    # edge TLS termination; macOS runs the same nginx for a non-FIPS eval — see targets/macos.py).
+    # certbot is the ACME client that mints secproxy's SAN cert from SecCert at deploy time (see
+    # _issue_secproxy_cert below) — nginx runs no ACME client of its own. A native package under a
+    # dedicated hardened systemd unit (not a podman container) was chosen deliberately, same
+    # reasoning as before: secproxy's manifest `kind` is "service" (like secdns), not "stack"
+    # (secsso/secchat's podman/compose path — a wholly separate deploy_stacks() mechanism, see
+    # targets/common.py); podman would also make binding :443/:80 with
+    # AmbientCapabilities=CAP_NET_BIND_SERVICE — the exact mechanism secdns uses for :53 — far
+    # less direct across a container boundary. See docs/fedora-fips.md#secproxy-edge-reverse-proxy.
     if "secproxy" in services:
         steps.append((
-            ["bash", "-c", "command -v caddy >/dev/null || "
-             "(dnf install -y 'dnf-command(copr)' && dnf copr enable -y @caddy/caddy && "
-             "dnf install -y 'caddy-2.8*')"],
-            "ensure Caddy runtime is installed (pinned to the 2.8 line, via the @caddy/caddy COPR)",
+            ["dnf", "install", "-y", "nginx", "certbot"],
+            "install the secproxy runtime (nginx — system-OpenSSL TLS, FIPS-validated in FIPS "
+            "mode) + certbot",
         ))
-    # secproxy — install the topology-generated Caddyfile (the suite's edge reverse-proxy
-    # config; see wiring.caddyfile_text/write_addressing). Unconditional refresh, exactly like
-    # the secdns zone above — it carries no secret (Caddy's own ACME account/cert material
-    # lives under its state dir, never in this file), so a redeploy after topology.toml changes
-    # (a fronted service added/moved) takes effect immediately.
+    # secproxy — the cert dir nginx reads, the ACME-challenge webroot the :80 server serves, and
+    # nginx's writable runtime dir (pid/logs/temp under ProtectSystem=strict); then the generated
+    # nginx config, and the SecCert-issued SAN cert (certbot --standalone, before nginx starts).
+    # The nginx config carries no secret (the key lands under the cert dir, never in this file),
+    # so — exactly like the secdns zone — it's refreshed unconditionally, so a redeploy after a
+    # topology.toml change (a fronted service added/moved) takes effect immediately.
     if "secproxy" in services and addr_dir is not None:
+        for sub, desc in ((SECPROXY_CERT_DIR, "cert dir"),
+                          (VAR / "secproxy" / "acme", "ACME-challenge webroot"),
+                          (VAR / "secproxy" / "tmp", "nginx temp/runtime dir")):
+            steps.append((
+                ["install", "-d", "-m", "750", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
+                 str(sub)],
+                f"secproxy {desc} {sub}",
+            ))
         steps.append((
             ["install", "-m", "644", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
-             str(addr_dir / "Caddyfile"), str(SECPROXY_CADDYFILE)],
-            f"install generated Caddyfile → {SECPROXY_CADDYFILE}",
+             str(addr_dir / "secproxy.nginx.conf"), str(SECPROXY_NGINX_CONF)],
+            f"install generated nginx config → {SECPROXY_NGINX_CONF}",
         ))
+        if topology is not None:
+            steps += _issue_secproxy_cert(topology, without)
     # units — only the selected services, plus the suite target
     for svc in services:
         steps.append((["install", "-m", "644", str(unit_dir / f"{svc}.service"), f"{UNITS}/"],
@@ -329,7 +404,21 @@ def deploy(
     trust_anchor_added = "seccert" in services
     secagent_enabled = "secagent" in services
     addr_dir = (Path(out) / "addressing") if (topology is not None and out is not None) else None
-    steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir)
+    steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir,
+                          topology=topology, without=without)
+    # secproxy's SecCert-issued SAN cert is minted at deploy time by certbot --standalone (see
+    # _issue_secproxy_cert) — a bootstrap-ordering assumption worth surfacing, not just burying in
+    # a step. HTTP-01 needs :80 free (nginx not started yet — the cert step is ordered ahead of
+    # `enable --now secsuite.target`) AND SecCert reachable + this host's resolver pointed at
+    # secdns so the fronted FQDNs resolve here. On a fresh first deploy where SecCert isn't
+    # configured yet, issuance is non-fatal and nginx fails closed until a redeploy re-issues.
+    secproxy_cert_note = (
+        "secproxy TLS: certbot mints one SAN cert from SecCert for the fronted FQDNs BEFORE nginx "
+        "starts (needs :80 free + SecCert reachable + this host's resolver → secdns; use "
+        "--configure-resolver). If SecCert isn't up yet the step is non-fatal — nginx stays down "
+        "until you redeploy. Renew with `certbot renew` (--webroot the :80 acme dir) + "
+        "`nginx -s reload` — see docs/fedora-fips.md#secproxy-edge-reverse-proxy."
+    )
 
     # SecAgent's Mattermost bot token is minted on the SecChat host, not this one, and
     # `mmctl token generate` produces a fresh, non-idempotent token with no machine-readable
@@ -379,6 +468,8 @@ def deploy(
             common.deploy_stacks(work, stacks, dry_run=True)
         if secagent_enabled and "secchat" in stacks:
             print(f"  · {secagent_bot_note}")
+        if "secproxy" in services:
+            print(f"  · {secproxy_cert_note}")
         if secagent_enabled and oidc_preview:
             oidc_path = (addr_dir / "secrouter-oidc.json") if addr_dir else None
             print(f"  · SecRouter OIDC config fragment (merge into security.oidc) would be "
@@ -440,6 +531,8 @@ def deploy(
         common.deploy_stacks(work, stacks, dry_run=False)
     if secagent_enabled and "secchat" in stacks:
         P.warn(secagent_bot_note)
+    if "secproxy" in services:
+        P.warn(secproxy_cert_note)
     if out is not None:
         # CMMC audit evidence: what landed on this resource + which security-relevant
         # authorizations (trust anchor / resolver / SecLLM inference auth) this run made —

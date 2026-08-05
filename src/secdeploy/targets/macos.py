@@ -93,24 +93,23 @@ def _ensure_certbot() -> None:
         P.warn("certbot not found and brew is unavailable — install certbot manually for --tls")
 
 
-def _ensure_caddy() -> None:
-    """secproxy runs natively on macOS (see module docstring) — it needs the `caddy` binary
-    on PATH. Same idiom as _ensure_certbot() above, and likewise only invoked when secproxy is
-    actually being stood up (never during --dry-run — see its native-run note in deploy()).
-    Homebrew's caddy formula doesn't keep older major.minor releases installable side by side
-    the way fedora-fips's @caddy/caddy COPR does (see targets/fedora_fips.py), so this can't
-    pin the 2.8 line the way that one does — it installs whatever `brew install caddy`
-    currently resolves to; see docs/macos.md for a pinned-version alternative."""
-    if P.which("caddy"):
+def _ensure_nginx() -> None:
+    """secproxy runs natively on macOS (see module docstring) — it needs the `nginx` binary on
+    PATH. Same idiom as _ensure_certbot() above, and likewise only invoked when secproxy is
+    actually being stood up (never during --dry-run — see its native-run note in deploy()). nginx
+    is the reverse-proxy runtime on both targets now — fedora-fips uses the system OpenSSL
+    (FIPS-validated in FIPS mode); macOS is a non-FIPS eval, so `brew install nginx` (whatever
+    homebrew-core currently resolves to) is fine here."""
+    if P.which("nginx"):
         return
     if P.which("brew"):
-        P.warn("caddy not found — installing via brew (required for secproxy)")
-        P.run(["brew", "install", "caddy"], check=False)
-        if not P.which("caddy"):
-            P.warn("caddy install did not complete — cannot run secproxy natively")
+        P.warn("nginx not found — installing via brew (required for secproxy)")
+        P.run(["brew", "install", "nginx"], check=False)
+        if not P.which("nginx"):
+            P.warn("nginx install did not complete — cannot run secproxy natively")
     else:
-        P.warn("caddy not found and brew is unavailable — install caddy manually for secproxy "
-               "(https://caddyserver.com/docs/install)")
+        P.warn("nginx not found and brew is unavailable — install nginx manually for secproxy "
+               "(https://nginx.org/en/docs/install.html)")
 
 
 def _configure_hosts(assume_yes: bool = False) -> None:
@@ -267,6 +266,57 @@ def _issue_secrecorder_cert(root: Path) -> tuple[Path, Path] | None:
     return None
 
 
+def _issue_secproxy_cert(
+    root: Path, topology, without: list[str] | None = None
+) -> tuple[Path, Path] | None:
+    """Get secproxy ONE SAN ACME cert from SecCert via certbot standalone — covering every
+    fronted FQDN (:func:`wiring.fronted_instances`, the SAME set the generated nginx conf serves)
+    under a single ``--cert-name secproxy``. Mirrors :func:`_issue_secrecorder_cert`'s invocation
+    (HTTP-01 crosses the container/host boundary through ``host.docker.internal`` on
+    ``HTTP01_PORT`` — see the module docstring and ``compose.yaml``'s ``SECCERT_HTTP01_PORT``),
+    just with N ``-d`` flags instead of one. Idempotent — certbot no-ops if the cert at
+    ``out/certbot`` isn't near expiry. Empty when nothing is fronted.
+
+    CROSS-BOUNDARY ACME CAVEAT (macOS eval only): SecCert (in its container) validates HTTP-01 by
+    connecting to ``http://<fronted-fqdn>:47080``, so each fronted name must resolve INSIDE the
+    container to this host — i.e. the container's resolver pointed at secdns. On a plain local
+    eval that isn't set up, so issuance may not complete; a self-signed cert (or nginx's own
+    ``ssl``) is a fine local fallback — see docs/macos.md. fedora-fips has no such boundary
+    (native certbot on the host — see ``targets/fedora_fips._issue_secproxy_cert``).
+    """
+    _ensure_certbot()
+    if not P.which("certbot"):
+        return None
+    fqdns = [fqdn for fqdn, _addr, _port in wiring.fronted_instances(topology, without)]
+    if not fqdns:
+        return None
+    cb_root = root / "out/certbot"
+    for d in ("config", "work", "logs"):
+        (cb_root / d).mkdir(parents=True, exist_ok=True)
+    d_flags: list[str] = []
+    for f in fqdns:
+        d_flags += ["-d", f]
+    P.run([
+        "certbot", "certonly", "--standalone",
+        "--non-interactive", "--agree-tos", "--register-unsafely-without-email",
+        "--config-dir", str(cb_root / "config"),
+        "--work-dir", str(cb_root / "work"),
+        "--logs-dir", str(cb_root / "logs"),
+        "--server", "http://localhost:47001/acme/directory",
+        "--http-01-port", str(HTTP01_PORT),
+        "--cert-name", "secproxy",
+        *d_flags,
+    ], check=False)
+    live = cb_root / "config/live/secproxy"
+    cert, key = live / "fullchain.pem", live / "privkey.pem"
+    if cert.exists() and key.exists():
+        return cert, key
+    P.warn(f"certbot did not produce a secproxy certificate — check {cb_root}/logs/letsencrypt.log "
+           "(macOS eval: the fronted names must resolve to this host inside the SecCert "
+           "container — see docs/macos.md; a self-signed cert is a fine local fallback)")
+    return None
+
+
 def build(manifest: Manifest, work: Path, out: Path, root: Path,
           without: list[str] | None = None) -> None:
     from .common import require_checkouts
@@ -415,24 +465,32 @@ def deploy(
                    f"addressing env: {chat_cmd}")
 
     # secproxy runs natively on macOS too — the key simplification for this target (see module
-    # docstring): Caddy binds directly to the host, so it reaches every OTHER backend the same
+    # docstring): nginx binds directly to the host, so it reaches every OTHER backend the same
     # way any host process does — containers publish their ports to the host (compose.yaml's
     # `ports:`), and every native service here (secdns/secllm/secagent above) already listens on
-    # the host — sidestepping the container/host boundary the --tls certbot flow has to cross
-    # via host.docker.internal. Topology-gated only, no --with-* flag, exactly like secdns
-    # above: secproxy is the suite's default front door the moment a topology places the edge
-    # tier here. The Caddyfile it points at was already written earlier in this function by
-    # write_addressing() (whenever a topology is active and this isn't a dry-run). Caddy binds
-    # :443/:80, so — like secdns's :53 — starting it needs sudo.
+    # the host. Topology-gated only, no --with-* flag, exactly like secdns above: secproxy is the
+    # suite's default front door the moment a topology places the edge tier here. nginx is the
+    # reverse-proxy runtime on both targets now — fedora-fips for FIPS (system OpenSSL), macOS as
+    # a non-FIPS eval. The nginx conf it points at was already written earlier in this function by
+    # write_addressing() (whenever a topology is active and this isn't a dry-run); the SAN cert is
+    # issued from SecCert via certbot (best-effort — see _issue_secproxy_cert's eval caveat). nginx
+    # binds :443/:80, so — like secdns's :53 — starting it needs sudo.
     if topology is not None and _here("secproxy"):
-        caddyfile = (Path(out) / "addressing/Caddyfile") if out else Path("out/addressing/Caddyfile")
-        secproxy_cmd = f"sudo caddy run --config {caddyfile}"
+        nginx_conf = (Path(out) / "addressing/secproxy.nginx.conf") if out \
+            else Path("out/addressing/secproxy.nginx.conf")
+        secproxy_cmd = f"sudo nginx -c {nginx_conf} -g 'daemon off;'"
         if dry_run:
-            print(f"  · secproxy: run natively on :443/:80 → {secproxy_cmd}")
+            print(f"  · secproxy: issue a SecCert SAN cert (certbot) for the fronted FQDNs, then "
+                  f"run nginx natively on :443/:80 → {secproxy_cmd}")
         else:
-            _ensure_caddy()
-            P.warn(f"secproxy (Caddy) runs natively on macOS — start it (needs :443/:80) "
-                   f"with: {secproxy_cmd}")
+            _ensure_nginx()
+            cert = _issue_secproxy_cert(root, topology, without)
+            if cert:
+                P.log(f"secproxy SAN cert ready (SecCert-issued): {cert[0]}")
+            P.warn(f"secproxy (nginx) runs natively on macOS — start it (needs :443/:80) with: "
+                   f"{secproxy_cmd}. The generated conf uses production paths (cert dir "
+                   f"/etc/secsuite/secproxy, state /var/lib/secsuite/secproxy) — see docs/macos.md "
+                   f"for the local-eval setup (cert placement + self-signed fallback).")
 
     # Optional: point this host's resolver at secdns for the internal domain.
     resolver_configured = False
