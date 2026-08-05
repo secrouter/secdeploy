@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import secrets
 import shutil
 from pathlib import Path
 from typing import NamedTuple
@@ -10,22 +12,61 @@ from typing import NamedTuple
 from .. import process as P
 from ..manifest import Manifest
 
+# A ``KEY=`` line whose value is empty (ignoring trailing whitespace) — the convention every
+# stack ``.env.example`` uses to mark a REQUIRED secret the operator must fill (see
+# ``secsso/.env.example``'s ``PG_PASS=``/``AUTHENTIK_SECRET_KEY=`` and ``secchat``'s
+# ``POSTGRES_PASSWORD=``). :func:`_seed_env_secrets` fills exactly these; a key with any default
+# value (``PG_USER=authentik``, ``MM_GITLAB_ENABLE=false``) is config, not a secret, and is left
+# alone.
+_ENV_BLANK_SECRET_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=[ \t]*$")
+
+
+def _seed_env_secrets(text: str) -> tuple[str, list[str]]:
+    """Fill every blank-valued ``KEY=`` line (see :data:`_ENV_BLANK_SECRET_RE`) with a strong
+    random token, returning ``(new_text, generated_keys)``.
+
+    Idempotent and non-destructive: a key that already has a value — an operator-set one, or a
+    value THIS function generated on a prior deploy — is never touched, so re-running a deploy
+    reads the same file back unchanged and a live stack's DB password/secret-key is never
+    rotated out from under it. Comments and every other line pass through verbatim. Tokens use
+    :func:`secrets.token_urlsafe` (``[A-Za-z0-9_-]`` only — no ``$`` or ``;`` that would break
+    docker-compose ``.env`` interpolation, unlike an operator-typed value might).
+    """
+    lines = text.splitlines()
+    generated: list[str] = []
+    for i, line in enumerate(lines):
+        m = _ENV_BLANK_SECRET_RE.match(line)
+        if m:
+            lines[i] = f"{m.group(1)}={secrets.token_urlsafe(36)}"
+            generated.append(m.group(1))
+    new_text = "\n".join(lines)
+    if text.endswith("\n") or not text:
+        new_text += "\n"
+    return new_text, generated
+
 
 def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
     """Bring up ``stack`` components via each checkout's ``bootstrap/<name>.sh up``.
 
     Stack components (SecSSO/SecChat) carry their own Compose topology + a bootstrap script.
-    Their ``.env`` holds operator secrets, so the first deploy writes it from ``.env.example``
-    and stops — you set the secrets, then re-run (or run the bootstrap yourself). Once the
-    ``.env`` exists we invoke the bootstrap, which does the compose up + wiring.
+    Their ``.env`` holds secrets (Postgres passwords, Authentik's secret key/bootstrap token).
+    The first deploy writes ``.env`` from ``.env.example`` and then **auto-generates a strong
+    random value for every required secret left blank** (the ``KEY=`` markers in the example —
+    see :func:`_seed_env_secrets`), so the bootstrap's ``compose up`` doesn't fail on a
+    ``required variable … is missing`` interpolation error. The filled ``.env`` is written
+    ``0600`` and is gitignored; generation is idempotent (a value already set — by the operator
+    or a prior deploy — is kept), so redeploys are stable and never rotate a live stack's
+    password. An operator who wants specific values (a known Authentik admin password, a
+    SecAgent client secret shared with SecAgent's own env) can still pre-fill ``.env`` before
+    deploying; only blank keys are generated.
     """
     for name in stacks:
         proj = work / name
         boot = proj / "bootstrap" / f"{name}.sh"
         env, example = proj / ".env", proj / ".env.example"
         if dry_run:
-            print(f"  · stack {name}: ensure {proj}/.env (from .env.example if absent), "
-                  f"then bootstrap/{name}.sh up")
+            print(f"  · stack {name}: ensure {proj}/.env (from .env.example; auto-generate a "
+                  f"strong secret for each blank required key), then bootstrap/{name}.sh up")
             continue
         if not boot.exists():
             P.warn(f"stack {name}: no bootstrap/{name}.sh in {proj} — skipping")
@@ -33,12 +74,19 @@ def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
         if not env.exists():
             if example.exists():
                 shutil.copy(example, env)
-                P.warn(f"stack {name}: wrote {env} from .env.example — set its secrets, "
-                       f"then bring it up:  bash {boot} up")
+                env.chmod(0o600)
+                P.log(f"stack {name}: created {env} from .env.example")
             else:
                 P.warn(f"stack {name}: no .env / .env.example in {proj} — configure it, "
                        f"then run:  bash {boot} up")
-            continue
+                continue
+        new_text, generated = _seed_env_secrets(env.read_text())
+        if generated:
+            env.write_text(new_text)
+            env.chmod(0o600)
+            P.log(f"stack {name}: generated {len(generated)} secret(s) in {env} "
+                  f"({', '.join(generated)}) — stored 0600, gitignored, kept across redeploys "
+                  f"(read them back from {env} if you need e.g. the Authentik admin credentials)")
         P.log(f"stack {name}: bringing up via bootstrap/{name}.sh up")
         P.run(["bash", str(boot), "up"], check=False)
 

@@ -9,10 +9,13 @@ common shapes (single host, GPU split); ``custom`` lets you define resources and
 tier yourself. Every per-resource deploy question is asked ONLY when it actually applies to
 that resource (what's placed there / its target) — see :func:`_ask_deploy_options`.
 
-Optionally (asked once, after ``secsite.toml`` is written) also seeds operator-typed secrets —
-SecCert's admin token/CA passphrase, SecAgent's SecSSO client secret/Mattermost bot token,
-SecRecorder's Hugging Face token, SecRouter's ``FREEROUTER_CONFIG`` path — into the gitignored
-``*.env`` files. Secrets NEVER go in ``secsite.toml``: see :func:`_maybe_seed_secrets`.
+Optionally (asked once, after ``secsite.toml`` is written) also seeds secrets into the
+gitignored ``*.env`` files: SecCert's admin token/CA passphrase are **auto-generated** by
+default (self-contained internal secrets — a machine should mint them, not the operator);
+external tokens a machine can't mint (SecAgent's Mattermost bot token, SecRecorder's Hugging
+Face token) and the shared SecAgent↔SecSSO client secret are asked; SecRouter's
+``FREEROUTER_CONFIG`` is a path, not a secret. Secrets NEVER go in ``secsite.toml``: see
+:func:`_maybe_seed_secrets`.
 
 Pure standard library (``getpass`` for the secret prompts, so nothing echoes to the terminal);
 every I/O seam (input/output/getpass) is injectable so the whole flow is unit-testable.
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import getpass
 import re
+import secrets
 from pathlib import Path
 from typing import Callable
 
@@ -350,6 +354,22 @@ def _maybe_seed_secrets(
         out("  skipped — no *.env file touched.")
         return
 
+    # Auto-generate the machine-generatable INTERNAL secrets (SecCert's CA passphrase + admin
+    # token — self-contained to SecCert, no cross-component matching) by default, so the operator
+    # never has to invent one. EXTERNAL tokens a machine can't mint (a Hugging Face token, a
+    # Mattermost bot token) and the shared SecAgent↔SecSSO client secret are always asked. The
+    # suite's other internal secrets are already auto-generated elsewhere: the SecLLM/SecRouter
+    # shared tokens + the SecAgent webhook secret in wiring.py, and every stack's Postgres
+    # password / Authentik secret key in targets/common.deploy_stacks.
+    autogen = _ask_yn(
+        input_fn, "\nAuto-generate strong random values for the internal secrets (SecCert CA "
+        "passphrase + admin token)? (external tokens — Hugging Face, Mattermost — are still "
+        "asked)", True,
+    )
+
+    def _internal_secret(prompt: str) -> str:
+        return secrets.token_urlsafe(36) if autogen else getpass_fn(prompt)
+
     groups = site.topology.groups
     without = site.without
     # (component, resource, {ENV_KEY: value}) — the resource decides which target's env file(s)
@@ -359,10 +379,12 @@ def _maybe_seed_secrets(
 
     if groups.get("identity") and "seccert" not in without:
         out("\nSecCert (the internal CA):")
+        if autogen:
+            out("  auto-generating SECCERT_CA_PASSPHRASE + SECCERT_ADMIN_TOKEN (strong random)")
         items.append(("seccert", groups["identity"][0], {
-            "SECCERT_CA_PASSPHRASE": getpass_fn(
+            "SECCERT_CA_PASSPHRASE": _internal_secret(
                 "  SECCERT_CA_PASSPHRASE — encrypts the CA key at rest (blank = skip): "),
-            "SECCERT_ADMIN_TOKEN": getpass_fn("  SECCERT_ADMIN_TOKEN (blank = skip): "),
+            "SECCERT_ADMIN_TOKEN": _internal_secret("  SECCERT_ADMIN_TOKEN (blank = skip): "),
         }))
 
     if groups.get("collab"):

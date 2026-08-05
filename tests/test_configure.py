@@ -235,6 +235,7 @@ def test_secret_seeding_writes_fedora_env_files_never_in_secsite_toml(tmp_path):
         "",                    # [deploy].without: drop none
         "", "y", "",           # with_inference, with_agent (-> True), configure_resolver
         "y",                   # set up operator secrets now? yes
+        "n",                   # auto-generate internal secrets? no — type them (below)
         "sup3r-ca-pass", "sup3r-admin-tok",    # SecCert
         "sso-secret-xyz", "mm-bot-tok-abc",    # SecAgent
         "hf_test_token",                        # SecRecorder
@@ -281,6 +282,7 @@ def test_secret_seeding_macos_shares_one_secrets_env_file(tmp_path):
         "", "y", "",                 # with_inference, with_agent (-> True), configure_resolver
         "", "", "", "",              # tls, configure_hosts, trust_ca, model_dir
         "y",                         # set up operator secrets now? yes
+        "n",                         # auto-generate internal secrets? no — type them (below)
         "ca-pass-mac", "admin-tok-mac",
         "sso-secret-mac", "bot-tok-mac",
         "hf-tok-mac",
@@ -305,6 +307,52 @@ def test_secret_seeding_macos_shares_one_secrets_env_file(tmp_path):
     assert "ca-pass-mac" not in dest.read_text()  # never in secsite.toml either
     # no per-component fedora-fips-style file for a macOS-only site
     assert not any((root / "deploy/fedora-fips").glob("*.env"))
+
+
+def _env_val(text: str, key: str) -> str:
+    line = next(ln for ln in text.splitlines() if ln.startswith(f"{key}="))
+    return line.split("=", 1)[1]
+
+
+def test_secret_seeding_autogenerates_internal_seccert_secrets(tmp_path):
+    """Auto-generation (the default) mints strong SecCert secrets without asking — the operator
+    never invents a CA passphrase — while external tokens (Hugging Face, Mattermost bot) and the
+    shared SecAgent client secret are still asked. See _maybe_seed_secrets."""
+    root = tmp_path / "checkout"
+    _stage_env_examples(root)
+    dest = tmp_path / "secsite.toml"
+    answers = [
+        "sec.internal", "1.1.1.1", "single-host",
+        "local", "fedora-fips", "127.0.0.1", "", "",
+        "",                    # without
+        "", "y", "",           # with_inference, with_agent (-> True), configure_resolver
+        "y",                   # set up operator secrets now? yes
+        "y",                   # auto-generate internal secrets? yes (SecCert NOT asked below)
+        "sso-secret-auto", "mm-bot-auto",   # SecAgent — still asked (shared/external)
+        "hf-auto",                           # SecRecorder HF_TOKEN — still asked (external)
+        "",                                  # SecRouter FREEROUTER_CONFIG — blank
+    ]
+    driver = _driver(answers)
+    result = configure.run(
+        _manifest(), dest=dest, root=root, input_fn=driver, out=lambda *_: None, getpass_fn=driver,
+    )
+    assert result == dest
+
+    seccert_env = (root / "deploy/fedora-fips/seccert.env").read_text()
+    passphrase = _env_val(seccert_env, "SECCERT_CA_PASSPHRASE")
+    admin = _env_val(seccert_env, "SECCERT_ADMIN_TOKEN")
+    # auto-generated: present, strong, distinct, and NOT any operator-typed answer
+    assert len(passphrase) >= 32 and len(admin) >= 32
+    assert passphrase != admin
+    for typed in ("sso-secret-auto", "mm-bot-auto", "hf-auto"):
+        assert typed not in (passphrase, admin)
+    # the still-asked external/shared answers landed where they belong
+    assert "SECAGENT_CLIENT_SECRET=sso-secret-auto" in (
+        root / "deploy/fedora-fips/secagent.env").read_text()
+    assert "HF_TOKEN=hf-auto" in (root / "deploy/fedora-fips/secrecorder.env").read_text()
+    # no secret — generated or typed — is ever in secsite.toml
+    assert "sso-secret-auto" not in dest.read_text()
+    assert passphrase not in dest.read_text()
 
 
 def test_declining_secrets_writes_no_env_file(tmp_path):
@@ -338,6 +386,7 @@ def test_secret_seeding_blank_values_writes_nothing(tmp_path):
         "",              # without
         "", "", "",      # with_inference, with_agent, configure_resolver
         "y",             # set up operator secrets now? yes
+        "n",             # auto-generate internal secrets? no — leave blank (below)
         "", "",          # SecCert — both blank
         "",              # SecRecorder HF_TOKEN — blank
         "",              # SecRouter FREEROUTER_CONFIG — blank
