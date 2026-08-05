@@ -1,19 +1,30 @@
 """macOS (Apple Silicon) target.
 
-SecCert + SecRouter run as containers via Docker Compose (Colima). SecRecorder runs
-**natively** through ``uv`` — its MLX/Metal backend can't run in Docker on macOS. SecCert
-comes up first as the internal CA; its root is exported so hosts/clients can trust the suite.
+SecCert + SecRouter run as containers via Docker Compose (Colima). The native services —
+SecDNS (:53), SecLLM, SecAgent, SecRecorder (MLX/Metal — can't run in Docker on macOS) and
+secproxy's nginx (:443/:80) — run **natively**, installed and supervised as **launchd
+daemons** (see :mod:`secdeploy.launchd`) so a deploy actually starts and keeps them running
+rather than printing a run command for the operator to paste. SecCert comes up first as the
+internal CA; its root is exported so hosts/clients can trust the suite. SecDNS is installed
+before the resolver is pointed at it (``--configure-resolver``), so ``<domain>`` names resolve
+immediately instead of hitting a not-yet-started :53. ``--no-native-services`` falls back to
+printing the run commands (foreground, DIY).
 """
 
 from __future__ import annotations
 
+import getpass
+import os
+import pwd
 import re
+import shutil
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import common
 from .. import audit
+from .. import launchd
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
@@ -27,14 +38,18 @@ PLAN = [
     "Export the SecCert root to ./out (trust anchor for the enclave)",
     "Bring up SecRouter via Compose",
     "Ensure ffmpeg is installed (SecRecorder transcoding — installs via brew if missing)",
-    "(--tls) Issue SecRecorder a SecCert cert via certbot — HTTP-01 through host.docker.internal",
     "(--configure-hosts) Map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo, asks first)",
     "(--trust-ca) Trust the SecCert root in the System keychain (sudo, asks first)",
-    "Layer HF_TOKEN (deploy/macos/secrets.env or --hf-token) and --model-dir (air-gapped "
-    "local models) onto SecRecorder's printed run command, if set",
-    "Prepare SecRecorder to run natively via uv (MLX/Metal — not containerized on macOS)",
-    "(--with-inference) Print a native SecLLM run command (no GPU passthrough into Colima — "
-    "GPU-free eval via SECLLM_BACKEND=mock)",
+    "Install SecDNS as a launchd daemon (:53, root) — BEFORE the resolver step",
+    "(--configure-resolver) Point /etc/resolver/<domain> at the now-running SecDNS (sudo)",
+    "(--with-inference) Install SecLLM as a launchd daemon (GPU-free eval via SECLLM_BACKEND=mock)",
+    "(--with-agent) Install SecAgent's chat bridge as a launchd daemon (env layered from the "
+    "generated addressing env + deploy/macos/secrets.env)",
+    "Install SecRecorder as a launchd daemon (native MLX/Metal; --tls issues a SecCert cert via "
+    "certbot; HF_TOKEN/--model-dir layered in)",
+    "Install secproxy (nginx :443/:80, root) as a launchd daemon — macOS-local conf + a "
+    "SecCert-issued or self-signed cert",
+    "(--no-native-services) Print the run commands instead of installing the launchd daemons",
 ]
 
 IMAGES = ("seccert", "secrouter")  # secrecorder is native on macOS
@@ -343,19 +358,126 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     for name in images:
         P.run(["docker", "build", "-t", _image(manifest, name), str(work / name)])
     _ensure_ffmpeg()
-    # SecRecorder: create its native venv so `uv run` is instant at deploy time.
-    rec = work / "secrecorder"
-    if P.which("uv") and (rec / "pyproject.toml").exists():
-        P.run(["uv", "sync", "--project", str(rec)], check=False)
-    else:
-        P.warn("uv not found or secrecorder has no pyproject — skipping native SecRecorder prep")
-    # SecLLM (--with-inference, native — no GPU passthrough into Colima): same treatment, so
-    # its printed run command is instant too. Silent skip if absent — it's opt-in, so not
-    # every macOS build needs it.
-    sllm = work / "secllm"
-    if P.which("uv") and (sllm / "pyproject.toml").exists():
-        P.run(["uv", "sync", "--project", str(sllm)], check=False)
+    # Native-service venvs — everything that runs via `uv run` under launchd (see deploy()):
+    # SecRecorder (MLX/Metal), SecLLM (opt-in inference), secdns, secagent. Pre-syncing here means
+    # the first service start is instant AND the deploy's `uv run --no-sync` never tries to build a
+    # venv at start time — critical for secdns, which launchd runs as ROOT and must never sync into
+    # the user-owned checkout. Respects --without; a component with no checkout/pyproject is
+    # skipped (secllm/secagent aren't in every build).
+    without = without or []
+    for name in ("secrecorder", "secllm", "secdns", "secagent"):
+        if name in without:
+            continue
+        proj = work / name
+        if P.which("uv") and (proj / "pyproject.toml").exists():
+            P.run(["uv", "sync", "--project", str(proj)], check=False)
+        elif not P.which("uv"):
+            P.warn(f"uv not found — build {name}'s venv on the Mac before deploy "
+                   f"(uv sync --project work/{name})")
     P.log(f"built images: {', '.join(_image(manifest, n) for n in images)}")
+
+
+# ── native-service (launchd) helpers ─────────────────────────────────────────────────────────
+# The macOS runtime for the suite's native services: rather than PRINT a run command and leave the
+# operator to start (and re-start) each one by hand — the gap that left SecDNS down and `.internal`
+# unresolvable after a deploy — deploy() installs each as a launchd daemon via these helpers (see
+# launchd.py). The UNPRIVILEGED services run as the invoking user; SecDNS (:53) and secproxy
+# (:443/:80) run as root.
+
+
+def _native_user() -> tuple[str, str]:
+    """The user (and home dir) the UNPRIVILEGED launchd services run as — the real invoking user
+    even if the deploy was started under sudo (``SUDO_USER``), so ``uv``/its project venv/``$HOME``
+    resolve exactly as they did when ``build`` created them. The privileged services (SecDNS :53,
+    secproxy :443/:80) ignore this and run as root (``LaunchdService.user is None``)."""
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        home = os.path.expanduser("~")
+    return user, home
+
+
+def _base_env(user_home: str | None = None) -> dict[str, str]:
+    """The env every launchd service needs: the invoking user's ``PATH`` (so ``uv``/homebrew are
+    found — launchd's own default is a bare ``/usr/bin:/bin:/usr/sbin:/sbin``) plus, for a user
+    service, ``HOME``. A launchd job otherwise starts with almost no environment."""
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")}
+    if user_home:
+        env["HOME"] = user_home
+    return env
+
+
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a generated/seeded ``KEY=VALUE`` env file into a dict (comments/blanks skipped) — the
+    launchd equivalent of systemd's ``EnvironmentFile=`` layering on fedora-fips, so SecAgent gets
+    its addressing wiring + operator secrets as real process env instead of the old 'source it
+    yourself' note (closing that documented macOS gap)."""
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip()
+    return env
+
+
+def _install_or_note(
+    svc: launchd.LaunchdService, staging_dir: Path, *,
+    native_services: bool, dry_run: bool, fallback_note: str,
+) -> None:
+    """Install ``svc`` as a launchd daemon — stage its plist under ``out/launchd``, then the single
+    ``sudo`` bootstrap (:func:`launchd.install_command`) — or, on ``--dry-run`` / with
+    ``--no-native-services``, just print/annotate what it would run. ``fallback_note`` is the exact
+    'start it yourself' command, shown on the opt-out path so the operator always has the manual
+    invocation behind every managed service."""
+    if dry_run:
+        print(f"  · launchd {svc.label} (as {svc.user or 'root'}): {' '.join(svc.program_args)}")
+        return
+    if not native_services:
+        P.warn(f"--no-native-services: not installing {svc.label} — start it yourself: {fallback_note}")
+        return
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    svc.log_dir.mkdir(parents=True, exist_ok=True)
+    launchd.staging_path(svc, staging_dir).write_text(launchd.plist_text(svc))
+    cmd, desc = launchd.install_command(svc, staging_dir)
+    P.log(desc)
+    P.run(cmd, check=False)
+    P.log(f"{svc.label}: launchd-managed (restarts on crash/boot); logs → {svc.stdout_path}")
+
+
+def _secproxy_cert_macos(root: Path, cert_dir: Path, topology, without: list[str] | None) -> bool:
+    """Put a usable cert at ``cert_dir/{fullchain,privkey}.pem`` for macOS secproxy, returning
+    whether one is in place. Tries the SecCert SAN cert first (certbot — best-effort; the macOS
+    container/host DNS boundary usually blocks its HTTP-01, see :func:`_issue_secproxy_cert`), and
+    otherwise generates a locally SELF-SIGNED cert covering the fronted FQDNs — the 'fine local
+    fallback' docs/macos.md documents, enough for nginx to terminate TLS for a local eval so the
+    edge actually comes up instead of failing closed on a missing cert."""
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    fullchain, privkey = cert_dir / "fullchain.pem", cert_dir / "privkey.pem"
+    issued = _issue_secproxy_cert(root, topology, without)
+    if issued:
+        shutil.copy(issued[0], fullchain)
+        shutil.copy(issued[1], privkey)
+        privkey.chmod(0o600)
+        P.log(f"secproxy: installed SecCert SAN cert → {fullchain}")
+        return True
+    fqdns = [fqdn for fqdn, _addr, _port in wiring.fronted_instances(topology, without)]
+    if not fqdns:
+        P.warn("secproxy: nothing fronted in this topology — no cert generated")
+        return False
+    san = ",".join(f"DNS:{f}" for f in fqdns)
+    P.warn("secproxy: SecCert SAN cert unavailable (macOS container/host DNS boundary) — "
+           "generating a self-signed cert for the local eval (browsers will warn; fine locally)")
+    P.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+           "-keyout", str(privkey), "-out", str(fullchain), "-days", "365",
+           "-subj", f"/CN={fqdns[0]}", "-addext", f"subjectAltName={san}"], check=False)
+    if privkey.exists():
+        privkey.chmod(0o600)
+    return fullchain.exists() and privkey.exists()
 
 
 def deploy(
@@ -376,6 +498,7 @@ def deploy(
     out: Path | None = None,
     with_inference: bool = False,
     with_agent: bool = False,
+    native_services: bool = True,
 ) -> None:
     without = without or []
     # Topology placement: only bring up the components placed on `resource` (single-host
@@ -388,11 +511,10 @@ def deploy(
     # Components on THIS resource this run — same secdns/secllm/secagent gating as
     # fedora_fips._include (secdns needs a topology; secllm/secagent additionally need
     # --with-inference/--with-agent). secproxy follows secdns's simpler rule exactly —
-    # topology-only, no --with-* flag (see its native-run note in deploy() below). Used for
-    # the deploy audit artifact (audit.py) — recorded regardless of whether secdeploy itself
-    # starts the process (SecRecorder/secagent/secproxy are always just a printed run command
-    # on macOS, never a managed service), since the audit's job is "what's part of this
-    # deploy", not "what secdeploy ran".
+    # topology-only, no --with-* flag. Used for the deploy audit artifact (audit.py) — recorded
+    # from PLACEMENT (what's part of this deploy), independent of whether native_services actually
+    # installed the launchd unit (--no-native-services prints run commands instead), the same way
+    # fedora-fips records placement regardless of what systemctl did.
     services = [
         n for n in ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder", "secproxy")
         if n not in without
@@ -424,8 +546,7 @@ def deploy(
         written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     if dry_run and topology is not None:
-        watched = ("seccert", "secrouter", "secrecorder") + (("secllm",) if with_inference else ())
-        here = ", ".join(sorted(s for s in watched if _here(s))) or "(none)"
+        here = ", ".join(services) or "(none)"
         print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
               f"components here: {here}")
     for cmd, desc in steps:
@@ -434,108 +555,207 @@ def deploy(
             continue
         P.run(cmd, env={**_os_environ(), **env})
 
-    # secdns runs natively on macOS (like SecRecorder), fed by the generated zone — only when
-    # a topology places it here (single-host has no topology, so this is skipped).
+    base_out = Path(out) if out is not None else root / "out"
+    staging_dir = base_out / "launchd"
+    log_dir = base_out / "logs"
+    user, home = _native_user()
+    uv = P.which("uv")
+
+    # CA / host-trust setup — independent of any one service, needs the SecCert root the compose
+    # steps exported. Pulled ahead of the native services so the trust anchor is in place before
+    # secproxy/SecRecorder present their SecCert-issued certs.
+    if dry_run:
+        _print_ca_dry_run(configure_hosts, trust_ca)
+    trust_anchor_added = False
+    if not dry_run:
+        if configure_hosts:
+            _configure_hosts(assume_yes)
+        trust_anchor_added = trust_ca and _trust_ca_root(root, assume_yes)
+
+    # ── native services (launchd) ─────────────────────────────────────────────────────────────
+    # Each is installed as a launchd daemon (RunAtLoad + KeepAlive) so the deploy actually STARTS
+    # and supervises it — the fix for "I deployed but nothing is running / .internal won't resolve"
+    # (--no-native-services / --dry-run print the run command instead). SecDNS is installed FIRST,
+    # so the resolver step below points at a RUNNING server rather than a dead 127.0.0.1:53 — the
+    # footgun that made every .internal name fail after a deploy.
     if topology is not None and _here("secdns"):
-        zone = (Path(out) / "addressing/secdns.zone") if out else Path("out/addressing/secdns.zone")
-        secdns_cmd = (f"sudo SECDNS_DOMAIN={topology.domain} SECDNS_ZONE={zone} "
-                      f"SECDNS_UPSTREAM={','.join(topology.upstream_dns)} "
-                      f"uv run --project work/secdns secdns serve")
-        if dry_run:
-            print(f"  · secdns: run natively on :53 → {secdns_cmd}")
+        zone = base_out / "addressing" / "secdns.zone"
+        fallback = (f"sudo SECDNS_DOMAIN={topology.domain} SECDNS_ZONE={zone} "
+                    f"SECDNS_UPSTREAM={','.join(topology.upstream_dns)} "
+                    f"uv run --project work/secdns secdns serve")
+        if uv is None and native_services and not dry_run:
+            P.warn(f"uv not found — cannot install secdns; start it yourself: {fallback}")
         else:
-            P.warn(f"secdns runs natively on macOS — start it (needs :53) with: {secdns_cmd}")
+            secdns = launchd.LaunchdService(
+                name="secdns",
+                program_args=[uv or "uv", "run", "--no-sync", "--project",
+                              str(root / "work" / "secdns"), "secdns", "serve"],
+                log_dir=log_dir,
+                env={**_base_env(), "SECDNS_DOMAIN": topology.domain, "SECDNS_ZONE": str(zone),
+                     "SECDNS_UPSTREAM": ",".join(topology.upstream_dns), "SECDNS_PORT": "53",
+                     "SECDNS_ADMIN_BIND": "127.0.0.1", "SECDNS_ADMIN_PORT": "47053"},
+                working_dir=str(root),
+                user=None,  # root — binds :53
+            )
+            _install_or_note(secdns, staging_dir, native_services=native_services,
+                             dry_run=dry_run, fallback_note=fallback)
 
-    # secllm runs natively on macOS too (no GPU passthrough into Colima) — only when a topology
-    # places it here AND --with-inference is set (a heavyweight GPU service is opt-in, like
-    # secdns/SecRecorder's native-run notes above). GPU-free eval uses SECLLM_BACKEND=mock
-    # instead of vllm.
-    if with_inference and topology is not None and _here("secllm"):
-        port = manifest.components["secllm"].port
-        secllm_cmd = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND=mock "
-                      f"uv run --project work/secllm secllm serve")
-        if dry_run:
-            print(f"  · (--with-inference) secllm: run natively (GPU-free eval) → {secllm_cmd}")
-        else:
-            P.warn(f"secllm is native on macOS (no GPU passthrough into Colima) — start it "
-                   f"(GPU-free eval via SECLLM_BACKEND=mock) with: {secllm_cmd}")
-
-    # secagent's Mattermost chat-ops bridge — KNOWN EVAL LIMITATION, not fixed here: fedora-fips
-    # gets a real systemd install (two layered EnvironmentFile=, see docs/fedora-fips.md); macOS
-    # has no equivalent service-manager env-file layering (compose.yaml has none either — same
-    # gap as SecRouter's own addressing env, see docs/macos.md), so this is a native-run note
-    # only, mirroring secdns/secllm's own notes above. The generated addressing env
-    # (write_addressing()'s secagent branch — LLM/SecSSO/Mattermost wiring + webhook secret)
-    # still lands in out/addressing/env/secagent.env either way; an operator running this
-    # manually can source it themselves.
-    if with_agent and topology is not None and _here("secagent"):
-        chat_cmd = "uv run --project work/secagent secagent chat serve --port 8070"
-        if dry_run:
-            print(f"  · (--with-agent) secagent: run natively (known eval limitation — no "
-                  f"macOS service install, see docs/macos.md) → {chat_cmd}")
-        else:
-            P.warn("secagent chat-ops has no macOS service install (known eval limitation — "
-                   f"see docs/macos.md) — start it manually, e.g. sourcing the generated "
-                   f"addressing env: {chat_cmd}")
-
-    # secproxy runs natively on macOS too — the key simplification for this target (see module
-    # docstring): nginx binds directly to the host, so it reaches every OTHER backend the same
-    # way any host process does — containers publish their ports to the host (compose.yaml's
-    # `ports:`), and every native service here (secdns/secllm/secagent above) already listens on
-    # the host. Topology-gated only, no --with-* flag, exactly like secdns above: secproxy is the
-    # suite's default front door the moment a topology places the edge tier here. nginx is the
-    # reverse-proxy runtime on both targets now — fedora-fips for FIPS (system OpenSSL), macOS as
-    # a non-FIPS eval. The nginx conf it points at was already written earlier in this function by
-    # write_addressing() (whenever a topology is active and this isn't a dry-run); the SAN cert is
-    # issued from SecCert via certbot (best-effort — see _issue_secproxy_cert's eval caveat). nginx
-    # binds :443/:80, so — like secdns's :53 — starting it needs sudo.
-    if topology is not None and _here("secproxy"):
-        nginx_conf = (Path(out) / "addressing/secproxy.nginx.conf") if out \
-            else Path("out/addressing/secproxy.nginx.conf")
-        secproxy_cmd = f"sudo nginx -c {nginx_conf} -g 'daemon off;'"
-        if dry_run:
-            print(f"  · secproxy: issue a SecCert SAN cert (certbot) for the fronted FQDNs, then "
-                  f"run nginx natively on :443/:80 → {secproxy_cmd}")
-        else:
-            _ensure_nginx()
-            cert = _issue_secproxy_cert(root, topology, without)
-            if cert:
-                P.log(f"secproxy SAN cert ready (SecCert-issued): {cert[0]}")
-            P.warn(f"secproxy (nginx) runs natively on macOS — start it (needs :443/:80) with: "
-                   f"{secproxy_cmd}. The generated conf uses production paths (cert dir "
-                   f"/etc/secsuite/secproxy, state /var/lib/secsuite/secproxy) — see docs/macos.md "
-                   f"for the local-eval setup (cert placement + self-signed fallback).")
-
-    # Optional: point this host's resolver at secdns for the internal domain.
+    # Point this host's resolver at secdns — AFTER secdns is up (see above).
     resolver_configured = False
     if configure_resolver and topology is not None:
         dns_ip = wiring.secdns_address_for(topology, resource, without)
-        if dns_ip and dry_run:
+        if dns_ip is None:
+            if not dry_run:
+                P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
+        elif dry_run:
             print(f"  · (--configure-resolver) point {topology.domain} at secdns {dns_ip} "
                   f"via /etc/resolver/{topology.domain} (sudo, asks first)")
-        elif dns_ip:
+        else:
+            if not native_services:
+                P.warn(f"--no-native-services: {topology.domain} won't resolve until you start "
+                       "secdns yourself (note above) — pointing the resolver at it regardless")
             resolver_configured = _configure_resolver(topology.domain, dns_ip, assume_yes)
-        elif not dry_run:
-            P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
 
-    # Stack components (SecSSO / SecChat) — brought up via their own bootstrap where placed.
+    # secllm — opt-in inference; GPU-free eval via SECLLM_BACKEND=mock (no GPU passthrough into
+    # Colima). Runs as the user (high port).
+    if with_inference and topology is not None and _here("secllm"):
+        port = manifest.components["secllm"].port
+        fallback = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND=mock "
+                    f"uv run --project work/secllm secllm serve")
+        secllm = launchd.LaunchdService(
+            name="secllm",
+            program_args=[uv or "uv", "run", "--no-sync", "--project",
+                          str(root / "work" / "secllm"), "secllm", "serve"],
+            log_dir=log_dir,
+            env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(port),
+                 "SECLLM_BACKEND": "mock"},
+            working_dir=str(root), user=user,
+        )
+        _install_or_note(secllm, staging_dir, native_services=native_services,
+                         dry_run=dry_run, fallback_note=fallback)
+
+    # secagent — opt-in chat bridge, now with REAL env layering: the generated addressing env
+    # (LLM/SecSSO/Mattermost wiring + webhook secret) + the SECAGENT_* operator secrets are folded
+    # into the launchd job's EnvironmentVariables — the macOS equivalent of fedora's two
+    # EnvironmentFile= layers, closing the old "source it yourself" eval gap. Runs as the user.
+    if with_agent and topology is not None and _here("secagent"):
+        # Listen on secagent's MANIFEST port (fronted by secproxy at that port) — not the CLI's
+        # own 8070 default — so the secagent.<domain> reverse-proxy route actually reaches it
+        # (secproxy dials the topology port). Mirrors secllm using its manifest port above.
+        port = manifest.components["secagent"].port
+        agent_env = _parse_env_file(base_out / "addressing" / "env" / "secagent.env")
+        agent_secrets = {k: v for k, v in
+                         _parse_env_file(root / "deploy" / "macos" / "secrets.env").items()
+                         if k.startswith("SECAGENT_")}
+        fallback = (f"uv run --project work/secagent secagent chat serve --port {port} "
+                    "(source out/addressing/env/secagent.env first)")
+        secagent = launchd.LaunchdService(
+            name="secagent",
+            program_args=[uv or "uv", "run", "--no-sync", "--project",
+                          str(root / "work" / "secagent"), "secagent", "chat", "serve",
+                          "--port", str(port)],
+            log_dir=log_dir,
+            env={**_base_env(home), **agent_env, **agent_secrets},
+            working_dir=str(root), user=user,
+        )
+        _install_or_note(secagent, staging_dir, native_services=native_services,
+                         dry_run=dry_run, fallback_note=fallback)
+
+    # SecRecorder — native MLX/Metal (never containerized on macOS). Runs as the user; TLS optional
+    # (a SecCert cert via certbot, reachable across the container boundary through
+    # host.docker.internal — the one fronted name that DOES resolve inside the SecCert container).
+    if _here("secrecorder"):
+        model_env = _model_env(root, hf_token, model_dir)
+        certfiles: tuple[Path, Path] | None = None
+        if tls and not dry_run:
+            certfiles = _issue_secrecorder_cert(root)
+            if certfiles is None:
+                P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
+        rec_args = [uv or "uv", "run", "--no-sync", "uvicorn", "server:app",
+                    "--host", "0.0.0.0", "--port", str(SECRECORDER_PORT)]
+        if certfiles:
+            rec_args += ["--ssl-certfile", str(certfiles[0]), "--ssl-keyfile", str(certfiles[1])]
+            fallback = _tls_run_cmd(certfiles[0], certfiles[1], model_env)
+        else:
+            fallback = (f"{_env_prefix(model_env)}HOST=0.0.0.0 PORT={SECRECORDER_PORT} "
+                        f"work/secrecorder/run.sh")
+        if tls and dry_run:
+            print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, then run "
+                  "SecRecorder with --ssl-certfile/--ssl-keyfile")
+        secrecorder = launchd.LaunchdService(
+            name="secrecorder", program_args=rec_args, log_dir=log_dir,
+            env={**_base_env(home), "WHISPER_PREWARM": "1", "WHISPER_PREWARM_DIARIZER": "1",
+                 **model_env},
+            working_dir=str(root / "work" / "secrecorder"), user=user,
+        )
+        _install_or_note(secrecorder, staging_dir, native_services=native_services,
+                         dry_run=dry_run, fallback_note=fallback)
+    elif not dry_run:
+        P.log(f"SecRecorder not placed on resource {resource!r} — skipping on this host")
+
+    # secproxy — nginx :443/:80 (root). Generate a macOS-LOCAL nginx conf: writable state + cert
+    # dirs under out/ (not fedora's /var/lib//etc production paths), and the worker `user` set
+    # since launchd starts nginx as root with no user drop of its own. The cert is SecCert-issued
+    # if certbot can (usually not, across the container/host DNS boundary) else self-signed, so the
+    # edge actually comes up instead of failing closed on a missing cert.
+    if topology is not None and _here("secproxy"):
+        sp_state = base_out / "secproxy" / "state"
+        sp_cert = base_out / "secproxy" / "cert"
+        sp_conf = base_out / "secproxy" / "nginx.conf"
+        fallback = f"sudo nginx -c {sp_conf} -g 'daemon off;'"
+        if dry_run:
+            print(f"  · secproxy: write macOS nginx conf → {sp_conf} (state {sp_state}, cert "
+                  f"{sp_cert}), issue/self-sign the fronted-FQDN cert, then:")
+            print(f"  · launchd {launchd.label_for('secproxy')} (as root): nginx -c {sp_conf} "
+                  "-g daemon off;")
+        elif not native_services:
+            P.warn(f"--no-native-services: secproxy not installed — start it yourself: {fallback}")
+        else:
+            _ensure_nginx()
+            nginx = P.which("nginx")
+            if nginx is None:
+                P.warn(f"nginx not found — cannot install secproxy; once installed: {fallback}")
+            else:
+                for d in (sp_state, sp_state / "tmp", sp_state / "acme", sp_cert):
+                    d.mkdir(parents=True, exist_ok=True)
+                sp_conf.write_text(wiring.nginx_conf_text(
+                    topology, str(sp_cert), without, state_dir=str(sp_state), user=user))
+                _secproxy_cert_macos(root, sp_cert, topology, without)
+                secproxy = launchd.LaunchdService(
+                    name="secproxy",
+                    program_args=[nginx, "-c", str(sp_conf), "-g", "daemon off;"],
+                    log_dir=log_dir, env=_base_env(), working_dir=str(root),
+                    user=None,  # root — binds :443/:80
+                )
+                _install_or_note(secproxy, staging_dir, native_services=True,
+                                 dry_run=False, fallback_note=fallback)
+
+    # Stack components (SecSSO / SecChat) — brought up via their own bootstrap where placed; their
+    # .env secrets are auto-generated by deploy_stacks (see targets/common).
     stacks = sorted(n for n in (placed or set())
                     if manifest.components[n].kind == "stack" and n not in without) \
         if topology is not None else []
     if stacks:
         common.deploy_stacks(work, stacks, dry_run=dry_run)
 
-    def _write_audit(trust_anchor_added: bool) -> None:
-        """CMMC audit evidence for this deploy — see audit.py. A no-op on dry-run/no --out."""
-        if dry_run or out is None:
-            return
+    # CMMC audit evidence — see audit.py. Dry-run prints the note and stops.
+    if dry_run:
+        if out is not None:
+            note = audit.dry_run_note(
+                out, NAME, resource, component_count=len(services) + len(stacks),
+                trust_anchor=trust_ca, resolver=resolver_configured,
+            )
+            print(f"  · {note}")
+        return
+    if out is not None:
         shas = common.resolved_shas(manifest, work)
         audit_path = audit.write_deploy_audit(
             manifest, topology, resource, out,
             target=NAME, services=services, shas=shas, stacks=stacks,
             flags={
                 "with_inference": with_inference, "with_agent": with_agent, "tls": tls,
-                "trust_ca": trust_ca, "configure_resolver": configure_resolver, "without": without,
+                "trust_ca": trust_ca, "configure_resolver": configure_resolver,
+                "without": without, "native_services": native_services,
             },
             addressing=written,
             trust_anchor_added=trust_anchor_added,
@@ -544,58 +764,7 @@ def deploy(
             secagent_enabled=("secagent" in services),
         )
         P.log(f"deploy audit artifact written → {audit_path}")
-
-    # SecRecorder runs natively on macOS — only when it's placed on this resource.
-    if not _here("secrecorder"):
-        if dry_run:
-            _print_ca_dry_run(configure_hosts, trust_ca)
-            if out is not None:
-                note = audit.dry_run_note(
-                    out, NAME, resource, component_count=len(services) + len(stacks),
-                    trust_anchor=trust_ca, resolver=resolver_configured,
-                )
-                print(f"  · {note}")
-            return
-        if configure_hosts:
-            _configure_hosts(assume_yes)
-        trust_anchor_added = trust_ca and _trust_ca_root(root, assume_yes)
-        _write_audit(trust_anchor_added)
-        P.log(f"SecRecorder not placed on resource {resource!r} — skipping on this host")
-        return
-
-    model_env = _model_env(root, hf_token, model_dir)
-    run_cmd = f"{_env_prefix(model_env)}HOST=0.0.0.0 PORT={SECRECORDER_PORT} work/secrecorder/run.sh"
-    if dry_run:
-        _print_ca_dry_run(configure_hosts, trust_ca)
-        if tls:
-            live = root / "out/certbot/config/live/secrecorder"
-            print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, then: "
-                  f"{_tls_run_cmd(live / 'fullchain.pem', live / 'privkey.pem', model_env)}")
-        else:
-            print(f"  · SecRecorder: run natively → {run_cmd}")
-        if out is not None:
-            note = audit.dry_run_note(
-                out, NAME, resource, component_count=len(services) + len(stacks),
-                trust_anchor=trust_ca, resolver=resolver_configured,
-            )
-            print(f"  · {note}")
-        return
-
-    if configure_hosts:
-        _configure_hosts(assume_yes)
-    trust_anchor_added = trust_ca and _trust_ca_root(root, assume_yes)
-
-    if tls:
-        cert = _issue_secrecorder_cert(root)
-        if cert:
-            certfile, keyfile = cert
-            P.log(f"SecRecorder cert ready (SecCert-issued): {certfile}")
-            P.warn(f"SecRecorder is native on macOS — start it with TLS: {_tls_run_cmd(certfile, keyfile, model_env)}")
-            _write_audit(trust_anchor_added)
-            return
-        P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
-    P.warn(f"SecRecorder is native on macOS — start it with: {run_cmd}")
-    _write_audit(trust_anchor_added)
+    P.log("suite deployed — check `secdeploy status macos`")
 
 
 def _print_ca_dry_run(configure_hosts: bool, trust_ca: bool) -> None:
@@ -676,6 +845,7 @@ class MacosFound:
     out_exists: bool               # <root>/out exists
     root: Path
     stacks: list[tuple[str, Path]]  # (name, bootstrap/<name>.sh) per stack checkout found
+    launchd_plists: list[Path]      # installed internal.secsuite.*.plist launchd daemons
 
 
 def _discover(root: Path, work: Path, topology_path: str | None = None) -> MacosFound:
@@ -731,6 +901,7 @@ def _discover(root: Path, work: Path, topology_path: str | None = None) -> Macos
         resolver_domains=resolver_domains, domain_hint=_topology_domain_hint(topology_path),
         hosts_line_present=hosts_line_present, keychain_cn=keychain_cn,
         out_exists=(root / "out").is_dir(), root=root, stacks=stacks,
+        launchd_plists=launchd.discovered_plists(),
     )
 
 
@@ -758,26 +929,20 @@ def teardown_plan(found: MacosFound, purge: bool) -> list[common.Step]:
                 "via `secdeploy build macos`)", ["docker", "rmi", img], "compose",
             ))
 
-    # 2. native services — secdns/secllm/secagent/secproxy run natively here with no PID or
-    #    launchd unit secdeploy tracks — DOCUMENT only, never auto-pkill (a fuzzy match risks
-    #    killing an unrelated host process bound to the same shared port).
+    # 2. native services (launchd) — bootout + remove each installed internal.secsuite.* daemon
+    #    that deploy() installed (discovered by plist, probe-driven like everything else here).
+    #    `bootout` stops + unloads; then the plist is removed so it doesn't reload at next boot.
+    for plist in found.launchd_plists:
+        for cmd, desc in launchd.teardown_commands(plist):
+            steps.append(common.Step(desc, cmd, "native_services"))
+    # A service the operator started in the FOREGROUND instead (--no-native-services, or a manual
+    # run) has no launchd unit to target — note it, but never auto-pkill (a fuzzy match on a shared
+    # port like :53/:443 could kill an unrelated host process).
     steps.append(common.Step(
-        "secdns/secllm/secagent/secproxy run natively on macOS with no PID/launchd unit "
-        "secdeploy can target — Ctrl-C the foreground terminal each is running in, or use "
-        "the patterns below AFTER confirming they actually name your process (`pgrep -fl "
-        "<pattern>` first): nginx and secdns bind ports other host processes may also use, "
-        "so a fuzzy pkill can kill something unrelated. NEVER auto-run these:",
-        None, "native_services",
+        "any native service started in the FOREGROUND (--no-native-services, or a manual run) has "
+        "no launchd unit to target — Ctrl-C its terminal; `pgrep -fl 'secdns serve|secllm serve|"
+        "secagent chat|nginx'` to check before any pkill", None, "native_services",
     ))
-    for label, pattern, needs_sudo in (
-        ("secdns", "secdns serve", False), ("secllm", "secllm serve", False),
-        ("secagent", "secagent chat serve", False),
-        # secproxy's own native run command is `sudo nginx -c ... -g 'daemon off;'` (docs/
-        # macos.md) — nginx binds :443/:80 and runs as root here, so killing it needs sudo too.
-        ("secproxy", "nginx -c .*secproxy", True),
-    ):
-        prefix = "sudo " if needs_sudo else ""
-        steps.append(common.Step(f"{label}: {prefix}pkill -f '{pattern}'", None, "native_services"))
 
     # 3. /etc/resolver/<domain> — only when unambiguous (an explicit --topology hint that
     #    matches an existing entry, or exactly one entry present); otherwise print the

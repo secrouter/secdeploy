@@ -374,7 +374,12 @@ def deploy(
     out: Path | None = None,
     with_inference: bool = False,
     with_agent: bool = False,
+    native_services: bool = True,
 ) -> None:
+    # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
+    # systemd-native, so it's accepted for calling-convention parity with macos.deploy() and
+    # otherwise ignored (same pattern as the macOS-only --tls/--configure-hosts flags above).
+    del native_services
     if hf_token or model_dir:
         P.warn("--hf-token/--model-dir are macOS-only — on fedora-fips, set HF_TOKEN/"
                "WHISPER_MODEL/WHISPER_DIARIZE_MODEL directly in /etc/secsuite/secrecorder.env")

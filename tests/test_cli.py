@@ -294,7 +294,9 @@ resource = "mac"
     assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
                  "--topology", str(tp), "--resource", "mac"]) == 0
     out = capsys.readouterr().out
-    assert "secdns: run natively" in out
+    # native services are launchd daemons now — the dry-run shows the unit + its argv
+    assert "launchd internal.secsuite.secdns" in out
+    assert "secdns serve" in out
 
 
 # ── secproxy on macOS: native nginx (not a container — see targets/macos.py's module
@@ -305,10 +307,43 @@ def test_deploy_macos_topology_secproxy_native(tmp_path, capsys):
     assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
                  "--topology", str(tp), "--resource", "gpu"]) == 0
     out = capsys.readouterr().out
-    assert "run nginx natively on :443/:80" in out
-    assert "issue a SecCert SAN cert" in out       # the certbot SAN issuance note
-    assert "sudo nginx -c" in out
-    assert "addressing/secproxy.nginx.conf" in out
+    # secproxy is a launchd nginx daemon now (macOS-local conf + self-signed fallback cert)
+    assert "launchd internal.secsuite.secproxy" in out
+    assert "nginx -c" in out
+    assert "secproxy/nginx.conf" in out
+    assert "self-sign" in out.lower()
+
+
+def test_deploy_macos_native_services_secdns_before_resolver(tmp_path, capsys):
+    """The resolver footgun fix: SecDNS is installed (launchd) BEFORE /etc/resolver is pointed at
+    it — and every native service is a launchd unit, not a printed 'do it yourself' note."""
+    tp = tmp_path / "t.toml"
+    tp.write_text("""
+domain = "sec.internal"
+upstream_dns = ["1.1.1.1"]
+[resources.mac]
+target = "macos"
+address = "127.0.0.1"
+[groups.identity]
+resource = "mac"
+[groups.inference]
+resource = "mac"
+[groups.gateway]
+resource = "mac"
+[groups.collab]
+resource = "mac"
+[groups.edge]
+resource = "mac"
+""")
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--topology", str(tp), "--resource", "mac",
+                 "--with-inference", "--with-agent", "--configure-resolver"]) == 0
+    out = capsys.readouterr().out
+    # ordering: secdns unit appears before the resolver step (else .internal resolves to a dead :53)
+    assert out.index("internal.secsuite.secdns") < out.index("configure-resolver")
+    # all five native services are launchd units
+    for name in ("secdns", "secllm", "secagent", "secrecorder", "secproxy"):
+        assert f"internal.secsuite.{name}" in out
 
 
 def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):

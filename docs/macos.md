@@ -41,8 +41,33 @@ What `deploy macos` does:
 1. `docker compose up -d seccert` and wait for `http://localhost:47001/health`.
 2. Save the CA trust anchor to `out/seccert-root.pem`.
 3. `docker compose up -d secrouter`.
-4. Write a deploy audit artifact to `out/audit/` (CMMC audit evidence — see
+4. Install + start the native services (with a `topology.toml` placing them here) as **launchd
+   daemons** — see [Native services (launchd)](#native-services-launchd) below.
+5. Write a deploy audit artifact to `out/audit/` (CMMC audit evidence — see
    [Deployment audit artifacts](fedora-fips.md#deployment-audit-artifacts)).
+
+### Native services (launchd)
+
+SecCert and SecRouter are containers; everything else that runs on macOS — **SecDNS** (`:53`),
+**SecLLM**, **SecAgent**, **SecRecorder** (MLX/Metal, never containerized here) and **secproxy**'s
+nginx (`:443`/`:80`) — runs natively and is installed as a **launchd daemon** so `deploy` actually
+starts and *keeps* it running (`RunAtLoad` + `KeepAlive`) instead of printing a command for you to
+paste and babysit. The units live at `/Library/LaunchDaemons/internal.secsuite.<name>.plist`:
+
+- **SecDNS** and **secproxy** bind privileged ports (`:53`, `:443`/`:80`), so they run as **root**
+  (macOS has no per-port capability like Linux's `CAP_NET_BIND_SERVICE`). SecLLM, SecAgent and
+  SecRecorder run as **you** (the invoking user), so `uv`/their project venvs/`$HOME` resolve
+  exactly as they did at `build` time.
+- Installing a LaunchDaemon writes a root-owned directory, so it uses `sudo` (the same escalation
+  the resolver/keychain steps already ask for; macOS caches it, so you're prompted at most once).
+- Logs are captured under `out/logs/<name>.{out,err}.log`. Check status with
+  `sudo launchctl print system/internal.secsuite.<name>` (or `secdeploy status macos`).
+- **`deploy macos --no-native-services`** skips the install and prints each run command instead —
+  for when you'd rather run one in the foreground (e.g. to watch its output while debugging).
+
+`build macos` pre-syncs each native service's `uv` venv, so the first start is instant and — for
+root-run SecDNS — nothing tries to write a venv into your checkout at start time. Teardown removes
+these units (`launchctl bootout` + remove the plist) — see [Teardown](#teardown).
 
 > **Known eval limitation:** with a `topology.toml` in play, secdeploy still generates
 > SecRouter's pool/token/egress wiring (`SECROUTER_SECLLM_ENDPOINTS`/`_TOKEN`/
@@ -54,13 +79,13 @@ What `deploy macos` does:
 > on macOS it stays generated-but-unapplied. Use `fedora-fips` (or hand-edit `compose.yaml` to
 > mount the file yourself) for anything beyond a single-host eval.
 
-`deploy macos --with-agent` (with a `topology.toml` placing SecAgent here) is the same story:
-it prints a native `secagent chat serve` run command (mirroring SecRecorder/secdns/SecLLM's own
-native notes below) rather than installing anything — macOS has no systemd-style env-file
-layering to install SecAgent's generated addressing env into. See
-[SecAgent and Mattermost](fedora-fips.md#secagent-and-mattermost) for the real (fedora-fips)
-turnkey standup; on macOS, source `out/addressing/env/secagent.env` yourself before running the
-printed command if you want the generated wiring.
+`deploy macos --with-agent` (with a `topology.toml` placing SecAgent here) installs SecAgent's
+`secagent chat serve` bridge as a launchd daemon **with its wiring layered in**: the generated
+addressing env (`out/addressing/env/secagent.env` — LLM/SecSSO/Mattermost wiring + webhook secret)
+and the `SECAGENT_*` operator secrets from `deploy/macos/secrets.env` are read and folded into the
+launchd job's `EnvironmentVariables` — the macOS equivalent of fedora-fips's two `EnvironmentFile=`
+layers, closing the old "source it yourself" gap. See
+[SecAgent and Mattermost](fedora-fips.md#secagent-and-mattermost) for the full turnkey standup.
 
 ### Internal DNS (`*.internal`) on macOS
 
@@ -68,20 +93,32 @@ A single-host eval has no topology and no `.internal` names — reach everything
 `localhost:<port>` (see [Verify](#verify)). With a `topology.toml`, though, the suite's
 `<component>.<domain>` hostnames **do** work on macOS; it isn't a Linux-only feature:
 
-- **SecDNS runs natively** (a service on `:53`, like SecRecorder). `deploy macos` prints the
-  `sudo … secdns serve` command for you to run — it isn't auto-started.
+- **SecDNS runs natively** on `:53`, installed as a launchd daemon (as root) and **started by the
+  deploy** — no `sudo … secdns serve` to run by hand.
 - **`deploy macos --configure-resolver`** writes `/etc/resolver/<domain>` pointing that domain
   at SecDNS — macOS's native per-domain resolver — so `secrouter.<domain>` and friends resolve
-  on the host.
+  on the host. The deploy installs **SecDNS first, then** points the resolver at it, so there's no
+  window where `<domain>` names are routed to a not-yet-running `:53` (an earlier version
+  configured the resolver against a SecDNS you still had to start yourself — every `.internal`
+  lookup failed until you did; that's fixed).
 
-It is **eval-grade**, though: those native services (SecDNS, SecLLM, SecAgent) are run-commands
-you start yourself rather than managed units; SecLLM runs `SECLLM_BACKEND=mock` (no GPU
-passthrough into Colima, so no real inference); the generated wiring env isn't auto-applied to
-the containers (see the limitation above); and `/etc/resolver` is host-side, so the containers
-still resolve peers through the Colima VM / `host.docker.internal`. For managed, auto-started
-services and real inference, use `fedora-fips`.
+Verify resolution once the deploy finishes:
 
-SecRecorder (optional, native):
+```bash
+dig @127.0.0.1 secrouter.sec.internal +short   # ask SecDNS directly
+sudo killall -HUP mDNSResponder                 # flush the macOS resolver cache
+dscacheutil -q host -a name secrouter.sec.internal
+```
+
+Still **eval-grade** in two ways unrelated to whether the services are managed: SecLLM runs
+`SECLLM_BACKEND=mock` (no GPU passthrough into Colima, so no real inference), and `/etc/resolver`
+is host-side, so the **containers** (SecCert/SecRouter) still resolve peers through the Colima VM /
+`host.docker.internal`, not through SecDNS — which is why the secproxy ACME cert usually can't
+issue on macOS (see [TLS on macOS](#tls-on-macos-the-same-eval-limitation-as-secrecorder)). For
+real inference and a FIPS crypto boundary, use `fedora-fips`.
+
+SecRecorder is installed and started as a launchd daemon too. For a one-off foreground run
+instead (e.g. `--no-native-services`, or to watch its output):
 
 ```bash
 HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh     # http://127.0.0.1:47003
@@ -90,7 +127,7 @@ HOST=0.0.0.0 PORT=47003 work/secrecorder/run.sh     # http://127.0.0.1:47003
 ### SecRecorder over TLS (SecCert-issued cert)
 
 `deploy macos --tls` gets SecRecorder a real cert from SecCert via `certbot` (installed via
-brew if missing) and prints the TLS run command. HTTP-01 validation crosses the container/host
+brew if missing) and starts its launchd daemon with TLS. HTTP-01 validation crosses the container/host
 boundary through `host.docker.internal` — SecCert (in its container) reaches back to a
 `certbot`-managed responder on the Mac itself via that name; `compose.yaml`'s
 `SECCERT_HTTP01_PORT=47080` matches the unprivileged port `certbot --standalone` binds to.
@@ -104,7 +141,7 @@ uv run secdeploy deploy macos --tls --configure-hosts --trust-ca
 # password prompt is separate and always happens (this asks whether to invoke sudo at all).
 ```
 
-Cert + key land under `out/certbot/config/live/secrecorder/`; the printed command starts
+Cert + key land under `out/certbot/config/live/secrecorder/`; the launchd daemon starts
 uvicorn directly with `--ssl-certfile`/`--ssl-keyfile` (bypassing `run.sh`, which has no TLS
 flags) and also sets `WHISPER_PREWARM=1`/`WHISPER_PREWARM_DIARIZER=1` explicitly — those are
 `run.sh`'s defaults too, but bypassing it means they're not applied for free. Without prewarm,
@@ -129,17 +166,17 @@ cp deploy/macos/secrets.env.example deploy/macos/secrets.env
 ```
 
 `deploy macos --tls` (and the plain-HTTP path) read `deploy/macos/secrets.env` automatically
-and fold `HF_TOKEN` into the printed run command; `--hf-token TOKEN` overrides it for a one-off
-run. `secrets.env` is gitignored (`*.env`) — never commit a real token.
+and fold `HF_TOKEN` into SecRecorder's launchd environment; `--hf-token TOKEN` overrides it for a
+one-off run. `secrets.env` is gitignored (`*.env`) — never commit a real token.
 
 > `secdeploy configure`'s optional secret-seeding step can write `HF_TOKEN` into
 > `deploy/macos/secrets.env` for you (`0600`, masked input) instead of the manual `cp` + edit
 > above — see [secsite.md § Seeding operator secrets](secsite.md#seeding-operator-secrets-optional).
-> It can also seed SecCert/SecAgent/SecRouter values into this same shared file when those
-> components are placed on a macOS resource, but — unlike `HF_TOKEN` — nothing on this target
-> reads them automatically yet (macOS has no per-component env-file plumbing today, the same
-> known eval limitation noted throughout this page); they land there for safekeeping until it
-> does.
+> SecAgent's `SECAGENT_*` secrets seeded into this same file **are** now layered into its launchd
+> job (see [`--with-agent`](#deploy) above). SecCert's CA passphrase/admin token still land here
+> for safekeeping only — SecCert runs as a container on macOS and takes its env from
+> `compose.yaml`, so use `fedora-fips` if you need those applied. (`configure` auto-generates the
+> SecCert secrets by default, so you don't have to invent them either way.)
 
 ### Air-gapped: manually pre-placed models
 
@@ -180,33 +217,22 @@ uv run secdeploy deploy macos --topology topology.toml --resource <edge-resource
 ```
 
 nginx is the reverse-proxy runtime on **both** targets — fedora-fips uses the system OpenSSL
-(FIPS-validated in FIPS mode), and macOS runs the same nginx for a non-FIPS eval. `deploy macos`
-writes `out/addressing/secproxy.nginx.conf` whenever a topology is active (the same
-`wiring.write_addressing()`/`wiring.nginx_conf_text()` generator fedora-fips installs — see
-[fedora-fips.md#the-generated-nginx-config](fedora-fips.md#the-generated-nginx-config)), makes
-sure `nginx` is on `PATH` first (installing via `brew install nginx` if missing — the same
-`_ensure_certbot()`-style idiom `--tls` uses for `certbot`), issues the SAN cert (below), and —
-like SecDNS/SecLLM/SecAgent's own native-run notes above — prints the command to run it rather
-than starting it for you:
+(FIPS-validated in FIPS mode), and macOS runs the same nginx for a non-FIPS eval. On macOS,
+`deploy` makes sure `nginx` is on `PATH` (installing via `brew install nginx` if missing), writes a
+**macOS-local** nginx config to `out/secproxy/nginx.conf`, obtains a cert (see below), and installs
+nginx as a **launchd daemon** on `:443`/`:80` (as root) — started for you, not printed:
 
 ```bash
-sudo nginx -c out/addressing/secproxy.nginx.conf -g 'daemon off;'
+# what the launchd daemon runs (check it with `secdeploy status macos`, logs in out/logs/secproxy.*.log):
+nginx -c out/secproxy/nginx.conf -g 'daemon off;'
 ```
 
-nginx binds `:443`/`:80`, so — like SecDNS's `:53` — starting it needs `sudo`.
-
-> **Eval setup — production paths.** The generated config is the *production* shape: it reads its
-> cert from `/etc/secsuite/secproxy/{fullchain,privkey}.pem` and points nginx's pid/logs/temp +
-> the ACME webroot at the state dir `/var/lib/secsuite/secproxy`. For a local macOS eval, create
-> those dirs and drop the cert in place (running as `sudo`), e.g.:
->
-> ```bash
-> sudo install -d /var/lib/secsuite/secproxy/tmp /var/lib/secsuite/secproxy/acme /etc/secsuite/secproxy
-> sudo cp out/certbot/config/live/secproxy/{fullchain,privkey}.pem /etc/secsuite/secproxy/
-> ```
->
-> — or hand-edit the paths in your copy of the generated conf (a one-off local workaround; a
-> redeploy overwrites it).
+Unlike fedora-fips's *production* config (cert at `/etc/secsuite/secproxy`, state under
+`/var/lib/secsuite/secproxy`, worker user set by systemd), the macOS config keeps everything under
+the deploy's own `out/` — cert dir `out/secproxy/cert`, writable state (pid/logs/temp + the ACME
+webroot) under `out/secproxy/state` — and names your user as nginx's `worker` user, since launchd
+starts nginx as root with no user drop of its own. No production paths to create, and no manual
+cert placement: both are handled for you.
 
 ### What it fronts
 
@@ -215,39 +241,29 @@ reverse-proxied by Host header on `:443`. **seccert**, **secllm**, and **secdns*
 fronted (reached directly at their own `host:port` instead), and secproxy never fronts itself.
 See [fedora-fips.md#what-it-fronts](fedora-fips.md#what-it-fronts) for why.
 
-### TLS on macOS: the same eval limitation as SecRecorder
+### TLS on macOS: automatic self-signed fallback
 
-nginx doesn't run its own ACME client — SecDeploy issues it one **SAN certificate** covering
-every fronted FQDN from SecCert via `certbot`, exactly like fedora-fips (see
-[fedora-fips.md#tls-via-seccert-the-deploy-time-san-cert](fedora-fips.md#tls-via-seccert-the-deploy-time-san-cert)),
-just adapted to macOS's container/host boundary the way SecRecorder's `--tls` flow is: the
-HTTP-01 responder runs on the Mac and SecCert (in its container) reaches it on
-`SECCERT_HTTP01_PORT` (see `compose.yaml`).
+nginx doesn't run its own ACME client — SecDeploy issues it one **SAN certificate** covering every
+fronted FQDN from SecCert via `certbot`, exactly like fedora-fips (see
+[fedora-fips.md#tls-via-seccert-the-deploy-time-san-cert](fedora-fips.md#tls-via-seccert-the-deploy-time-san-cert)).
+That validation needs SecCert to resolve each fronted FQDN **to this host, from inside its
+container** — i.e. SecDNS serving the fronted FQDNs and the SecCert container's resolver pointed at
+SecDNS. On a plain macOS eval that isn't set up (the containers resolve through the Colima VM, not
+your host `/etc/resolver`), so HTTP-01 usually can't complete.
 
-That validation needs the challenge to actually be reachable: SecCert must resolve each fronted
-FQDN **to this host, from inside its container** — i.e. SecDNS serving the fronted FQDNs and the
-SecCert container's resolver pointed at SecDNS. On a plain local eval that isn't set up, so
-issuance may not complete (the deploy warns and continues).
+So on macOS the deploy **falls back automatically**: when the SecCert SAN cert can't be issued, it
+generates a **self-signed** cert covering the fronted FQDNs into `out/secproxy/cert/` and nginx
+serves that — enough to terminate TLS for a local eval (browsers warn on an untrusted issuer;
+that's expected locally). You place nothing by hand. For a trusted cert, run where SecCert can
+validate the fronted names from inside its container — that's what `fedora-fips` provides.
 
-For a pure local eval, skip ACME entirely instead of fighting it: drop a **self-signed**
-certificate at `/etc/secsuite/secproxy/{fullchain,privkey}.pem` (e.g. `openssl req -x509 -newkey
-rsa:2048 -nodes -keyout privkey.pem -out fullchain.pem -days 30 -subj /CN=secrouter.<domain>`),
-which nginx serves the same way. Like every other generated file here, don't expect a hand-edited
-conf to survive a redeploy — this is a one-off local workaround, not a supported flag.
-
-### Known caveat: SecAgent's port
+### SecAgent's port
 
 `suite.toml` gives secagent port `47007` — the port the generated nginx config's
-`secagent.<domain>` server block reverse-proxies to. But SecAgent's own native run command (both
-here and on fedora-fips — see
-[fedora-fips.md#secagent-and-mattermost](fedora-fips.md#secagent-and-mattermost)) is `secagent
-chat serve --port 8070`, a different port than the one nginx is told to dial. On a single-Mac
-eval running secproxy and SecAgent together, that mismatch means `secagent.<domain>` won't
-actually reach the running `chat serve` process unless you start it on `47007` instead of the
-documented `8070` (`secagent chat serve --port 47007`) — or you accept that the fronted route
-doesn't work end-to-end here and reach SecAgent directly at whatever port it's actually
-listening on instead. This is a pre-existing gap in the port model, not something this native-
-nginx integration introduces or fixes.
+`secagent.<domain>` server block reverse-proxies to. The macOS launchd daemon starts
+`secagent chat serve` on **that manifest port** (not the CLI's own `8070` default), so the
+`secagent.<domain>` reverse-proxy route reaches it end-to-end — no manual `--port` override
+needed. (fedora-fips's systemd unit likewise runs it on the manifest port.)
 
 ## Verify
 
@@ -276,13 +292,17 @@ Equivalent to (but discovered, not hand-run):
 ```bash
 docker compose -f deploy/macos/compose.yaml down            # keep the CA volume
 docker compose -f deploy/macos/compose.yaml down -v         # also wipe SecCert state (--purge)
+# each installed launchd daemon (SecDNS/SecLLM/SecAgent/SecRecorder/secproxy):
+sudo launchctl bootout system /Library/LaunchDaemons/internal.secsuite.<name>.plist
+sudo rm -f /Library/LaunchDaemons/internal.secsuite.<name>.plist
 ```
 
 **It discovers, it doesn't assume.** Same principle as `fedora-fips` (see
 [fedora-fips.md#teardown](fedora-fips.md#teardown)): `deploy` is purely additive, so this
 Mac can be a superset of any one `topology.toml`/deploy-flags combination. Teardown probes
 Docker directly (which containers/volumes exist for the `secsuite` compose project, which
-`secrouter/{seccert,secrouter}` images are built), lists `/etc/resolver` and checks
+`secrouter/{seccert,secrouter}` images are built), enumerates the installed
+`/Library/LaunchDaemons/internal.secsuite.*.plist` units, lists `/etc/resolver` and checks
 `/etc/hosts` and the System keychain itself, rather than trusting what was last deployed.
 If a prior deploy's audit JSON exists under `--out`, it prints a one-line drift note (never
 the driver of the plan — see fedora-fips.md's own note on this).
@@ -292,24 +312,19 @@ then asks you to confirm before doing anything; `-y`/`--yes` skips it. Two steps
 their **own** extra confirmation on top of that, because they touch state another program
 might also own.
 
-### Native services: teardown cannot stop them
+### Native services (launchd): stopped + removed
 
-`secdns`, `secllm`, `secagent`, and `secproxy` (nginx) all run **natively** on macOS with no
-PID or launchd unit secdeploy tracks (see [Internal DNS](#internal-dns-internal-on-macos) and
-[SecProxy](#secproxy-edge-reverse-proxy) above) — teardown can't stop them for you. It prints
-guidance instead: Ctrl-C the foreground terminal each is running in, or — only after
-confirming the PID actually belongs to your process (`pgrep -fl <pattern>` first) —
+The native services (`secdns`, `secllm`, `secagent`, `secrecorder`, `secproxy`) are launchd
+daemons now, so teardown **stops and removes each one it finds** — `launchctl bootout system`
+(stops + unloads) then removes the plist so it doesn't reload at next boot. It discovers them by
+listing `/Library/LaunchDaemons/internal.secsuite.*.plist`, so it removes exactly the suite's own
+units and nothing else.
 
-```bash
-pkill -f 'secdns serve'
-pkill -f 'secllm serve'
-pkill -f 'secagent chat serve'
-sudo pkill -f 'nginx -c .*secproxy'   # secproxy runs as root (sudo nginx ...) — see above
-```
-
-**These are never run automatically.** `nginx` and `secdns` bind ports other host processes
-may also use, so a fuzzy `pkill -f` match can kill something unrelated to this suite —
-verify the PID first.
+The one thing it still won't touch is a service you ran in the **foreground** yourself
+(`--no-native-services`, or a manual run) — that has no launchd unit to target. Teardown notes
+this; stop it with Ctrl-C, and only after confirming the PID is yours (`pgrep -fl 'secdns
+serve|secllm serve|secagent chat|nginx'`) should you `pkill`. Teardown never runs a fuzzy `pkill`
+itself — `nginx`/`secdns` bind shared ports, so a loose match could kill something unrelated.
 
 ### `/etc/resolver/<domain>` and the cross-host resolver caveat
 
@@ -370,10 +385,10 @@ listed under "NOT removed" only, since other tools on this Mac may depend on the
 
 - It never runs `git`, and never touches `topology.toml`/deploy flags to decide what's
   installed — see "it discovers, it doesn't assume" above.
-- It can't stop the **native** services (SecDNS/SecLLM/SecAgent/nginx-secproxy) — they run as
-  foreground processes with no PID/launchd unit secdeploy tracks. The plan prints the exact
-  `pkill` patterns (confirm with `pgrep -fl` first — they bind shared ports); stop them
-  yourself, or Ctrl-C their terminals.
+- It removes the **launchd** native services it finds (`bootout` + remove the plist), but a
+  service you ran in the **foreground** yourself (`--no-native-services`) has no unit to target —
+  Ctrl-C it, or `pkill` after confirming the PID with `pgrep -fl` (they bind shared ports). See
+  [Native services (launchd): stopped + removed](#native-services-launchd-stopped--removed).
 
 ## Notes
 

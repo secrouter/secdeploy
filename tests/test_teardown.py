@@ -73,6 +73,10 @@ def _macos_found_everything(**overrides) -> macos.MacosFound:
             ("secsso", Path("work/secsso/bootstrap/secsso.sh")),
             ("secchat", Path("work/secchat/bootstrap/secchat.sh")),
         ],
+        launchd_plists=[
+            Path("/Library/LaunchDaemons/internal.secsuite.secdns.plist"),
+            Path("/Library/LaunchDaemons/internal.secsuite.secproxy.plist"),
+        ],
     )
     base.update(overrides)
     return macos.MacosFound(**base)
@@ -84,7 +88,7 @@ def _macos_found_nothing() -> macos.MacosFound:
         compose_containers=False, compose_volumes=False, images=[],
         resolver_domains=[], domain_hint=None, hosts_line_present=False,
         keychain_cn=None, out_exists=False, root=Path("/tmp/secdeploy-test-root"),
-        stacks=[],
+        stacks=[], launchd_plists=[],
     )
 
 
@@ -304,13 +308,23 @@ def test_macos_plan_without_purge_never_mentions_out_artifacts():
     assert not any(s.category == "artifacts" for s in plan)
 
 
-def test_macos_plan_native_services_never_a_real_pkill_command():
+def test_macos_plan_native_services_bootout_each_discovered_plist():
+    """launchd services now have real reverse actions — bootout + rm each installed plist — plus
+    a print-only note for any FOREGROUND instance (which has no unit to target). Never a fuzzy
+    pkill COMMAND (the shared-port risk), only pkill guidance in the note."""
     plan = macos.teardown_plan(_macos_found_everything(), purge=False)
     native = [s for s in plan if s.category == "native_services"]
-    assert native
-    assert all(s.command is None for s in native)  # documentation only — never auto-run
-    assert any("secproxy" in s.description and "sudo pkill" in s.description for s in native)
-    assert any("port" in s.description.lower() for s in native)  # the shared-port warning
+    cmds = [s.command for s in native if s.command]
+    # a bootout + an rm for each discovered plist (secdns, secproxy)
+    assert any(c[:3] == ["sudo", "bash", "-c"] and "launchctl bootout system" in c[3]
+               and "secdns" in c[3] for c in cmds)
+    assert ["sudo", "rm", "-f",
+            "/Library/LaunchDaemons/internal.secsuite.secdns.plist"] in cmds
+    assert ["sudo", "rm", "-f",
+            "/Library/LaunchDaemons/internal.secsuite.secproxy.plist"] in cmds
+    # the foreground fallback is guidance only — print-only, never an auto-run pkill command
+    assert any(s.command is None and "pkill" in s.description for s in native)
+    assert not any(s.command and "pkill" in " ".join(s.command) for s in native)
 
 
 def test_macos_plan_hosts_step_targets_exact_line_only():

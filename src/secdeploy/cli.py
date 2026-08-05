@@ -261,6 +261,7 @@ def cmd_deploy(args) -> int:
         topology=site.topology if from_file else None, resource=resource, out=Path(args.out),
         with_inference=_resolved(args.with_inference, opts.with_inference),
         with_agent=_resolved(args.with_agent, opts.with_agent),
+        native_services=args.native_services,
     )
     return 0
 
@@ -404,8 +405,15 @@ def build_parser() -> argparse.ArgumentParser:
              "the resource where the collab tier is placed here (default: off — the peer-wiring "
              "env pointing SecAgent's LLM traffic at SecRouter is always generated; this "
              "additionally installs pi + secagent and starts the secagent service). "
-             "fedora-fips only; macOS prints a native note instead (see docs/fedora-fips.md). "
-             "Overrides the resource's secsite.toml `with_agent` when given.",
+             "fedora-fips installs a systemd service; macOS installs a launchd service (see "
+             "docs/macos.md). Overrides the resource's secsite.toml `with_agent` when given.",
+    )
+    sub.choices["deploy"].add_argument(
+        "--no-native-services", action="store_false", dest="native_services",
+        help="macOS: don't install the native services (SecDNS/SecLLM/SecAgent/SecRecorder/"
+             "secproxy) as launchd daemons — print the run commands so you start them in the "
+             "foreground yourself. Default is to install + start them. fedora-fips ignores this "
+             "(always systemd-native).",
     )
 
     tp = sub.add_parser(

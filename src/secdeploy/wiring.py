@@ -176,7 +176,8 @@ def fronted_instances(
 _NGINX_STATE_DIR = "/var/lib/secsuite/secproxy"
 
 
-def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None = None) -> str:
+def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None = None,
+                    *, state_dir: str = _NGINX_STATE_DIR, user: str | None = None) -> str:
     """Render the nginx config secproxy serves — the suite's one HTTPS front door (:443) for its
     FRONTED HTTP services (the ``fronted`` manifest flag; see :meth:`Topology.is_fronted`). nginx
     is the reverse-proxy runtime on BOTH targets: on fedora-fips it links the **system OpenSSL**,
@@ -205,6 +206,12 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
       the WebSocket ``Upgrade``/``Connection`` pair.
 
     Deterministic manifest order, so the output is stable/testable.
+
+    ``state_dir`` (nginx's writable pid/log/temp/acme root) and ``user`` (the worker ``user``
+    directive) default to the fedora convention — ``/var/lib/secsuite/secproxy`` and no directive
+    (systemd's ``User=`` sets it) — so fedora output is byte-identical. The macOS target overrides
+    both: a writable dir under the deploy's ``out/`` and the invoking user, since launchd starts
+    nginx as root with no user drop of its own (see ``targets/macos.py``).
     """
     fronted = fronted_instances(topology, without)
     lines = [
@@ -216,8 +223,8 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
         "# the suite's edge TLS termination via the system OpenSSL (FIPS-validated in FIPS mode);",
         "# the SAN cert covering every fronted name is issued from SecCert by SecDeploy (certbot).",
         "worker_processes auto;",
-        f"pid {_NGINX_STATE_DIR}/nginx.pid;",
-        f"error_log {_NGINX_STATE_DIR}/error.log;",
+        f"pid {state_dir}/nginx.pid;",
+        f"error_log {state_dir}/error.log;",
         "",
         "events {",
         "\tworker_connections 1024;",
@@ -227,12 +234,12 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
         "\t# ProtectSystem=strict makes nginx's default /var/log/nginx, /var/lib/nginx and /run",
         "\t# paths read-only — keep every writable path inside the service state dir (granted by",
         "\t# secproxy.service's ReadWritePaths), so no default nginx temp/log/pid path is touched.",
-        f"\taccess_log {_NGINX_STATE_DIR}/access.log;",
-        f"\tclient_body_temp_path {_NGINX_STATE_DIR}/tmp/client_body;",
-        f"\tproxy_temp_path {_NGINX_STATE_DIR}/tmp/proxy;",
-        f"\tfastcgi_temp_path {_NGINX_STATE_DIR}/tmp/fastcgi;",
-        f"\tuwsgi_temp_path {_NGINX_STATE_DIR}/tmp/uwsgi;",
-        f"\tscgi_temp_path {_NGINX_STATE_DIR}/tmp/scgi;",
+        f"\taccess_log {state_dir}/access.log;",
+        f"\tclient_body_temp_path {state_dir}/tmp/client_body;",
+        f"\tproxy_temp_path {state_dir}/tmp/proxy;",
+        f"\tfastcgi_temp_path {state_dir}/tmp/fastcgi;",
+        f"\tuwsgi_temp_path {state_dir}/tmp/uwsgi;",
+        f"\tscgi_temp_path {state_dir}/tmp/scgi;",
         "",
         "\t# WebSocket upgrade support (SecChat/SecRecorder need it) — referenced by the",
         "\t# proxy_set_header Upgrade/Connection pair in every site block below.",
@@ -242,6 +249,12 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
         "\t}",
         "",
     ]
+    # macOS runs nginx under launchd as root (needed for :443/:80), so — unlike fedora, where
+    # systemd's User= sets it — the conf itself must name the worker user, or workers default to
+    # `nobody` and can't write the state dir. `user` is None on fedora → no directive, output
+    # unchanged.
+    if user:
+        lines.insert(lines.index("worker_processes auto;"), f"user {user};")
     if fronted:
         server_names = " ".join(fqdn for fqdn, _addr, _port in fronted)
         lines += [
@@ -253,7 +266,7 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             f"\t\tserver_name {server_names};",
             "",
             "\t\tlocation /.well-known/acme-challenge/ {",
-            f"\t\t\troot {_NGINX_STATE_DIR}/acme;",
+            f"\t\t\troot {state_dir}/acme;",
             "\t\t}",
             "",
             "\t\tlocation / {",

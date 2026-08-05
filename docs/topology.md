@@ -159,8 +159,8 @@ each resource where inference is placed (default off, since it's a heavyweight G
 without it, secdeploy still generates the DNS + env wiring above for an externally-run SecLLM.
 On fedora-fips this installs a hardened `secllm.service` (see
 `deploy/fedora-fips/systemd/secllm.service`) with a generated `/etc/secsuite/secllm.env`; on
-macOS (no GPU passthrough into Colima) it instead prints a native run command using
-`SECLLM_BACKEND=mock` for a GPU-free eval.
+macOS (no GPU passthrough into Colima) it installs a native launchd daemon using
+`SECLLM_BACKEND=mock` for a GPU-free eval (see [macos.md § Native services](macos.md#native-services-launchd)).
 
 Two more pieces of this pool's security setup are generated alongside the wiring above — both
 are CMMC audit evidence, recorded in the [deploy audit artifact](fedora-fips.md#deployment-audit-artifacts):
