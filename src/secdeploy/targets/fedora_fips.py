@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import platform
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import common
@@ -74,6 +75,10 @@ SECPROXY_NGINX_CONF = ETC / "nginx-secproxy.conf"
 # _issue_secproxy_cert), covering all fronted FQDNs; nginx_conf_text points every :443 server
 # block's ssl_certificate/ssl_certificate_key here. Key lands 0600, owned by secsuite-secproxy.
 SECPROXY_CERT_DIR = ETC / "secproxy"
+# --configure-resolver's systemd-resolved drop-in (below, in deploy()) — also teardown's
+# reverse-direction target (see the teardown section at the end of this module). A module
+# constant (not inlined twice) so the two can never drift apart.
+RESOLVER_DROPIN = Path("/etc/systemd/resolved.conf.d/secsuite.conf")
 
 PLAN = [
     "Preflight: verify the host is in FIPS mode + the OpenSSL FIPS provider is active (fail closed)",
@@ -444,7 +449,7 @@ def deploy(
     if configure_resolver and topology is not None:
         dns_ip = wiring.secdns_address_for(topology, resource, without)
         if dns_ip:
-            drop = "/etc/systemd/resolved.conf.d/secsuite.conf"
+            drop = str(RESOLVER_DROPIN)
             steps.append((
                 ["bash", "-c",
                  "mkdir -p /etc/systemd/resolved.conf.d && "
@@ -565,3 +570,280 @@ def status(manifest: Manifest, root: Path) -> None:
     P.run(["systemctl", "--no-pager", "status", "secsuite.target"], check=False)
     for svc in SERVICES:
         P.run(["systemctl", "--no-pager", "--lines=0", "status", f"{svc}.service"], check=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# Teardown — the reverse of deploy(). deploy() is purely ADDITIVE: a narrower redeploy (a
+# smaller topology, a dropped --with-inference/--with-agent, a new --without) never removes a
+# component that fell out of it — see SERVICES' own comment above. So the LIVE HOST can be a
+# superset of any single topology.toml/deploy-flags/out/audit combination. Teardown must
+# therefore DISCOVER what THIS host actually has installed and remove exactly that — it must
+# NEVER drive off topology.toml, the deploy flags, or out/audit/*.json (the audit JSON may
+# only annotate, as an optional drift note printed alongside discovery — see teardown() below
+# — never decide what's in the plan).
+#
+# Split for testability (see tests/test_teardown.py), the same shape targets/macos.py uses:
+#   _discover()     — probes the host, returns a FedoraFound. Host-dependent (systemctl/
+#                     getent/the filesystem), so it isn't unit-tested directly — every check
+#                     tolerates absence instead of raising (a fresh host, a partially torn-
+#                     down host, and a host missing systemctl/getent entirely, like this dev
+#                     Mac, all just report less "found" — the exact "tolerate absence" spirit
+#                     status() above already uses for a health check, applied here to
+#                     discovery instead).
+#   teardown_plan() — PURE: FedoraFound + purge -> an ordered list of common.Step. No I/O, so
+#                     tests exercise it directly with synthetic FedoraFound values — the
+#                     ordering/content/--purge-gating logic is fully covered without a real
+#                     Fedora host.
+#   teardown()      — wires the two together: print the plan (+ a best-effort audit drift
+#                     note), stop on --dry-run, else confirm (the main gate, then a SEPARATE
+#                     extra-loud one under --purge) and execute.
+# ─────────────────────────────────────────────────────────────────────────────────────────
+
+# The suite's only two `kind = "stack"` components today (see suite.toml) — hardcoded here,
+# NOT read from a Manifest, because teardown must stay 100% probe-driven: it discovers these
+# by checkout path, never by asking a Manifest/Topology what's "supposed to" be a stack here.
+STACK_NAMES = ("secsso", "secchat")
+ALL_UNIT_NAMES = (*SERVICES, "secsuite.target")
+
+
+def _unit_file(name: str) -> Path:
+    return UNITS / (name if name == "secsuite.target" else f"{name}.service")
+
+
+@dataclass
+class FedoraFound:
+    """What a probe of THIS host actually turned up — see the teardown section docstring
+    above. Every field is a discovered fact, never a topology/flag-derived assumption."""
+
+    units: list[str]                # names (SERVICES + maybe "secsuite.target") with a unit file present
+    users: list[str]                # SERVICES entries whose secsuite-{svc} user exists
+    opt_dirs: list[str]             # SERVICES entries with a code dir under OPT
+    opt_root_exists: bool           # OPT itself exists
+    etc_exists: bool                # the whole ETC (/etc/secsuite) tree exists
+    var_dirs: list[str]             # SERVICES entries with a state dir under VAR
+    var_root_exists: bool           # VAR itself exists
+    anchor_exists: bool             # ANCHORS/secsuite-seccert-root.pem exists
+    resolver_dropin_exists: bool    # RESOLVER_DROPIN exists
+    stacks: list[tuple[str, Path]]  # (name, bootstrap/<name>.sh path) for each stack checkout found
+
+
+def _discover(work: Path) -> FedoraFound:
+    """Probe this host — never raises. A tool/path that isn't there (getent/systemctl on a
+    non-Linux dev box, e.g.) just means less is reported "found", same as status()'s own
+    not-Linux branch above."""
+
+    def _user_exists(user: str) -> bool:
+        if not P.which("getent"):
+            return False
+        return P.run(["getent", "passwd", user], check=False, capture=True).returncode == 0
+
+    stacks: list[tuple[str, Path]] = []
+    for name in STACK_NAMES:
+        boot = work / name / "bootstrap" / f"{name}.sh"
+        if boot.exists():
+            stacks.append((name, boot))
+
+    return FedoraFound(
+        units=[u for u in ALL_UNIT_NAMES if _unit_file(u).exists()],
+        users=[svc for svc in SERVICES if _user_exists(f"secsuite-{svc}")],
+        opt_dirs=[svc for svc in SERVICES if (OPT / svc).is_dir()],
+        opt_root_exists=OPT.is_dir(),
+        etc_exists=ETC.is_dir(),
+        var_dirs=[svc for svc in SERVICES if (VAR / svc).is_dir()],
+        var_root_exists=VAR.is_dir(),
+        anchor_exists=(ANCHORS / "secsuite-seccert-root.pem").is_file(),
+        resolver_dropin_exists=RESOLVER_DROPIN.is_file(),
+        stacks=stacks,
+    )
+
+
+def teardown_plan(found: FedoraFound, purge: bool) -> list[common.Step]:
+    """Pure: the ordered reverse-actions for exactly what ``found`` reports — never consults
+    the topology, deploy flags, or the audit JSON (see the teardown section docstring above).
+    Order matches docs/fedora-fips.md#teardown exactly: services, users, code, config, data
+    (--purge only — nothing under VAR is ever even MENTIONED without --purge), trust anchor,
+    resolver, stacks, then a fixed "not removed" packages note.
+    """
+    steps: list[common.Step] = []
+
+    # 1. services — stop everything BEFORE anything is deleted (a running unit's User=
+    #    mustn't be removed out from under it; rm-ing a unit file that's still
+    #    enabled/running just invites a confusing half-state). rm the unit files before the
+    #    daemon-reload that makes systemd forget them.
+    if found.units:
+        if "secsuite.target" in found.units:
+            steps.append(common.Step(
+                "disable + stop secsuite.target (PartOf= cascades the stop to every member unit)",
+                ["systemctl", "disable", "--now", "secsuite.target"], "services",
+            ))
+        for u in found.units:
+            steps.append(common.Step(f"stop {u}", ["systemctl", "stop", u], "services"))
+            steps.append(common.Step(
+                f"unmask {u} (an operator may have masked it — see secrecorder.env.example)",
+                ["systemctl", "unmask", u], "services",
+            ))
+        for u in found.units:
+            steps.append(common.Step(
+                f"remove unit file {_unit_file(u)}", ["rm", "-f", str(_unit_file(u))], "services",
+            ))
+        steps.append(common.Step(
+            "reload systemd unit definitions", ["systemctl", "daemon-reload"], "services",
+        ))
+
+    # 2. users — AFTER services are stopped. No -r: the state dir is handled separately,
+    #    below, gated on --purge (decoupling user removal from data removal).
+    for svc in found.users:
+        user = f"secsuite-{svc}"
+        steps.append(common.Step(
+            f"remove user {user} (no -r — state dir is handled separately, under --purge)",
+            ["userdel", user], "users",
+        ))
+
+    # 3. code — always (rebuildable from the pinned checkouts).
+    for svc in found.opt_dirs:
+        steps.append(common.Step(
+            f"remove code dir {OPT / svc}", ["rm", "-rf", str(OPT / svc)], "code",
+        ))
+    if found.opt_root_exists:
+        steps.append(common.Step(f"remove {OPT} if now empty", ["rmdir", str(OPT)], "code"))
+
+    # 4. config — always, but every *.env here may hold operator-typed secrets with no
+    #    backup anywhere else (unlike the SecLLM/SecAgent tokens wiring.py caches under
+    #    out/addressing, these are hand-typed and never generated/cached).
+    if found.etc_exists:
+        steps.append(common.Step(
+            f"WARNING: {ETC} holds operator-typed secrets with no backup elsewhere — "
+            "SECCERT_CA_PASSPHRASE, SECCERT_ADMIN_TOKEN, SECAGENT_CLIENT_SECRET, "
+            "SECAGENT_MATTERMOST__BOT_TOKEN in the *.env files — copy it aside first if "
+            "you'll need any of them again", None, "config",
+        ))
+        steps.append(common.Step(f"remove config dir {ETC}", ["rm", "-rf", str(ETC)], "config"))
+
+    # 5. data — --purge ONLY. Nothing under VAR is mentioned at all otherwise.
+    if purge and found.var_dirs:
+        callouts = []
+        if "seccert" in found.var_dirs:
+            callouts.append(
+                "the SecCert CA private key + passphrase — invalidates every cert it has "
+                "issued and the trust anchor already distributed to clients"
+            )
+        if "secagent" in found.var_dirs:
+            callouts.append("the SecAgent CMMC audit log (audit.jsonl)")
+        if callouts:
+            steps.append(common.Step(
+                "IRREVERSIBLE — this also destroys: " + "; and ".join(callouts), None, "data",
+            ))
+        if "secdns" in found.var_dirs:
+            steps.append(common.Step(
+                f"note: {VAR / 'secdns' / 'secdns.zone'} is regenerable from topology.toml "
+                "(not itself a secret) — removed here for completeness, not because it's precious",
+                None, "data",
+            ))
+        for svc in found.var_dirs:
+            steps.append(common.Step(
+                f"remove state dir {VAR / svc}", ["rm", "-rf", str(VAR / svc)], "data",
+            ))
+        if found.var_root_exists:
+            steps.append(common.Step(f"remove {VAR} if now empty", ["rmdir", str(VAR)], "data"))
+
+    # 6. trust anchor — rm before update-ca-trust (so the extract reflects its removal).
+    if found.anchor_exists:
+        anchor = ANCHORS / "secsuite-seccert-root.pem"
+        steps.append(common.Step(
+            f"remove the trust anchor {anchor}", ["rm", "-f", str(anchor)], "trust anchor",
+        ))
+        steps.append(common.Step(
+            "refresh the system trust store", ["update-ca-trust", "extract"], "trust anchor",
+        ))
+
+    # 7. resolver — rm the drop-in before restarting the resolver.
+    if found.resolver_dropin_exists:
+        steps.append(common.Step(
+            f"remove resolver drop-in {RESOLVER_DROPIN}",
+            ["rm", "-f", str(RESOLVER_DROPIN)], "resolver",
+        ))
+        steps.append(common.Step(
+            "restart systemd-resolved to apply", ["systemctl", "restart", "systemd-resolved"], "resolver",
+        ))
+        steps.append(common.Step(
+            "this reverts DNS host-wide — if another host still points its resolver at this "
+            "one for the suite's domain, reverting strands it (operator's call)", None, "resolver",
+        ))
+
+    # 8. stacks (SecSSO/SecChat) — mirrors common.deploy_stacks' own invocation shape.
+    for name, boot in found.stacks:
+        sub = ["down", "-v"] if purge else ["down"]
+        steps.append(common.Step(
+            f"stack {name}: bring down via bootstrap/{name}.sh {' '.join(sub)}"
+            + (" (also wipes its data volume)" if purge else " (config + data volume kept)"),
+            ["bash", str(boot), *sub], "stacks",
+        ))
+
+    # packages — never removed, regardless of --purge or what was found.
+    steps.append(common.Step(
+        "NOT removed (shared): distro packages this host may have installed for the suite "
+        "(nodejs/npm, uv, nginx, certbot, podman) and the global npm package "
+        "@earendil-works/pi-coding-agent — remove manually if you're sure nothing else on "
+        "this host depends on them (an interactive `pi` session in particular needs the npm "
+        "package)", None, "packages",
+    ))
+    return steps
+
+
+def teardown(
+    manifest: Manifest,
+    work: Path,
+    root: Path,
+    dry_run: bool = False,
+    purge: bool = False,
+    assume_yes: bool = False,
+    topology: str | None = None,
+    out: Path | None = None,
+) -> None:
+    """The reverse of deploy() — see the teardown section docstring above. ``topology`` is
+    accepted only for calling-convention symmetry with the CLI/macOS's own ``teardown()``
+    (which uses it as a best-effort /etc/resolver/<domain> hint) — fedora-fips needs no hint
+    from it; every fact this function acts on comes from :func:`_discover`, never from that
+    file. ``root`` is likewise unused here (fedora-fips's reverse actions are all absolute
+    host paths — no repo asset needs locating) — kept for the same calling-convention parity
+    ``status()`` already established (it accepts ``root`` too, and doesn't use it either)."""
+    del root, topology  # unused — see docstring
+    found = _discover(work)
+    plan = teardown_plan(found, purge)
+    print(f"# fedora-fips teardown plan — suite {manifest.suite} — probed from THIS host, "
+          "not from topology.toml/deploy flags/out/audit (deploy is purely additive, so the "
+          "live host may be a superset of any one of those — see docs/fedora-fips.md#teardown)")
+    common.render_teardown_plan(plan)
+    if out is not None:
+        note = common.audit_drift_note(Path(out), NAME)
+        if note:
+            print(f"\n{note}")
+    if dry_run:
+        return
+    if not any(s.command for s in plan):
+        P.log("nothing found to tear down on this host")
+        return
+    if platform.system() != "Linux":
+        P.die(f"fedora-fips teardown must run on the Fedora host (this is {platform.system()}). "
+              "Use --dry-run to preview.")
+    import os
+
+    if os.geteuid() != 0:
+        P.die("fedora-fips teardown must run as root (systemd units + /opt,/etc,/var removal)")
+
+    print()
+    n = sum(1 for s in plan if s.command)
+    if not P.confirm(f"Proceed with fedora-fips teardown ({n} command(s) above)?", assume_yes):
+        P.warn("teardown aborted — nothing changed")
+        return
+    if purge and found.var_dirs:
+        if not P.confirm(
+            f"--purge: ALSO remove {VAR} state data — including the SecCert CA key/"
+            "passphrase and the SecAgent audit log, if present. This cannot be undone. "
+            "Proceed?", assume_yes,
+        ):
+            P.warn(f"--purge declined — {VAR} state data left in place; tearing down everything else")
+            purge = False
+            plan = teardown_plan(found, purge)
+    common.execute_teardown_plan(plan, assume_yes)
+    P.log("fedora-fips teardown complete")

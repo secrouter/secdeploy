@@ -427,6 +427,100 @@ journalctl -u secrouter.service -f
 sudo systemctl restart seccert.service
 ```
 
+## Teardown
+
+`secdeploy teardown fedora-fips` reverses a deploy — it removes the services, users, code,
+config, trust anchor, resolver drop-in, and stack(s) a deploy stood up on **this host**.
+
+```bash
+# Always preview first — prints the exact plan, touches nothing:
+sudo uv run secdeploy teardown fedora-fips --dry-run
+
+# Then run it for real (as root — same requirement as deploy):
+sudo uv run secdeploy teardown fedora-fips
+```
+
+**It discovers, it doesn't assume.** `deploy` is purely *additive* — a narrower redeploy (a
+smaller topology, a dropped `--with-inference`/`--with-agent`, a new `--without`) never
+removes a component that fell out of it, so the live host can be a **superset** of any one
+`topology.toml`/deploy-flags/`out/audit/*.json` combination. `teardown` therefore **probes
+this host directly** (which unit files exist under `/etc/systemd/system`, which
+`secsuite-*` users `getent passwd` finds, which directories exist under `/opt/secsuite`,
+`/etc/secsuite`, `/var/lib/secsuite`, whether the trust anchor and the resolver drop-in are
+present, which stack checkouts have a `bootstrap/<name>.sh`) and removes exactly what it
+finds — never what `topology.toml`, the deploy flags, or a prior audit artifact say *should*
+be here. If a prior deploy's audit JSON exists under `--out`, teardown prints a one-line
+**drift note** naming what it recorded, purely as a courtesy comparison — it never drives
+what gets torn down.
+
+**The plan, in order:** stop + disable `secsuite.target` (cascades via `PartOf=`), then per
+discovered unit `systemctl stop` + `unmask` (an operator may have masked one — see
+`secrecorder.env.example`) + remove the unit file, then `daemon-reload`; remove the
+`secsuite-*` users (**after** services are stopped, `userdel` with **no** `-r` — state stays
+until `--purge`); remove `/opt/secsuite/<svc>` code (always — it's rebuildable); remove
+`/etc/secsuite` config (always, with a printed warning — see below); remove the SecCert trust
+anchor and refresh the trust store; remove the `systemd-resolved` drop-in and restart it; and
+bring down any SecSSO/SecChat stack via its own `bootstrap/<name>.sh down`.
+
+**Safety gates:**
+
+- `--dry-run` prints the full discovered plan and stops — nothing is touched.
+- Without `--dry-run`, the full plan is still printed first, then you're asked to confirm
+  before anything runs; `-y`/`--yes` skips the prompt (for automation).
+- `/etc/secsuite` holds **operator-typed secrets with no backup anywhere else** —
+  `SECCERT_CA_PASSPHRASE`, `SECCERT_ADMIN_TOKEN`, `SECAGENT_CLIENT_SECRET`,
+  `SECAGENT_MATTERMOST__BOT_TOKEN` in the `*.env` files. Teardown prints this warning before
+  removing the directory; copy it aside first if you'll need any of those values again.
+- Distro packages (`nodejs`/`npm`, `uv`, `nginx`, `certbot`, `podman`) and the global npm
+  package `@earendil-works/pi-coding-agent` are **never removed** — they're listed under "NOT
+  removed" only, since an interactive `pi` session (or other tooling) on this host may still
+  depend on them.
+
+### `--purge`: also wiping persistent data
+
+Without `--purge`, `/var/lib/secsuite` is **never even mentioned**. `--purge` adds
+`rm -rf /var/lib/secsuite/<svc>` for every discovered service, and asks a **second, separate,
+extra-loud confirmation** before doing it — because for two services this is irreversible in
+a way the rest of teardown isn't:
+
+- **SecCert** (`/var/lib/secsuite/seccert`) holds the **CA private key and its passphrase**.
+  Deleting it invalidates every certificate SecCert has issued *and* the trust anchor already
+  distributed to every client that trusts it — there is no undo.
+- **SecAgent** (`/var/lib/secsuite/secagent`) holds the **CMMC audit log**
+  (`audit/audit.jsonl`) — required evidence, not just working state.
+
+Back up `/var/lib/secsuite/{seccert,secagent}` (and `out/audit/` from any host that ran a
+deploy) *before* confirming `--purge` if you might need either again. Declining the
+purge-specific confirmation does **not** abort the rest of the teardown — it just leaves
+`/var/lib/secsuite` in place and continues with everything else. Note that
+`/var/lib/secsuite/secdns/secdns.zone` is removed under `--purge` too, purely for
+completeness — unlike the two above, it's fully regenerable from `topology.toml` and isn't
+itself a secret.
+
+### Stacks (SecSSO / SecChat)
+
+If a stack's checkout (`work/secsso` or `work/secchat`, i.e. it has a
+`bootstrap/<name>.sh`) is present, teardown brings it down via that same script:
+`bootstrap/<name>.sh down` (config and its data volume kept) — or `down -v` under `--purge`,
+which also wipes the stack's own data volume.
+
+### Resolver: a host-wide, cross-host caveat
+
+Removing `/etc/systemd/resolved.conf.d/secsuite.conf` reverts this host's DNS resolution
+host-wide. If **another** host still points its resolver at this one for the suite's
+domain, tearing this down strands it — that's an operator call teardown can't make for you.
+
+### What teardown does *not* do
+
+- It never runs `git`, and never touches `topology.toml`, `suite.toml`, or any deploy flag —
+  see "it discovers, it doesn't assume" above.
+- It never removes a distro package, or the global `pi` npm package — see "NOT removed"
+  above.
+- It doesn't attempt to detect a SecSSO/SecChat stack that's still *running* if its checkout
+  under `work/` has been deleted since the deploy that brought it up — there's no
+  `bootstrap/<name>.sh` left to invoke `down` with in that case, so it's left running. Bring
+  it down by hand (`docker`/`podman compose down`) first if that's happened.
+
 ## Hardening applied
 
 The units set `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,

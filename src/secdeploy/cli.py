@@ -1,13 +1,16 @@
 """``secdeploy`` — the suite release/deploy CLI.
 
 Subcommands:
-  verify   validate the manifest and that each target's assets are present
-  plan     show what a target deploy would do (pinned versions + steps)
-  fetch    git clone/checkout every component at its pinned ref into ./work
-  build    fetch, then build the target's artifacts into ./out
-  bundle   produce an air-gapped release bundle (+ SHA256SUMS)
-  deploy   stand the suite up on this host for a target (use --dry-run to preview)
-  status   report health of a deployed target
+  verify    validate the manifest and that each target's assets are present
+  plan      show what a target deploy would do (pinned versions + steps)
+  fetch     git clone/checkout every component at its pinned ref into ./work
+  build     fetch, then build the target's artifacts into ./out
+  bundle    produce an air-gapped release bundle (+ SHA256SUMS)
+  deploy    stand the suite up on this host for a target (use --dry-run to preview)
+  status    report health of a deployed target
+  teardown  remove what a deploy installed on THIS host (discovers what's actually here —
+            never trusts topology.toml/deploy flags/the audit JSON; use --dry-run to preview,
+            --purge to also remove persistent data)
 
 Optional infra (SecCert, SecSSO) can be dropped with ``--without seccert,secsso`` when you
 already run that infrastructure.
@@ -209,6 +212,16 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_teardown(args) -> int:
+    m = Manifest.load(args.manifest)
+    mod = _target_mod(args.target)
+    mod.teardown(
+        m, work=Path(args.work), root=_root(args), dry_run=args.dry_run,
+        purge=args.purge, assume_yes=args.yes, topology=args.topology, out=Path(args.out),
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="secdeploy", description=__doc__.splitlines()[0])
     p.add_argument("--manifest", default="suite.toml", help="release manifest (default: suite.toml)")
@@ -303,6 +316,35 @@ def build_parser() -> argparse.ArgumentParser:
              "additionally installs pi + secagent and starts the secagent service). "
              "fedora-fips only; macOS prints a native note instead (see docs/fedora-fips.md)",
     )
+
+    tp = sub.add_parser(
+        "teardown",
+        help="remove what a deploy installed on this host — discovers what's actually here, "
+             "never trusts topology.toml/deploy flags/the audit JSON (see docs)",
+    )
+    tp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+    tp.add_argument(
+        "--dry-run", action="store_true",
+        help="print the discovered plan and stop — touches nothing",
+    )
+    tp.add_argument(
+        "--purge", action="store_true",
+        help="also remove persistent DATA (/var/lib/secsuite, or the seccert-data compose "
+             "volume) — IRREVERSIBLE: destroys the SecCert CA key + any audit log. Asks a "
+             "SEPARATE, extra-loud confirmation naming exactly what's lost",
+    )
+    tp.add_argument(
+        "-y", "--yes", action="store_true",
+        help="skip confirmation prompts (for automation) — including the --purge one and, on "
+             "macOS, the /etc/hosts line's own confirmation",
+    )
+    tp.add_argument(
+        "--topology", default="topology.toml",
+        help="site placement file (optional). NOT used to decide what's installed (teardown "
+             "always discovers that) — used ONLY as a best-effort hint for which "
+             "/etc/resolver/<domain> entry to remove on macOS, when more than one exists",
+    )
+    tp.set_defaults(fn=cmd_teardown)
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")
     fp.add_argument("--component", help="only fetch this component")

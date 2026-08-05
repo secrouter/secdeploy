@@ -8,6 +8,8 @@ comes up first as the internal CA; its root is exported so hosts/clients can tru
 from __future__ import annotations
 
 import re
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import common
@@ -142,7 +144,11 @@ def _configure_resolver(domain: str, dns_ip: str, assume_yes: bool = False) -> b
     return True
 
 
-def _ca_already_trusted(root_pem: Path) -> bool:
+def _extract_cn(root_pem: Path) -> str | None:
+    """The CN of the cert at ``root_pem`` (openssl x509 -noout -subject). Shared by
+    :func:`_ca_already_trusted` (forward direction, during ``deploy --trust-ca``) and
+    teardown's own keychain-removal discovery (below), so the two can never disagree on
+    which CN they mean."""
     import subprocess
 
     subj = subprocess.run(
@@ -150,13 +156,21 @@ def _ca_already_trusted(root_pem: Path) -> bool:
         capture_output=True, text=True, check=False,
     ).stdout
     m = re.search(r"CN\s*=\s*([^,/\n]+)", subj)
-    if not m:
-        return False
-    cn = m.group(1).strip()
+    return m.group(1).strip() if m else None
+
+
+def _cn_trusted(cn: str) -> bool:
+    import subprocess
+
     return subprocess.run(
         ["security", "find-certificate", "-c", cn, "/Library/Keychains/System.keychain"],
         capture_output=True, check=False,
     ).returncode == 0
+
+
+def _ca_already_trusted(root_pem: Path) -> bool:
+    cn = _extract_cn(root_pem)
+    return cn is not None and _cn_trusted(cn)
 
 
 def _trust_ca_root(root: Path, assume_yes: bool = False) -> bool:
@@ -606,3 +620,286 @@ def _os_environ() -> dict[str, str]:
     import os
 
     return dict(os.environ)
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# Teardown — the reverse of deploy(). See targets/fedora_fips.py's own teardown section for
+# the full PROBE-not-topology rationale (deploy is purely additive, so the host may be a
+# superset of any one topology.toml/flag combination) — the same principle applies here: this
+# module discovers what's actually on THIS Mac and removes what it finds, never trusting
+# topology.toml/deploy flags/out/audit/*.json to decide the plan (the audit JSON may only
+# annotate — see the drift note in teardown() below).
+#
+# Same (discover, teardown_plan, teardown) split for testability as fedora-fips — see
+# tests/test_teardown.py. Like fedora-fips, teardown brings down any SecSSO/SecChat stack it
+# finds a checkout for (work/<name>/bootstrap/<name>.sh down [-v]).
+# ─────────────────────────────────────────────────────────────────────────────────────────
+
+
+def _topology_domain_hint(topology_path: str | None) -> str | None:
+    """Best-effort ONLY: the bare ``domain`` key from ``--topology``, if it's given and
+    parses — used SOLELY to disambiguate which ``/etc/resolver/<domain>`` entry teardown
+    should remove when more than one exists (see :func:`teardown_plan` below). NEVER used to
+    decide what's installed — a missing, stale, or invalid topology.toml just falls back to
+    plain discovery (list ``/etc/resolver``, and if more than one entry remains ambiguous,
+    print them and don't guess) instead of raising. Deliberately avoids
+    :meth:`secdeploy.topology.Topology.load` here — that validates the WHOLE file against the
+    current manifest, which is more than teardown needs (just one string) and would make a
+    stale/unrelated topology.toml break teardown instead of just not helping it."""
+    if not topology_path:
+        return None
+    try:
+        data = tomllib.loads(Path(topology_path).read_text())
+    except (OSError, ValueError):  # missing/unreadable file, or tomllib.TOMLDecodeError
+        return None
+    domain = data.get("domain")
+    return domain if isinstance(domain, str) and domain else None
+
+
+@dataclass
+class MacosFound:
+    """What a probe of THIS host actually turned up — see the teardown section docstring
+    above. Every field is a discovered fact, never a topology/flag-derived assumption."""
+
+    docker_present: bool
+    compose_cmd: list[str]         # resolved `docker compose` vs `docker-compose` (_compose_cmd)
+    compose_file: Path | None      # deploy/macos/compose.yaml, if this checkout has it
+    compose_containers: bool       # any container (running or stopped) for the compose project
+    compose_volumes: bool          # any docker volume labeled for the compose project
+    images: list[str]              # locally present secrouter/{seccert,secrouter}:<tag> refs
+    resolver_domains: list[str]    # names of files under /etc/resolver
+    domain_hint: str | None        # best-effort, from --topology (see _topology_domain_hint)
+    hosts_line_present: bool       # /etc/hosts mentions CERT_HOST (loose check — discovery
+                                   # only; the removal COMMAND below still only ever matches
+                                   # one exact whole line, never a substring)
+    keychain_cn: str | None        # SecCert root's CN, IF it is currently trusted (else None)
+    out_exists: bool               # <root>/out exists
+    root: Path
+    stacks: list[tuple[str, Path]]  # (name, bootstrap/<name>.sh) per stack checkout found
+
+
+def _discover(root: Path, work: Path, topology_path: str | None = None) -> MacosFound:
+    """Probe this host — never raises. Every docker call tolerates the daemon being down
+    (Colima stopped) by treating a failed probe as "found nothing" plus a warning — the same
+    tolerate-absence spirit as status() and fedora_fips._discover()."""
+    docker_present = bool(P.which("docker"))
+    compose_cmd = _compose_cmd() if docker_present else ["docker", "compose"]
+    compose_path = _compose(root)
+    compose_file = compose_path if compose_path.exists() else None
+    compose_containers = compose_volumes = False
+    images: list[str] = []
+    if docker_present:
+        if compose_file is not None:
+            r = P.run(compose_cmd + ["-f", str(compose_file), "ps", "-a", "-q"],
+                      check=False, capture=True)
+            if r.returncode == 0:
+                compose_containers = bool(r.stdout.strip())
+            else:
+                P.warn("docker compose ps failed — is Docker/Colima running? skipping "
+                       "compose container discovery")
+        rv = P.run(["docker", "volume", "ls", "-q",
+                   "--filter", "label=com.docker.compose.project=secsuite"],
+                  check=False, capture=True)
+        if rv.returncode == 0:
+            compose_volumes = bool(rv.stdout.strip())
+        ri = P.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                  check=False, capture=True)
+        if ri.returncode == 0:
+            images = sorted(
+                ln for ln in ri.stdout.splitlines()
+                if ln.startswith("secrouter/seccert:") or ln.startswith("secrouter/secrouter:")
+            )
+    resolver_dir = Path("/etc/resolver")
+    resolver_domains = sorted(p.name for p in resolver_dir.iterdir()) if resolver_dir.is_dir() else []
+    hosts_path = Path("/etc/hosts")
+    hosts_line_present = hosts_path.exists() and CERT_HOST in hosts_path.read_text()
+    keychain_cn = None
+    root_pem = root / "out" / "seccert-root.pem"
+    if root_pem.exists():
+        cn = _extract_cn(root_pem)
+        if cn and _cn_trusted(cn):
+            keychain_cn = cn
+    from .fedora_fips import STACK_NAMES
+    stacks: list[tuple[str, Path]] = []
+    for name in STACK_NAMES:
+        boot = work / name / "bootstrap" / f"{name}.sh"
+        if boot.exists():
+            stacks.append((name, boot))
+    return MacosFound(
+        docker_present=docker_present, compose_cmd=compose_cmd, compose_file=compose_file,
+        compose_containers=compose_containers, compose_volumes=compose_volumes, images=images,
+        resolver_domains=resolver_domains, domain_hint=_topology_domain_hint(topology_path),
+        hosts_line_present=hosts_line_present, keychain_cn=keychain_cn,
+        out_exists=(root / "out").is_dir(), root=root, stacks=stacks,
+    )
+
+
+def teardown_plan(found: MacosFound, purge: bool) -> list[common.Step]:
+    """Pure — see fedora_fips.teardown_plan's docstring for the same PROBE-not-topology
+    contract. Order mirrors docs/macos.md#teardown: compose, native-services guidance,
+    resolver, /etc/hosts, keychain, out/ artifacts (--purge only), then a fixed "not removed"
+    packages note."""
+    steps: list[common.Step] = []
+
+    # 1. compose — `down` (config/volumes kept) whenever something's actually there for this
+    #    project; `down -v` (wipes seccert-data, the CA) plus offering to remove built images
+    #    (compose down never removes images), --purge only.
+    if found.compose_file is not None and (found.compose_containers or found.compose_volumes):
+        sub = ["down", "-v"] if purge else ["down"]
+        note = " — also wipes seccert-data (the CA)" if purge else " (config/volumes kept)"
+        steps.append(common.Step(
+            f"bring down the macOS compose stack{note}",
+            found.compose_cmd + ["-f", str(found.compose_file), *sub], "compose",
+        ))
+    if purge:
+        for img in found.images:
+            steps.append(common.Step(
+                f"remove built image {img} (compose down doesn't remove images; rebuildable "
+                "via `secdeploy build macos`)", ["docker", "rmi", img], "compose",
+            ))
+
+    # 2. native services — secdns/secllm/secagent/secproxy run natively here with no PID or
+    #    launchd unit secdeploy tracks — DOCUMENT only, never auto-pkill (a fuzzy match risks
+    #    killing an unrelated host process bound to the same shared port).
+    steps.append(common.Step(
+        "secdns/secllm/secagent/secproxy run natively on macOS with no PID/launchd unit "
+        "secdeploy can target — Ctrl-C the foreground terminal each is running in, or use "
+        "the patterns below AFTER confirming they actually name your process (`pgrep -fl "
+        "<pattern>` first): nginx and secdns bind ports other host processes may also use, "
+        "so a fuzzy pkill can kill something unrelated. NEVER auto-run these:",
+        None, "native_services",
+    ))
+    for label, pattern, needs_sudo in (
+        ("secdns", "secdns serve", False), ("secllm", "secllm serve", False),
+        ("secagent", "secagent chat serve", False),
+        # secproxy's own native run command is `sudo nginx -c ... -g 'daemon off;'` (docs/
+        # macos.md) — nginx binds :443/:80 and runs as root here, so killing it needs sudo too.
+        ("secproxy", "nginx -c .*secproxy", True),
+    ):
+        prefix = "sudo " if needs_sudo else ""
+        steps.append(common.Step(f"{label}: {prefix}pkill -f '{pattern}'", None, "native_services"))
+
+    # 3. /etc/resolver/<domain> — only when unambiguous (an explicit --topology hint that
+    #    matches an existing entry, or exactly one entry present); otherwise print the
+    #    candidates and don't guess.
+    target_domain: str | None = None
+    if found.domain_hint and found.domain_hint in found.resolver_domains:
+        target_domain = found.domain_hint
+    elif len(found.resolver_domains) == 1:
+        target_domain = found.resolver_domains[0]
+    elif len(found.resolver_domains) > 1:
+        steps.append(common.Step(
+            f"/etc/resolver has {len(found.resolver_domains)} entries "
+            f"({', '.join(found.resolver_domains)}) and no --topology hint matched one of "
+            "them — not guessing which is this suite's; pass --topology, or remove the "
+            "right one by hand: sudo rm -f /etc/resolver/<domain>", None, "resolver",
+        ))
+    if target_domain:
+        steps.append(common.Step(
+            f"remove resolver entry for {target_domain}",
+            ["sudo", "rm", "-f", f"/etc/resolver/{target_domain}"], "resolver",
+        ))
+
+    # 4. /etc/hosts — ONLY the exact whole line, ONLY with its own explicit confirmation
+    #    (execute_teardown_plan's `gated`, wired in teardown() below): Docker Desktop may
+    #    write this SAME line itself, so a substring strip is never safe here.
+    if found.hosts_line_present:
+        pattern = f"/^127\\.0\\.0\\.1[[:space:]]+{re.escape(CERT_HOST)}[[:space:]]*$/d"
+        steps.append(common.Step(
+            f"remove the exact line '127.0.0.1 {CERT_HOST}' from /etc/hosts — needs its OWN "
+            "confirmation (below): Docker Desktop may also own this exact line, so only a "
+            "whole-line match is ever touched, never a substring strip",
+            ["sudo", "sed", "-i", "", "-E", pattern, "/etc/hosts"], "hosts",
+        ))
+
+    # 5. keychain — reverse _trust_ca_root via the exact same CN _ca_already_trusted extracts.
+    if found.keychain_cn:
+        steps.append(common.Step(
+            f"remove the SecCert root ({found.keychain_cn!r}) from the System keychain",
+            ["sudo", "security", "delete-certificate", "-c", found.keychain_cn,
+             "/Library/Keychains/System.keychain"], "keychain",
+        ))
+
+    # 6. out/ build artifacts — --purge only; never even mentioned otherwise. Nothing here is
+    #    un-rebuildable, but it DOES cache the same kind of no-backup-elsewhere secrets as
+    #    fedora's /etc/secsuite warning above.
+    if purge and found.out_exists:
+        steps.append(common.Step(
+            f"IRREVERSIBLE — {found.root / 'out'} also caches seccert-root.pem and the "
+            "secllm-shared-token/secagent-webhook-secret used by any OTHER live deploy that "
+            "shares this --out — copy it aside first if one does",
+            None, "artifacts",
+        ))
+        steps.append(common.Step(
+            f"remove build artifacts {found.root / 'out'}",
+            ["rm", "-rf", str(found.root / "out")], "artifacts",
+        ))
+
+    # stacks (SecSSO/SecChat) — same as fedora-fips; mirrors common.deploy_stacks' invocation.
+    for name, boot in found.stacks:
+        sub = ["down", "-v"] if purge else ["down"]
+        steps.append(common.Step(
+            f"stack {name}: bring down via bootstrap/{name}.sh {' '.join(sub)}"
+            + (" (also wipes its data volume)" if purge else " (config + data volume kept)"),
+            ["bash", str(boot), *sub], "stacks",
+        ))
+
+    # packages — never removed, regardless of --purge or what was found.
+    steps.append(common.Step(
+        "NOT removed (shared): brew packages this host may have installed for the suite "
+        "(colima, docker, uv, ffmpeg, nginx, certbot) — remove manually if you're sure "
+        "nothing else on this host depends on them", None, "packages",
+    ))
+    return steps
+
+
+def teardown(
+    manifest: Manifest,
+    work: Path,
+    root: Path,
+    dry_run: bool = False,
+    purge: bool = False,
+    assume_yes: bool = False,
+    topology: str | None = None,
+    out: Path | None = None,
+) -> None:
+    """The reverse of deploy() — see the teardown section docstring above. ``topology`` is
+    used ONLY as a best-effort hint for which ``/etc/resolver/<domain>`` entry to remove (see
+    :func:`_topology_domain_hint`) — never to decide what's installed. ``work`` locates the
+    SecSSO/SecChat stack checkouts (work/<name>/bootstrap/<name>.sh) to bring them down, same
+    as fedora-fips."""
+    found = _discover(root, work, topology)
+    plan = teardown_plan(found, purge)
+    print(f"# macos teardown plan — suite {manifest.suite} — probed from THIS host, not from "
+          "topology.toml/deploy flags/out/audit (see docs/macos.md#teardown)")
+    common.render_teardown_plan(plan)
+    if out is not None:
+        note = common.audit_drift_note(Path(out), NAME)
+        if note:
+            print(f"\n{note}")
+    if dry_run:
+        return
+    if not any(s.command for s in plan):
+        P.log("nothing found to tear down on this host")
+        return
+    print()
+    n = sum(1 for s in plan if s.command)
+    if not P.confirm(f"Proceed with macOS teardown ({n} command(s) above)?", assume_yes):
+        P.warn("teardown aborted — nothing changed")
+        return
+    if purge and (found.compose_volumes or found.out_exists):
+        if not P.confirm(
+            "--purge: ALSO wipe the seccert-data volume (the CA) and out/'s cached secrets "
+            "(seccert-root.pem, the SecLLM/SecAgent shared tokens). This cannot be undone. "
+            "Proceed?", assume_yes,
+        ):
+            P.warn("--purge declined — seccert-data/out/ left in place; tearing down everything else")
+            purge = False
+            plan = teardown_plan(found, purge)
+    common.execute_teardown_plan(
+        plan, assume_yes,
+        gated={"hosts": f"Remove the exact line '127.0.0.1 {CERT_HOST}' from /etc/hosts? "
+                        "Docker Desktop may also own this line — only that one exact line is "
+                        "touched, nothing else."},
+    )
+    P.log("macOS teardown complete")

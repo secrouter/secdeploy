@@ -250,10 +250,121 @@ curl -s http://localhost:47002/health    # SecRouter (dev mode by default)
 
 ## Teardown
 
+`secdeploy teardown macos` reverses a deploy — bringing the compose stack and any SecSSO/SecChat
+stack down, and reverting the resolver/`/etc/hosts`/keychain changes `--configure-resolver`/`--configure-hosts`/
+`--trust-ca` made — for decommissioning or resetting between evals.
+
+```bash
+# Always preview first — prints the exact plan, touches nothing:
+uv run secdeploy teardown macos --dry-run
+
+# Then run it for real:
+uv run secdeploy teardown macos
+```
+
+Equivalent to (but discovered, not hand-run):
+
 ```bash
 docker compose -f deploy/macos/compose.yaml down            # keep the CA volume
-docker compose -f deploy/macos/compose.yaml down -v         # also wipe SecCert state
+docker compose -f deploy/macos/compose.yaml down -v         # also wipe SecCert state (--purge)
 ```
+
+**It discovers, it doesn't assume.** Same principle as `fedora-fips` (see
+[fedora-fips.md#teardown](fedora-fips.md#teardown)): `deploy` is purely additive, so this
+Mac can be a superset of any one `topology.toml`/deploy-flags combination. Teardown probes
+Docker directly (which containers/volumes exist for the `secsuite` compose project, which
+`secrouter/{seccert,secrouter}` images are built), lists `/etc/resolver` and checks
+`/etc/hosts` and the System keychain itself, rather than trusting what was last deployed.
+If a prior deploy's audit JSON exists under `--out`, it prints a one-line drift note (never
+the driver of the plan — see fedora-fips.md's own note on this).
+
+**Safety gates:** `--dry-run` prints the full plan and stops. A real run prints the plan,
+then asks you to confirm before doing anything; `-y`/`--yes` skips it. Two steps below carry
+their **own** extra confirmation on top of that, because they touch state another program
+might also own.
+
+### Native services: teardown cannot stop them
+
+`secdns`, `secllm`, `secagent`, and `secproxy` (nginx) all run **natively** on macOS with no
+PID or launchd unit secdeploy tracks (see [Internal DNS](#internal-dns-internal-on-macos) and
+[SecProxy](#secproxy-edge-reverse-proxy) above) — teardown can't stop them for you. It prints
+guidance instead: Ctrl-C the foreground terminal each is running in, or — only after
+confirming the PID actually belongs to your process (`pgrep -fl <pattern>` first) —
+
+```bash
+pkill -f 'secdns serve'
+pkill -f 'secllm serve'
+pkill -f 'secagent chat serve'
+sudo pkill -f 'nginx -c .*secproxy'   # secproxy runs as root (sudo nginx ...) — see above
+```
+
+**These are never run automatically.** `nginx` and `secdns` bind ports other host processes
+may also use, so a fuzzy `pkill -f` match can kill something unrelated to this suite —
+verify the PID first.
+
+### `/etc/resolver/<domain>` and the cross-host resolver caveat
+
+If `--configure-resolver` pointed this Mac's resolver at `secdns` for the suite's domain,
+teardown removes `/etc/resolver/<domain>`. It gets `<domain>` from `--topology` if you pass
+one (matched against what's actually present under `/etc/resolver`); otherwise it lists
+`/etc/resolver` itself. If there's exactly one entry, that's unambiguous. If there's more
+than one and no `--topology` hint matches, teardown **prints the candidates and does not
+guess** — pass `--topology`, or remove the right one by hand.
+
+Like fedora-fips's `systemd-resolved` drop-in, this is host-wide: if **another** host still
+relies on this Mac's resolver config for the suite's domain, removing it strands that host —
+an operator call teardown can't make for you.
+
+### `/etc/hosts`: only the exact line, only with its own confirmation
+
+If `--configure-hosts` added `127.0.0.1 host.docker.internal`, teardown can remove it — but
+**only** that exact whole line, via an anchored match, and **only** after its own separate
+confirmation (in addition to the main one above). Docker Desktop can write this identical
+line itself, so a substring strip is never safe here; if the confirmation is declined, the
+line is left in place and everything else in the plan still proceeds.
+
+### Keychain: reverting `--trust-ca`
+
+If the SecCert root is currently trusted in the System keychain, teardown extracts its CN
+the same way `--trust-ca`'s own trust check does (`openssl x509 -noout -subject`) and runs
+`security delete-certificate -c "<CN>" /Library/Keychains/System.keychain`. If the local
+`out/seccert-root.pem` this reads the CN from isn't present (e.g. `out/` was already cleaned
+on this checkout), teardown has no way to identify the CN and skips this step — remove it by
+hand with the CN from wherever you still have the cert.
+
+### `--purge`: also wiping the CA and cached secrets
+
+Without `--purge`, `docker compose down` keeps the `seccert-data` volume and `out/` is left
+alone entirely. `--purge` changes the compose step to `down -v` (which **wipes
+`seccert-data` — the CA**), offers `docker rmi` for any built `secrouter/{seccert,secrouter}`
+image (compose down never removes images; they're rebuildable via `secdeploy build macos`),
+and offers to remove `out/` — which caches `out/seccert-root.pem` plus the SecLLM/SecAgent
+shared tokens (`secllm-shared-token`, `secagent-webhook-secret`) another *live* deploy
+sharing this same `--out` may still depend on.
+
+`--purge` asks a **second, separate, extra-loud** confirmation before any of this, naming
+exactly what's lost: wiping `seccert-data` destroys the CA private key the same way
+fedora-fips's `/var/lib/secsuite/seccert` purge does (see
+[fedora-fips.md#--purge-also-wiping-persistent-data](fedora-fips.md#--purge-also-wiping-persistent-data))
+— every cert it issued, and the trust anchor already distributed to clients, become invalid.
+Back up whatever you need from `seccert-data`/`out/` first. Declining this second
+confirmation doesn't abort the rest of the teardown — it just leaves `seccert-data` and
+`out/` in place and continues with everything else (compose `down` without `-v`, resolver,
+`/etc/hosts`, keychain).
+
+### brew packages: never removed
+
+`colima`, `docker`, `uv`, `ffmpeg`, `nginx`, and `certbot` are never uninstalled — they're
+listed under "NOT removed" only, since other tools on this Mac may depend on them.
+
+### What teardown does *not* do
+
+- It never runs `git`, and never touches `topology.toml`/deploy flags to decide what's
+  installed — see "it discovers, it doesn't assume" above.
+- It can't stop the **native** services (SecDNS/SecLLM/SecAgent/nginx-secproxy) — they run as
+  foreground processes with no PID/launchd unit secdeploy tracks. The plan prints the exact
+  `pkill` patterns (confirm with `pgrep -fl` first — they bind shared ports); stop them
+  yourself, or Ctrl-C their terminals.
 
 ## Notes
 
