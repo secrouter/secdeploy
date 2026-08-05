@@ -344,6 +344,24 @@ resource = "mac"
     # all five native services are launchd units
     for name in ("secdns", "secllm", "secagent", "secrecorder", "secproxy"):
         assert f"internal.secsuite.{name}" in out
+    # SecDNS runs from an ABSOLUTE venv binary (launchd resolves relative paths unpredictably —
+    # a relative out/ path was why the daemon installed but never served :53)
+    secdns_line = next(ln for ln in out.splitlines() if "internal.secsuite.secdns (" in ln)
+    prog = secdns_line.split("): ", 1)[1].split()[0]
+    assert prog.startswith("/") and prog.endswith("/work/secdns/.venv/bin/secdns")
+
+
+def test_macos_venv_helpers(tmp_path):
+    from secdeploy.targets import macos
+
+    root = tmp_path
+    assert macos._venv_bin(root, "secdns", "secdns") == \
+        root / "work" / "secdns" / ".venv" / "bin" / "secdns"
+    # present venv → True (no sync attempted)
+    (root / "work" / "secdns" / ".venv" / "bin").mkdir(parents=True)
+    assert macos._ensure_native_venv(root, "secdns") is True
+    # absent venv + no checkout/pyproject → False (nothing to sync from)
+    assert macos._ensure_native_venv(root, "secllm") is False
 
 
 def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):

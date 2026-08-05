@@ -425,6 +425,30 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return env
 
 
+def _venv_bin(root: Path, project: str, script: str) -> Path:
+    """Absolute path to a console script inside a native service's project venv (created by
+    ``build`` / ``uv sync``). The launchd daemon runs straight from here rather than through
+    ``uv run``: a root-run service (SecDNS) then never invokes ``uv`` against the user-owned
+    checkout, and no service depends on ``uv`` being resolvable in launchd's minimal environment
+    (`uv run` in that context was the reported not-starting failure)."""
+    return root / "work" / project / ".venv" / "bin" / script
+
+
+def _ensure_native_venv(root: Path, name: str) -> bool:
+    """Make sure ``work/<name>/.venv`` exists before installing a daemon that runs from it.
+    ``build`` pre-syncs it, but a deploy that skipped ``build`` (or an older ``build`` that didn't
+    cover this service) would otherwise install a daemon whose command can't start — the reported
+    "installed but nothing is listening". Synced as the invoking user; returns whether a usable
+    venv is present afterward."""
+    proj = root / "work" / name
+    if (proj / ".venv" / "bin").is_dir():
+        return True
+    if P.which("uv") and (proj / "pyproject.toml").exists():
+        P.warn(f"{name}: project venv missing — building it now (uv sync --project work/{name})")
+        P.run(["uv", "sync", "--project", str(proj)], check=False)
+    return (proj / ".venv" / "bin").is_dir()
+
+
 def _install_or_note(
     svc: launchd.LaunchdService, staging_dir: Path, *,
     native_services: bool, dry_run: bool, fallback_note: str,
@@ -555,11 +579,13 @@ def deploy(
             continue
         P.run(cmd, env={**_os_environ(), **env})
 
-    base_out = Path(out) if out is not None else root / "out"
+    # ABSOLUTE — launchd resolves a relative WorkingDirectory/StandardOutPath/zone path
+    # unpredictably (its cwd is /), so every path baked into a plist must be absolute. `root` is
+    # already absolute (cli._root); resolve `out` (defaults to the relative "out") to match.
+    base_out = (Path(out) if out is not None else root / "out").resolve()
     staging_dir = base_out / "launchd"
     log_dir = base_out / "logs"
     user, home = _native_user()
-    uv = P.which("uv")
 
     # CA / host-trust setup — independent of any one service, needs the SecCert root the compose
     # steps exported. Pulled ahead of the native services so the trust anchor is in place before
@@ -583,13 +609,12 @@ def deploy(
         fallback = (f"sudo SECDNS_DOMAIN={topology.domain} SECDNS_ZONE={zone} "
                     f"SECDNS_UPSTREAM={','.join(topology.upstream_dns)} "
                     f"uv run --project work/secdns secdns serve")
-        if uv is None and native_services and not dry_run:
-            P.warn(f"uv not found — cannot install secdns; start it yourself: {fallback}")
+        if not dry_run and native_services and not _ensure_native_venv(root, "secdns"):
+            P.warn(f"secdns: no project venv — run `secdeploy build macos`, then start it: {fallback}")
         else:
             secdns = launchd.LaunchdService(
                 name="secdns",
-                program_args=[uv or "uv", "run", "--no-sync", "--project",
-                              str(root / "work" / "secdns"), "secdns", "serve"],
+                program_args=[str(_venv_bin(root, "secdns", "secdns")), "serve"],
                 log_dir=log_dir,
                 env={**_base_env(), "SECDNS_DOMAIN": topology.domain, "SECDNS_ZONE": str(zone),
                      "SECDNS_UPSTREAM": ",".join(topology.upstream_dns), "SECDNS_PORT": "53",
@@ -622,17 +647,19 @@ def deploy(
         port = manifest.components["secllm"].port
         fallback = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND=mock "
                     f"uv run --project work/secllm secllm serve")
-        secllm = launchd.LaunchdService(
-            name="secllm",
-            program_args=[uv or "uv", "run", "--no-sync", "--project",
-                          str(root / "work" / "secllm"), "secllm", "serve"],
-            log_dir=log_dir,
-            env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(port),
-                 "SECLLM_BACKEND": "mock"},
-            working_dir=str(root), user=user,
-        )
-        _install_or_note(secllm, staging_dir, native_services=native_services,
-                         dry_run=dry_run, fallback_note=fallback)
+        if not dry_run and native_services and not _ensure_native_venv(root, "secllm"):
+            P.warn(f"secllm: no project venv — run `secdeploy build macos`, then start it: {fallback}")
+        else:
+            secllm = launchd.LaunchdService(
+                name="secllm",
+                program_args=[str(_venv_bin(root, "secllm", "secllm")), "serve"],
+                log_dir=log_dir,
+                env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(port),
+                     "SECLLM_BACKEND": "mock"},
+                working_dir=str(root), user=user,
+            )
+            _install_or_note(secllm, staging_dir, native_services=native_services,
+                             dry_run=dry_run, fallback_note=fallback)
 
     # secagent — opt-in chat bridge, now with REAL env layering: the generated addressing env
     # (LLM/SecSSO/Mattermost wiring + webhook secret) + the SECAGENT_* operator secrets are folded
@@ -649,17 +676,19 @@ def deploy(
                          if k.startswith("SECAGENT_")}
         fallback = (f"uv run --project work/secagent secagent chat serve --port {port} "
                     "(source out/addressing/env/secagent.env first)")
-        secagent = launchd.LaunchdService(
-            name="secagent",
-            program_args=[uv or "uv", "run", "--no-sync", "--project",
-                          str(root / "work" / "secagent"), "secagent", "chat", "serve",
-                          "--port", str(port)],
-            log_dir=log_dir,
-            env={**_base_env(home), **agent_env, **agent_secrets},
-            working_dir=str(root), user=user,
-        )
-        _install_or_note(secagent, staging_dir, native_services=native_services,
-                         dry_run=dry_run, fallback_note=fallback)
+        if not dry_run and native_services and not _ensure_native_venv(root, "secagent"):
+            P.warn(f"secagent: no project venv — run `secdeploy build macos`, then start it: {fallback}")
+        else:
+            secagent = launchd.LaunchdService(
+                name="secagent",
+                program_args=[str(_venv_bin(root, "secagent", "secagent")), "chat", "serve",
+                              "--port", str(port)],
+                log_dir=log_dir,
+                env={**_base_env(home), **agent_env, **agent_secrets},
+                working_dir=str(root), user=user,
+            )
+            _install_or_note(secagent, staging_dir, native_services=native_services,
+                             dry_run=dry_run, fallback_note=fallback)
 
     # SecRecorder — native MLX/Metal (never containerized on macOS). Runs as the user; TLS optional
     # (a SecCert cert via certbot, reachable across the container boundary through
@@ -671,7 +700,7 @@ def deploy(
             certfiles = _issue_secrecorder_cert(root)
             if certfiles is None:
                 P.warn("cert issuance failed — falling back to plain HTTP for SecRecorder")
-        rec_args = [uv or "uv", "run", "--no-sync", "uvicorn", "server:app",
+        rec_args = [str(_venv_bin(root, "secrecorder", "uvicorn")), "server:app",
                     "--host", "0.0.0.0", "--port", str(SECRECORDER_PORT)]
         if certfiles:
             rec_args += ["--ssl-certfile", str(certfiles[0]), "--ssl-keyfile", str(certfiles[1])]
@@ -682,14 +711,17 @@ def deploy(
         if tls and dry_run:
             print(f"  · (--tls) issue a SecCert cert for {CERT_HOST} via certbot, then run "
                   "SecRecorder with --ssl-certfile/--ssl-keyfile")
-        secrecorder = launchd.LaunchdService(
-            name="secrecorder", program_args=rec_args, log_dir=log_dir,
-            env={**_base_env(home), "WHISPER_PREWARM": "1", "WHISPER_PREWARM_DIARIZER": "1",
-                 **model_env},
-            working_dir=str(root / "work" / "secrecorder"), user=user,
-        )
-        _install_or_note(secrecorder, staging_dir, native_services=native_services,
-                         dry_run=dry_run, fallback_note=fallback)
+        if not dry_run and native_services and not _ensure_native_venv(root, "secrecorder"):
+            P.warn(f"secrecorder: no project venv — run `secdeploy build macos`, then start it: {fallback}")
+        else:
+            secrecorder = launchd.LaunchdService(
+                name="secrecorder", program_args=rec_args, log_dir=log_dir,
+                env={**_base_env(home), "WHISPER_PREWARM": "1", "WHISPER_PREWARM_DIARIZER": "1",
+                     **model_env},
+                working_dir=str(root / "work" / "secrecorder"), user=user,
+            )
+            _install_or_note(secrecorder, staging_dir, native_services=native_services,
+                             dry_run=dry_run, fallback_note=fallback)
     elif not dry_run:
         P.log(f"SecRecorder not placed on resource {resource!r} — skipping on this host")
 
