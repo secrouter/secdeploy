@@ -23,6 +23,11 @@ SHA256SUMS
 topology.toml
 !topology.toml.example
 
+# unified site config (placement + deploy options) — operator-specific, like the env files
+# (the .example is tracked)
+secsite.toml
+!secsite.toml.example
+
 # Sphinx
 docs/_build/
 

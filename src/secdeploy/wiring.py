@@ -7,7 +7,10 @@ any target/OS specifics so it can be unit-tested and reused by every target.
 
 Backward compatibility: when no ``topology.toml`` exists, :func:`active_topology` synthesizes
 a single-host topology (everything on this box, addresses at loopback), so a plain
-``secdeploy deploy macos`` behaves exactly as it did before topologies existed.
+``secdeploy deploy macos`` behaves exactly as it did before topologies existed. :func:`active_site`
+is the newer, ``secsite.toml``-aware sibling ``cmd_deploy`` (and verify/plan/bundle) actually
+use — it falls all the way back through a bare ``topology.toml`` to this same single-host
+synthesis, so everything documented above still holds.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .manifest import Manifest
+from .site import SiteConfig
 from .topology import Topology
 
 # This suite's internal-CUI classification level — the default `authorizedClassifications`
@@ -42,6 +46,40 @@ def active_topology(
     if path.exists():
         return Topology.load(path, manifest), True
     return Topology.single_host(manifest, target, address=address), False
+
+
+def active_site(
+    manifest: Manifest,
+    site_path: str | Path | None,
+    topology_path: str | Path,
+    target: str,
+    address: str = "127.0.0.1",
+) -> tuple[SiteConfig, bool]:
+    """Return ``(site, from_file)`` — the unified site config, resolved in precedence order:
+
+    1. ``site_path`` (``--site``), if given — an EXPLICIT path must exist; a missing/invalid
+       file raises rather than silently falling through to a name the operator didn't ask for
+       (same fail-loud contract a bad ``--topology`` already has);
+    2. ``secsite.toml`` in the current directory, if present;
+    3. ``topology_path`` (``--topology``, default ``topology.toml``), if present — loaded as a
+       plain :class:`~secdeploy.topology.Topology` and wrapped with all-default deploy options
+       (:meth:`SiteConfig.from_topology`), so a bare topology.toml behaves EXACTLY as it did
+       before ``secsite.toml`` existed — this is the back-compat guarantee;
+    4. a synthesized single-host SiteConfig (mirrors :func:`active_topology`'s own fallback).
+
+    ``from_file`` is ``False`` only for case 4 — mirrors :func:`active_topology` exactly, so
+    every caller that already branches on it (resource selection, "single-host mode" messaging)
+    keeps working unchanged whether it's handed a Topology or a SiteConfig.
+    """
+    if site_path is not None:
+        return SiteConfig.load(site_path, manifest), True
+    default_site = Path("secsite.toml")
+    if default_site.exists():
+        return SiteConfig.load(default_site, manifest), True
+    topo_path = Path(topology_path)
+    if topo_path.exists():
+        return SiteConfig.from_topology(Topology.load(topo_path, manifest)), True
+    return SiteConfig.single_host(manifest, target, address=address), False
 
 
 def resource_for(topology: Topology, target: str, explicit: str | None = None) -> str:

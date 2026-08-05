@@ -64,6 +64,23 @@ class Topology:
     def load(path: str | Path, manifest: Manifest) -> "Topology":
         path = Path(path)
         data = tomllib.loads(path.read_text())
+        return Topology.from_data(data, manifest, path=path)
+
+    @staticmethod
+    def from_data(
+        data: dict, manifest: Manifest, path: Path | None = None, validate: bool = True,
+    ) -> "Topology":
+        """Build a Topology from an already-parsed TOML mapping (``tomllib.loads`` output).
+
+        Split out of :meth:`load` so a caller that has ALREADY parsed the file for its own
+        purposes — namely :class:`secdeploy.site.SiteConfig`, which layers deploy options onto
+        the same ``[resources.*]``/``[groups.*]`` shape — can build the placement half without
+        re-reading/re-parsing the file. Only the placement keys are read here (``target``/
+        ``address``/``ssh``/``capabilities`` per resource); any other keys in ``data`` (e.g.
+        SiteConfig's per-resource deploy toggles, or a ``[deploy]`` table) are simply ignored —
+        Topology stays focused on placement, never deploy options. Pass ``validate=False`` to
+        defer validation to the caller (e.g. SiteConfig, which validates placement + its own
+        deploy-only additions together)."""
         resources = {
             name: Resource(
                 name=name,
@@ -86,7 +103,8 @@ class Topology:
             manifest=manifest,
             path=path,
         )
-        topo.validate()
+        if validate:
+            topo.validate()
         return topo
 
     @staticmethod

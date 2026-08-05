@@ -1,0 +1,128 @@
+# SecDeploy site config (example) — the ONE file that places the suite on your compute
+# resources AND configures how `deploy` runs them.
+#
+#   suite.toml     pins WHAT versions (the immutable bill of materials)
+#   secsite.toml   places them on YOUR compute resources + configures deploy (this file)
+#
+# Copy to `secsite.toml` and edit — or run `secdeploy configure` to generate one.
+# secsite.toml is site-specific and gitignored (like your *.env files); the .example is tracked.
+#
+# With a secsite.toml in place, a routine `secdeploy deploy <target>` needs NO flags at all —
+# everything a flag would otherwise ask for lives here instead. CLI flags still exist and
+# OVERRIDE whatever this file sets, for one-off runs (e.g. a single dry-run with an extra
+# --without you don't want to keep).
+#
+# NO SECRETS live here. The Hugging Face token, the SecCert CA passphrase, SecAgent's client
+# secret and Mattermost bot token stay in the *.env files (deploy/macos/secrets.env,
+# /etc/secsuite/*.env on fedora-fips) — see `secdeploy configure` and docs/*.md.
+#
+# If secsite.toml (and topology.toml) are BOTH absent, SecDeploy runs in single-host mode:
+# every component lands on the machine you run `deploy` on, and every deploy option defaults
+# off. You only need this file for multi-host, or simply to stop retyping deploy flags.
+#
+# A bare topology.toml (this file's placement-only predecessor) still works unchanged — see
+# docs/topology.md — and still takes effect if that's all you have.
+#
+# Components belong to fixed TIERS (declared in suite.toml); you assign each tier to a
+# resource:
+#   identity   seccert, secsso, secdns   (trust / auth / naming — all optional infra)
+#   inference  secllm                    (wants a resource with the "gpu" capability; may
+#                                          span SEVERAL resources for N SecLLM instances)
+#   gateway    secrouter
+#   collab     secagent, secchat, secrecorder
+#   edge       secproxy                  (optional infra — the suite's :443 front door)
+
+# Internal DNS zone the suite resolves under (served by secdns). Component FQDNs are
+# <component>.<domain>, e.g. secrouter.sec.internal.
+domain = "sec.internal"
+
+# Where secdns forwards NON-internal queries. Leave empty ([]) for a closed network.
+upstream_dns = ["1.1.1.1"]
+
+# ── Suite-wide deploy options ─────────────────────────────────────────────────────────
+[deploy]
+# Optional components to drop, e.g. when you already run your own CA/IdP/DNS — the same names
+# `deploy --without seccert,secsso` takes (comma-separated there; a real array here).
+without = []
+# Control-host push mode: build each resource's bundle, rsync it to that resource's `ssh`
+# endpoint (see below), and deploy remotely — what `deploy --ssh` does, without retyping it.
+# Needs at least one resource below with an `ssh` endpoint set.
+ssh = false
+
+# ── Compute resources (hosts) ────────────────────────────────────────────────────────
+[resources.core]
+target = "fedora-fips"      # deploy mechanism: macos | fedora-fips
+address = "10.0.0.5"        # how peer hosts reach this one (IP or resolvable name)
+# ssh = "root@10.0.0.5"     # optional — set to enable ssh-push deploy to this host
+capabilities = ["fips"]     # gpu | fips | arch tags
+
+# Per-resource deploy options — commented here at their defaults. These differ per host (e.g.
+# inference on the GPU box, TLS on the Mac), which is why they live on the resource instead of
+# in the suite-wide [deploy] table above. Uncomment only what you need to change.
+# with_inference = false      # stand up SecLLM here (fedora-fips only; see 'gpu' below)
+# with_agent = false          # stand up SecAgent's Mattermost chat-ops bridge here (fedora-fips only)
+# configure_resolver = false  # point THIS host's resolver at secdns (multi-host — docs/topology.md)
+# tls = false                 # macOS only: issue SecRecorder a SecCert cert via certbot
+# configure_hosts = false     # macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts
+# trust_ca = false            # macOS only: trust the SecCert root in the System keychain
+# model_dir = ""              # macOS only, air-gapped: pre-downloaded model snapshots dir
+
+[resources.gpu]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+# Standing up SecLLM itself is opt-in — without it, secdeploy still generates the DNS/env
+# wiring for an externally-run SecLLM. Here it's turned ON, so this GPU box actually runs it:
+with_inference = true
+# model_dir = ""              # air-gapped hosts only — see docs/macos.md (macOS target only)
+
+# ── Tier → resource assignments ──────────────────────────────────────────────────────
+# Multiple tiers may share one resource. Omit an all-optional tier (identity, edge) to skip
+# that infrastructure. Every REQUIRED tier must be placed.
+[groups.identity]
+resource = "core"
+
+[groups.gateway]
+resource = "core"
+
+[groups.collab]
+resource = "core"
+
+[groups.inference]
+resource = "gpu"
+
+# secproxy (edge) — the suite's one HTTPS front door for the fronted web/API services.
+# Topology-gated only, no --with-* flag: it stands up the moment this tier is placed.
+[groups.edge]
+resource = "core"
+
+# N-way inference: several SecLLM instances (stateless — no coordination needed), one per
+# resource, each with its OWN with_inference toggle. Swap the single-resource form above for:
+#
+#   [resources.gpu2]
+#   target = "fedora-fips"
+#   address = "10.0.0.7"
+#   capabilities = ["fips", "gpu"]
+#   with_inference = true
+#
+#   [groups.inference]
+#   resources = ["gpu", "gpu2"]
+
+# ── Single-host variant ──────────────────────────────────────────────────────────────
+# For one machine, define a single resource and point every tier at it:
+#
+#   [resources.local]
+#   target = "macos"
+#   address = "127.0.0.1"
+#   capabilities = []
+#   # tls = true
+#   # configure_hosts = true
+#   # trust_ca = true
+#
+#   [groups.identity]   { resource = "local" }
+#   [groups.inference]  { resource = "local" }
+#   [groups.gateway]    { resource = "local" }
+#   [groups.collab]     { resource = "local" }
+#
+# …or just delete secsite.toml (and topology.toml) — that is exactly what single-host mode
+# does for you, with every deploy option at its default.

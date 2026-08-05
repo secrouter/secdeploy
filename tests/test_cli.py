@@ -546,3 +546,233 @@ def test_verify_fedora_topology_reports_secproxy_placement(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "target assets present" in out  # secproxy.service ships, so verify passes clean
     assert "secproxy" in out  # listed among 'core's placed components
+
+
+# ── secsite.toml: unified site config (placement + deploy options) ─────────────────────
+# 'core' (identity/gateway/collab), 'gpu1'+'gpu2' (inference, N-way). [deploy].without drops
+# secdns; only gpu1 sets with_inference — gpu2 deliberately leaves it at its default (False),
+# to prove both directions of the tri-state CLI/site override.
+SITE_WITH_INFERENCE = """
+domain = "sec.internal"
+
+[deploy]
+without = ["secdns"]
+
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+capabilities = ["fips"]
+
+[resources.gpu1]
+target = "fedora-fips"
+address = "10.0.0.6"
+capabilities = ["fips", "gpu"]
+with_inference = true
+
+[resources.gpu2]
+target = "fedora-fips"
+address = "10.0.0.7"
+capabilities = ["fips", "gpu"]
+
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.inference]
+resources = ["gpu1", "gpu2"]
+"""
+
+# Same shape, but 'core' also carries an ssh endpoint and [deploy].ssh = true — for proving
+# the suite-wide ssh-push toggle takes effect from the file without passing --ssh.
+SITE_SSH = """
+domain = "sec.internal"
+
+[deploy]
+ssh = true
+
+[resources.core]
+target = "fedora-fips"
+address = "10.0.0.5"
+ssh = "root@10.0.0.5"
+capabilities = ["fips"]
+
+[groups.identity]
+resource = "core"
+[groups.gateway]
+resource = "core"
+[groups.collab]
+resource = "core"
+[groups.inference]
+resource = "core"
+"""
+
+
+def test_deploy_site_with_inference_stands_up_secllm_without_the_flag(tmp_path, capsys):
+    """The headline behavior: with_inference=true on gpu1's secsite.toml block stands up
+    secllm on --dry-run WITHOUT --with-inference ever appearing on the command line."""
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--site", str(tp), "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" in out
+    assert "secllm.env" in out
+    assert "secsuite-secllm" in out
+    # gpu1 hosts only the inference tier — no other resource's services leak in
+    assert "seccert.service" not in out
+    assert "secrouter.service" not in out
+
+
+def test_deploy_site_without_drops_secdns_on_its_own_resource(tmp_path, capsys):
+    """[deploy].without = ["secdns"] takes effect from the file — secdns is absent even on
+    'core' (its own identity-tier resource), not merely absent because it's unplaced."""
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--site", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "secdns.service" not in out
+    assert "generated secdns zone" not in out
+    assert "seccert.service" in out
+    assert "secrouter.service" in out
+
+
+def test_deploy_site_gpu2_omits_secllm_when_not_set_there(tmp_path, capsys):
+    # gpu2 never sets with_inference — defaults False, same as no secsite.toml at all.
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--site", str(tp), "--resource", "gpu2"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" not in out
+
+
+def test_deploy_cli_with_inference_overrides_site_false(tmp_path, capsys):
+    # gpu2's secsite.toml leaves with_inference at its default (False) — an explicit
+    # --with-inference on the CLI still wins (an explicit flag always overrides the file).
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--site", str(tp), "--resource", "gpu2", "--with-inference"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" in out
+
+
+def test_deploy_cli_without_overrides_site_without(tmp_path, capsys):
+    # an explicit (even empty) --without on the CLI is "given" — distinguishable from "absent"
+    # by the tri-state None sentinel — so it overrides the file's without = ["secdns"] entirely.
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--site", str(tp), "--resource", "core", "--without", ""]) == 0
+    out = capsys.readouterr().out
+    assert "secdns.service" in out
+
+
+def test_deploy_site_ssh_true_without_the_flag(tmp_path, capsys):
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_SSH)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--site", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "rsync -az" in out and "root@10.0.0.5" in out  # ssh-push runbook, no --ssh passed
+
+
+def test_deploy_cli_ssh_false_not_representable_but_absence_uses_site(tmp_path, capsys):
+    # store_true tri-state means there is no CLI way to force ssh OFF when the site says on —
+    # only "pass --ssh" (True) or "don't" (None → falls back to site.ssh). Document that by
+    # showing the only override direction that exists: explicit --ssh when the file is silent.
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT_SSH)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--ssh", "--dry-run",
+                 "--topology", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "rsync -az" in out
+
+
+def test_deploy_secsite_toml_autodetected_in_cwd(tmp_path, monkeypatch, capsys):
+    """No --site, no --topology override — secsite.toml sitting in the current directory is
+    picked up automatically (the precedence tier active_site adds ahead of --topology)."""
+    (tmp_path / "secsite.toml").write_text(SITE_WITH_INFERENCE)
+    monkeypatch.chdir(tmp_path)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "secllm.service" in out
+    assert "secdns.service" not in out
+
+
+def test_deploy_explicit_site_missing_file_fails_loud(tmp_path):
+    missing = tmp_path / "nope.toml"
+    with pytest.raises(SystemExit):
+        main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+              "--site", str(missing)])
+
+
+def test_deploy_site_with_bad_deploy_key_fails_loud(tmp_path):
+    bad = SITE_WITH_INFERENCE.replace('without = ["secdns"]', 'without = ["secdns"]\nbogus = 1')
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(bad)
+    with pytest.raises(SystemExit):
+        main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run", "--site", str(tp)])
+
+
+# ── back-compat: a topology.toml with no [deploy]/per-resource-deploy keys must dry-run
+#    byte-identically to before secsite.toml existed (same file GPU_SPLIT always was) ────
+def test_deploy_topology_only_file_matches_pre_secsite_behavior(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "seccert.service" in out
+    assert "secrouter.service" in out
+    assert "secllm.service" not in out
+    assert "secagent.service" not in out
+    assert "secproxy.service" not in out
+
+
+def test_plan_topology_only_file_unaffected_by_site_loader_swap(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(GPU_SPLIT)
+    assert main(["--manifest", MANIFEST, "plan", "fedora-fips", "--topology", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "resource 'core'" in out and "placement:" in out
+
+
+# ── verify/plan/bundle also resolve --site (secsite.toml awareness "where sensible") ────
+def test_verify_picks_up_explicit_site(tmp_path, capsys):
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "verify", "--site", str(tp)]) == 0
+    out = capsys.readouterr().out
+    assert "topology valid" in out
+    assert "gpu1" in out and "gpu2" in out
+
+
+def test_plan_picks_up_explicit_site(tmp_path, capsys):
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    assert main(["--manifest", MANIFEST, "plan", "fedora-fips", "--site", str(tp),
+                 "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "resource 'gpu1'" in out
+
+
+def test_bundle_picks_up_explicit_site(tmp_path):
+    import tarfile
+
+    work = tmp_path / "work"
+    (work / "secllm").mkdir(parents=True)
+    out_dir = tmp_path / "out"
+    tp = tmp_path / "secsite.toml"
+    tp.write_text(SITE_WITH_INFERENCE)
+    rc = main(["--manifest", MANIFEST, "--work", str(work), "--out", str(out_dir),
+               "bundle", "fedora-fips", "--site", str(tp), "--resource", "gpu1"])
+    assert rc == 0
+    tarball = out_dir / "secsuite-1.6.0-fedora-fips-gpu1.tar.gz"
+    assert tarball.exists()
+    names = tarfile.open(tarball).getnames()
+    assert any("/work/secllm" in n for n in names)

@@ -24,6 +24,7 @@ from pathlib import Path
 from . import process as P
 from . import wiring
 from .manifest import Manifest
+from .site import DeployOptions
 from .targets import common, fedora_fips, macos
 
 TARGETS = {macos.NAME: macos, fedora_fips.NAME: fedora_fips}
@@ -46,6 +47,30 @@ def _root(args) -> Path:
 
 def _without(args) -> list[str]:
     return [s.strip() for s in getattr(args, "without", "").split(",") if s.strip()]
+
+
+def _resolved_without(cli_value: str | None, site_without: list[str]) -> list[str]:
+    """``deploy``'s own ``--without`` resolution: the CLI value (parsed the same way
+    :func:`_without` does) when given, else the site config's suite-wide ``[deploy].without``
+    unchanged — see cmd_deploy's tri-state override wiring."""
+    if cli_value is None:
+        return list(site_without)
+    return [s.strip() for s in cli_value.split(",") if s.strip()]
+
+
+def _site_or_topology_path(args) -> str:
+    """The effective placement FILE PATH for commands that only need placement, not deploy
+    options (verify/plan already resolve a full SiteConfig instead; bundle uses this) —
+    ``--site`` if given, else ``secsite.toml`` in the current directory if present, else
+    ``--topology``. Safe to hand straight to :meth:`~secdeploy.topology.Topology.load` (or
+    anything that loads one): a secsite.toml's extra deploy-only keys are simply ignored by
+    Topology's own parser (see :meth:`Topology.from_data`)."""
+    site_arg = getattr(args, "site", None)
+    if site_arg is not None:
+        return site_arg
+    if Path("secsite.toml").exists():
+        return "secsite.toml"
+    return args.topology
 
 
 def _expected_assets(root: Path, target: str) -> list[Path]:
@@ -91,14 +116,26 @@ def cmd_verify(args) -> int:
 
 
 def _verify_topology(args, m: Manifest) -> None:
-    """Report the site topology when a topology.toml is present, else note single-host mode."""
+    """Report the site placement when a secsite.toml/topology.toml is present, else note
+    single-host mode. Mirrors :func:`wiring.active_site`'s file precedence (``--site``, else
+    ``secsite.toml``, else ``--topology``) but — unlike deploy — needs no ``target`` to fall
+    back on: verify inspects placement across every target, not one, so when no file exists at
+    all there is nothing to synthesize, only a message to print (unchanged from before
+    secsite.toml existed)."""
+    from .site import SiteConfig
     from .topology import Topology
 
-    tpath = Path(args.topology)
-    if not tpath.exists():
-        print("  topology: none — single-host mode (deploy places every component on this host)")
-        return
-    topo = Topology.load(tpath, m)  # raises ValueError on an invalid topology → main() dies
+    site_arg = getattr(args, "site", None)
+    spath = Path(site_arg) if site_arg is not None else Path("secsite.toml")
+    if site_arg is None and not spath.exists():
+        tpath = Path(args.topology)
+        if not tpath.exists():
+            print("  topology: none — single-host mode (deploy places every component on this host)")
+            return
+        site = SiteConfig.from_topology(Topology.load(tpath, m))
+    else:
+        site = SiteConfig.load(spath, m)  # raises ValueError on an invalid file → main() dies
+    topo = site.topology
     print(f"✓ topology valid — domain {topo.domain}, {len(topo.resources)} resource(s)")
     for rname, r in topo.resources.items():
         placed = ", ".join(topo.components_on(rname)) or "(none)"
@@ -120,13 +157,14 @@ def cmd_plan(args) -> int:
     mod = _target_mod(args.target)
     t = m.target(args.target)
     without = _without(args)
-    topo, from_file = wiring.active_topology(m, args.topology, args.target)
+    site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+    topo = site.topology
     print(f"suite {m.suite}  →  target {t.name} ({t.kind})")
     print(f"  {t.description}\n")
 
     if from_file:
         resource = wiring.resource_for(topo, args.target, args.resource)
-        print(f"  topology {args.topology} — this deploy targets resource "
+        print(f"  topology {topo.path} — this deploy targets resource "
               f"{resource!r} ({topo.resources[resource].address})\n")
         print("  placement:")
         for rname, r in topo.resources.items():
@@ -176,31 +214,49 @@ def cmd_bundle(args) -> int:
     m = Manifest.load(args.manifest)
     bundle.build_bundle(m, args.target, Path(args.work), Path(args.out),
                         root=_root(args), without=_without(args),
-                        topology_path=args.topology, resource=args.resource)
+                        topology_path=_site_or_topology_path(args), resource=args.resource)
     return 0
 
 
 def cmd_deploy(args) -> int:
+    """The seam every deploy flag converges on: resolve the active site config (``--site``,
+    else ``secsite.toml``, else ``--topology``, else single-host — see
+    :func:`wiring.active_site`), then resolve each deploy-only option as ``the CLI flag if the
+    operator actually passed it, else the site config's value`` — see the local ``_resolved``
+    helper below. Every CLI flag this resolves is tri-state (``None`` = "not passed on the CLI",
+    set via ``action="store_true", default=None`` in :func:`build_parser`) specifically so a
+    secsite.toml's settings aren't silently overridden by an absent flag's `False` default. The
+    resolved values are passed to ``mod.deploy(...)`` with EXACTLY the kwargs it took before
+    secsite.toml existed — the target ``deploy()`` signatures never change.
+    """
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
-    without = _without(args)
-    topo, from_file = wiring.active_topology(m, args.topology, args.target)
-    if getattr(args, "ssh", False):
+    site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+    without = _resolved_without(args.without, site.without)
+    ssh = args.ssh if args.ssh is not None else site.ssh
+
+    def _resolved(cli_value, site_value):
+        return cli_value if cli_value is not None else site_value
+
+    if ssh:
         if not from_file:
-            P.die("--ssh needs a topology.toml defining resources with ssh endpoints")
+            P.die("--ssh needs a topology.toml/secsite.toml defining resources with ssh endpoints")
         from . import remote
-        remote.ssh_deploy(m, args.target, args.topology, topo, Path(args.work), Path(args.out),
-                          _root(args), without=without, dry_run=args.dry_run)
+        remote.ssh_deploy(m, args.target, str(site.topology.path), site.topology, Path(args.work),
+                          Path(args.out), _root(args), without=without, dry_run=args.dry_run)
         return 0
-    resource = wiring.resource_for(topo, args.target, args.resource) if from_file else None
+    resource = wiring.resource_for(site.topology, args.target, args.resource) if from_file else None
+    opts = site.deploy_for(resource) if resource is not None else DeployOptions()
     mod.deploy(
         m, Path(args.work), root=_root(args), dry_run=args.dry_run,
-        tls=args.tls, configure_hosts=args.configure_hosts,
-        trust_ca=args.trust_ca, assume_yes=args.yes,
-        hf_token=args.hf_token, model_dir=args.model_dir,
-        without=without, configure_resolver=args.configure_resolver,
-        topology=topo if from_file else None, resource=resource, out=Path(args.out),
-        with_inference=args.with_inference, with_agent=args.with_agent,
+        tls=_resolved(args.tls, opts.tls),
+        configure_hosts=_resolved(args.configure_hosts, opts.configure_hosts),
+        trust_ca=_resolved(args.trust_ca, opts.trust_ca), assume_yes=args.yes,
+        hf_token=args.hf_token, model_dir=_resolved(args.model_dir, opts.model_dir or None),
+        without=without, configure_resolver=_resolved(args.configure_resolver, opts.configure_resolver),
+        topology=site.topology if from_file else None, resource=resource, out=Path(args.out),
+        with_inference=_resolved(args.with_inference, opts.with_inference),
+        with_agent=_resolved(args.with_agent, opts.with_agent),
     )
     return 0
 
@@ -241,8 +297,16 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--resource",
                         help="topology resource this action targets (default: auto-detect by target)")
 
+    def _site_arg(sp):
+        sp.add_argument(
+            "--site", default=None,
+            help="unified site config — placement + deploy options (default: secsite.toml in "
+                 "the current directory if present, else --topology; explicit paths must exist)",
+        )
+
     vp = sub.add_parser("verify", help="validate manifest + target assets")
     _topology_arg(vp)
+    _site_arg(vp)
     vp.set_defaults(fn=cmd_verify)
 
     cp = sub.add_parser("configure", help="interactively write a topology.toml (resources + placement)")
@@ -253,27 +317,37 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(name, help=f"{name} a target")
         sp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
         sp.set_defaults(fn=globals()[f"cmd_{name}"])
-        if name != "status":
+        if name not in ("status", "deploy"):
             _without_arg(sp)
         if name in ("plan", "build", "deploy"):
             _topology_arg(sp)
             _resource_arg(sp)
+        if name in ("plan", "deploy"):
+            _site_arg(sp)
     sub.choices["deploy"].add_argument(
         "--dry-run", action="store_true", help="print the steps without executing them"
     )
     sub.choices["deploy"].add_argument(
-        "--tls", action="store_true",
-        help="macOS only: issue SecRecorder a SecCert cert via certbot and print its TLS run command",
+        "--without", default=None,
+        help="comma-separated optional components to drop (e.g. seccert,secsso) — overrides "
+             "the site config's [deploy].without when given",
     )
     sub.choices["deploy"].add_argument(
-        "--configure-hosts", action="store_true",
+        "--tls", action="store_true", default=None,
+        help="macOS only: issue SecRecorder a SecCert cert via certbot and print its TLS run "
+             "command — overrides the resource's secsite.toml `tls` when given",
+    )
+    sub.choices["deploy"].add_argument(
+        "--configure-hosts", action="store_true", default=None,
         help="macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo, asks "
-             "first — see -y/--yes), so host-side clients can use the --tls cert's hostname",
+             "first — see -y/--yes), so host-side clients can use the --tls cert's hostname — "
+             "overrides the resource's secsite.toml `configure_hosts` when given",
     )
     sub.choices["deploy"].add_argument(
-        "--trust-ca", action="store_true",
+        "--trust-ca", action="store_true", default=None,
         help="macOS only: trust the SecCert root in the System keychain (sudo, asks first — "
-             "see -y/--yes), so browsers/curl stop flagging SecRecorder's cert as untrusted",
+             "see -y/--yes), so browsers/curl stop flagging SecRecorder's cert as untrusted — "
+             "overrides the resource's secsite.toml `trust_ca` when given",
     )
     sub.choices["deploy"].add_argument(
         "-y", "--yes", action="store_true",
@@ -283,38 +357,44 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["deploy"].add_argument(
         "--hf-token",
         help="macOS only: Hugging Face token for the gated diarizer model, for SecRecorder's "
-             "printed run command. Overrides deploy/macos/secrets.env if both are set.",
+             "printed run command. Overrides deploy/macos/secrets.env if both are set. Never "
+             "read from secsite.toml — it's a secret, so it stays flag/*.env-only.",
     )
     sub.choices["deploy"].add_argument(
         "--model-dir",
         help="macOS only, for air-gapped hosts: a local directory with pre-downloaded model "
              "snapshots at <dir>/whisper and <dir>/diarizer, used in place of Hugging Face "
-             "repo IDs in SecRecorder's printed run command — see docs/macos.md",
+             "repo IDs in SecRecorder's printed run command — see docs/macos.md. Overrides the "
+             "resource's secsite.toml `model_dir` when given.",
     )
     sub.choices["deploy"].add_argument(
-        "--ssh", action="store_true",
+        "--ssh", action="store_true", default=None,
         help="control-host mode: build each resource's bundle, rsync it to that resource's ssh "
-             "endpoint, and deploy remotely (needs ssh endpoints in topology.toml)",
+             "endpoint, and deploy remotely (needs ssh endpoints in topology.toml/secsite.toml) "
+             "— overrides the site config's [deploy].ssh when given",
     )
     sub.choices["deploy"].add_argument(
-        "--configure-resolver", action="store_true", dest="configure_resolver",
+        "--configure-resolver", action="store_true", default=None, dest="configure_resolver",
         help="point this host's resolver at secdns for the internal domain (macOS /etc/resolver, "
-             "Fedora systemd-resolved) — asks first; the multi-host replacement for --configure-hosts",
+             "Fedora systemd-resolved) — asks first; the multi-host replacement for "
+             "--configure-hosts. Overrides the resource's secsite.toml `configure_resolver`.",
     )
     sub.choices["deploy"].add_argument(
-        "--with-inference", action="store_true", dest="with_inference",
+        "--with-inference", action="store_true", default=None, dest="with_inference",
         help="also stand up SecLLM on every resource where the inference tier is placed here "
              "(default: off — the DNS/env wiring for SecLLM's backend pool is always generated; "
              "this additionally installs + starts the secllm service). fedora-fips only; macOS "
-             "prints a native run command instead (see docs/macos.md)",
+             "prints a native run command instead (see docs/macos.md). Overrides the resource's "
+             "secsite.toml `with_inference` when given.",
     )
     sub.choices["deploy"].add_argument(
-        "--with-agent", action="store_true", dest="with_agent",
+        "--with-agent", action="store_true", default=None, dest="with_agent",
         help="also stand up SecAgent's Mattermost chat-ops bridge (`secagent chat serve`) on "
              "the resource where the collab tier is placed here (default: off — the peer-wiring "
              "env pointing SecAgent's LLM traffic at SecRouter is always generated; this "
              "additionally installs pi + secagent and starts the secagent service). "
-             "fedora-fips only; macOS prints a native note instead (see docs/fedora-fips.md)",
+             "fedora-fips only; macOS prints a native note instead (see docs/fedora-fips.md). "
+             "Overrides the resource's secsite.toml `with_agent` when given.",
     )
 
     tp = sub.add_parser(
@@ -356,6 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     _without_arg(bp)
     _topology_arg(bp)
     _resource_arg(bp)
+    _site_arg(bp)
     bp.set_defaults(fn=cmd_bundle)
 
     return p
