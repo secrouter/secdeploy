@@ -82,7 +82,7 @@ role = "agentic harness (pi) — MR review, analysis, chat-ops"
 
 [components.secchat]
 repo = "secrouter/secchat"
-ref = "v1.0.0"
+ref = "v1.1.0"
 kind = "stack"
 tier = "collab"
 port = 8065

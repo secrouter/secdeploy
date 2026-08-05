@@ -21,21 +21,18 @@ brew install colima docker uv ffmpeg        # ffmpeg: SecRecorder transcoding (b
 colima start                                # Docker daemon on Apple Silicon
 ```
 
-> **Deploying SecChat or SecSSO on Apple Silicon? Start Colima with Rosetta.** Mattermost
-> (SecChat) and Authentik (SecSSO) publish **amd64-only** images — there is no arm64 build — so
-> they run under emulation on Apple Silicon. Default Colima uses QEMU, which is slow enough that
-> Mattermost's first boot (DB migrations) can miss SecChat's 3-minute health-wait. Use Apple's
-> Virtualization framework + **Rosetta** for near-native amd64 instead:
+> **Deploying SecChat or SecSSO?** Both run **native arm64** on Apple Silicon — no
+> Rosetta/emulation. Mattermost's *published* image is amd64-only, but its release *binary* ships
+> arm64 too, so SecChat builds a native Mattermost image from the official binary (see
+> `secchat/Dockerfile`); SecSSO's Authentik/Postgres/Redis are multi-arch. Two practical notes:
+> give Colima headroom for the extra containers, and SecChat's **first** bring-up *builds*
+> Mattermost (a download + build — a few minutes, one-time, then cached):
 >
 > ```bash
-> softwareupdate --install-rosetta --agree-to-license     # once, if Rosetta isn't installed
-> colima delete                                           # if an existing VM was made with QEMU
-> colima start --vm-type vz --vz-rosetta --cpu 4 --memory 8 --disk 60
+> colima start --cpu 4 --memory 8 --disk 60   # room for SecChat + SecSSO (Mattermost, Authentik, 2× Postgres, Redis)
 > ```
 >
-> The native services (SecDNS/SecLLM/SecRecorder/SecRouter/secproxy) and Postgres are arm64 and
-> unaffected — this only matters for the two emulated stacks. If you don't need chat/SSO for an
-> eval, `deploy macos --without secsso,secchat` skips them entirely.
+> If you don't need chat/SSO for an eval, `deploy macos --without secsso,secchat` skips them.
 
 Then get secdeploy — it runs from its checkout via `uv` (no separate Python install):
 

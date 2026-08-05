@@ -84,7 +84,7 @@ def test_plan_macos_lists_all(capsys):
     out = capsys.readouterr().out
     assert "compose" in out.lower()
     assert "seccert @ v1.0.0" in out
-    assert "secchat @ v1.0.0" in out
+    assert "secchat @ v1.1.0" in out   # native-Mattermost build (arm64 + amd64)
 
 
 def test_plan_without_drops_optionals(capsys):

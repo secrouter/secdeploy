@@ -768,16 +768,16 @@ def deploy(
                     if manifest.components[n].kind == "stack" and n not in without) \
         if topology is not None else []
     if stacks and not dry_run:
-        # SecSSO (Authentik) + SecChat (Mattermost) publish amd64-ONLY images (verified: no arm64
-        # tag exists), so on Apple Silicon they run under emulation. Default Colima uses QEMU
-        # (very slow — first-boot DB migrations can exceed SecChat's 3-min bootstrap health-wait);
-        # Colima's Apple-Virtualization + Rosetta path runs amd64 near-native. Nudge the operator
-        # there, and note the bring-up is detached + resumable so a slow one isn't a dead end.
-        P.warn("SecSSO/SecChat run amd64-only images — on Apple Silicon, use Colima's Rosetta for "
-               "near-native speed: `colima start --vm-type vz --vz-rosetta` (default QEMU is slow "
-               "enough that first boot can miss SecChat's health-wait). Bring-up is detached + "
-               "safe to Ctrl-C; finish/redo bot+team setup any time with "
-               "`bash work/secchat/bootstrap/secchat.sh bot`.")
+        # Both stacks run NATIVE arm64 on Apple Silicon now: SecChat builds a native Mattermost
+        # image from the official release binary on first bring-up (Mattermost's published image is
+        # amd64-only, but its release BINARY ships arm64 too — see secchat/Dockerfile), and SecSSO's
+        # Authentik/Postgres/Redis are multi-arch. So no QEMU/Rosetta emulation. The only cost is
+        # SecChat's first build (download + build, a few minutes, one-time + cached); the bring-up
+        # is detached, so a slow first run isn't a dead end.
+        P.warn("bringing up SecSSO/SecChat (native arm64 — no emulation): SecChat builds its "
+               "Mattermost image from the official binary on first run (a few minutes, one-time). "
+               "The bring-up is detached + safe to Ctrl-C; finish/redo bot+team setup any time "
+               "with `bash work/secchat/bootstrap/secchat.sh bot`.")
     if stacks:
         common.deploy_stacks(work, stacks, dry_run=dry_run)
 
