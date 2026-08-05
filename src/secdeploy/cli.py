@@ -1,6 +1,8 @@
 """``secdeploy`` — the suite release/deploy CLI.
 
 Subcommands:
+  configure interactively write secsite.toml (placement + deploy options; optionally seeds
+            operator secrets into the gitignored *.env files) — see docs/secsite.md
   verify    validate the manifest and that each target's assets are present
   plan      show what a target deploy would do (pinned versions + steps)
   fetch     git clone/checkout every component at its pinned ref into ./work
@@ -138,9 +140,11 @@ def _verify_topology(args, m: Manifest) -> None:
     topo = site.topology
     print(f"✓ topology valid — domain {topo.domain}, {len(topo.resources)} resource(s)")
     for rname, r in topo.resources.items():
-        placed = ", ".join(topo.components_on(rname)) or "(none)"
+        placed = ", ".join(topo.components_on(rname, site.without)) or "(none)"
         caps = ",".join(r.capabilities) or "-"
         print(f"    {rname:<10} {r.target:<13} {r.address:<15} [{caps}]  ← {placed}")
+    if site.without:
+        print(f"    dropped ([deploy].without): {', '.join(site.without)}")
     for w in topo.warnings:
         P.warn(w)
 
@@ -149,7 +153,7 @@ def cmd_configure(args) -> int:
     from . import configure
 
     m = Manifest.load(args.manifest)
-    return 0 if configure.run(m, dest=args.topology) else 1
+    return 0 if configure.run(m, dest=args.site, root=_root(args)) else 1
 
 
 def cmd_plan(args) -> int:
@@ -309,8 +313,15 @@ def build_parser() -> argparse.ArgumentParser:
     _site_arg(vp)
     vp.set_defaults(fn=cmd_verify)
 
-    cp = sub.add_parser("configure", help="interactively write a topology.toml (resources + placement)")
-    _topology_arg(cp)  # doubles as the destination path
+    cp = sub.add_parser(
+        "configure",
+        help="interactively write a secsite.toml (placement + deploy options; optionally "
+             "seeds operator secrets into the gitignored *.env files)",
+    )
+    cp.add_argument(
+        "--site", default="secsite.toml",
+        help="destination site config file to write (default: secsite.toml)",
+    )
     cp.set_defaults(fn=cmd_configure)
 
     for name in ("plan", "build", "deploy", "status"):

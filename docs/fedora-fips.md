@@ -418,6 +418,15 @@ SecRouter's config must enable the security block and `tls.mode: frontend|native
 closed if FIPS is required but unavailable. Start from `freerouter.config.hardened.example.json`
 in the SecRouter checkout.
 
+> **Filling these in *before* the first deploy.** `secdeploy configure`'s optional secret-
+> seeding step (asked right after it writes `secsite.toml`) can pre-fill these same values —
+> `SECCERT_ADMIN_TOKEN`/`SECCERT_CA_PASSPHRASE`, `SECAGENT_CLIENT_SECRET`/
+> `SECAGENT_MATTERMOST__BOT_TOKEN`, `HF_TOKEN`, `FREEROUTER_CONFIG` — into the checkout's own
+> `deploy/fedora-fips/<svc>.env` (gitignored, `0600`), which `deploy` then installs to
+> `/etc/secsuite/<svc>.env` on first run **in place of** the blank `.env.example` (the
+> `test -f … || install …` non-clobber guard still applies — an already-seeded target host is
+> never overwritten). See [secsite.md § Seeding operator secrets](secsite.md#seeding-operator-secrets-optional).
+
 ## 5. Operate
 
 ```bash

@@ -132,6 +132,15 @@ cp deploy/macos/secrets.env.example deploy/macos/secrets.env
 and fold `HF_TOKEN` into the printed run command; `--hf-token TOKEN` overrides it for a one-off
 run. `secrets.env` is gitignored (`*.env`) — never commit a real token.
 
+> `secdeploy configure`'s optional secret-seeding step can write `HF_TOKEN` into
+> `deploy/macos/secrets.env` for you (`0600`, masked input) instead of the manual `cp` + edit
+> above — see [secsite.md § Seeding operator secrets](secsite.md#seeding-operator-secrets-optional).
+> It can also seed SecCert/SecAgent/SecRouter values into this same shared file when those
+> components are placed on a macOS resource, but — unlike `HF_TOKEN` — nothing on this target
+> reads them automatically yet (macOS has no per-component env-file plumbing today, the same
+> known eval limitation noted throughout this page); they land there for safekeeping until it
+> does.
+
 ### Air-gapped: manually pre-placed models
 
 For a host with no path to Hugging Face at all, pre-download both models on a connected

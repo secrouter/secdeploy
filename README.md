@@ -47,17 +47,23 @@ may be dropped (naming a required one is an error).
 
 By default a deploy stands the whole suite up on one machine. To split it — say inference on a
 GPU box and everything else on a core host — describe your hosts and which **tier**
-(identity / inference / gateway / collab) runs where in a `topology.toml`:
+(identity / inference / gateway / collab / edge) runs where in a `secsite.toml`:
 
 ```bash
-secdeploy configure                         # wizard → writes topology.toml (presets: single-host / gpu-split / custom)
-secdeploy verify --topology topology.toml   # validate placement + print the host map
+secdeploy configure           # wizard → writes secsite.toml (presets: single-host / gpu-split / custom)
+secdeploy verify               # validate placement + print the host map (secsite.toml auto-detected)
 secdeploy plan fedora-fips --resource core  # per-resource placement + steps
+secdeploy deploy fedora-fips --resource core # no flags needed — secsite.toml supplies them
 ```
 
-SecDeploy derives each component's internal FQDN and peer URLs from that placement. See
-[docs/topology.md](docs/topology.md) and [topology.toml.example](topology.toml.example); omit
-the file for single-host mode.
+`secsite.toml` carries placement (what `topology.toml` always carried) plus the deploy options
+that used to be CLI-flags-only (`--without`, `--with-inference`, `--with-agent`, macOS's
+`--tls`/`--trust-ca`/…), so a routine deploy needs no flags at all; the `configure` wizard also
+offers to seed operator secrets (SecCert's admin token, SecAgent's Mattermost bot token, …) into
+the gitignored `*.env` files. See [docs/secsite.md](docs/secsite.md) and
+[secsite.toml.example](secsite.toml.example) for the full picture, or
+[docs/topology.md](docs/topology.md) for the placement model alone (a bare `topology.toml` still
+works unchanged). Omit both files for single-host mode.
 
 ## Quickstart
 
@@ -103,7 +109,7 @@ sudo uv run secdeploy deploy fedora-fips
 
 | Command | Does |
 |---|---|
-| `configure` | Interactive wizard → write a `topology.toml` (resources + tier placement) |
+| `configure` | Interactive wizard → write a `secsite.toml` (placement + deploy options; optionally seeds operator secrets into `*.env`) |
 | `verify` | Validate the manifest (+ topology, if present) and that each target's assets exist |
 | `plan <target>` | Show the pinned versions and the steps a deploy would run |
 | `fetch` | `git clone`/checkout each component at its pinned ref into `./work` |

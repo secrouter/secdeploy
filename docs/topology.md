@@ -11,6 +11,13 @@ If `topology.toml` is **absent**, SecDeploy runs in **single-host mode**: every 
 placed on the machine you run `deploy` on — the historical behavior. You only need a
 topology file to split the suite across more than one machine.
 
+> **This page covers placement.** `topology.toml` still works exactly as documented below —
+> nothing here changed. If you also want `deploy` to need **no flags at all** (which optional
+> components to drop, `--with-inference`/`--with-agent`, macOS's `--tls`/`--trust-ca`/…), see
+> [secsite.md](secsite.md) — `secsite.toml` is a superset of this file that adds those deploy
+> options on top of the same placement model. The `configure` wizard described below now writes
+> a `secsite.toml`, not a bare `topology.toml`.
+
 ## The model: components → tiers → resources
 
 Every component belongs to one fixed **tier** (declared in `suite.toml`). You assign each
@@ -73,11 +80,13 @@ capabilities = ["fips", "gpu"]
 
 ### Generating it with the wizard
 
-`secdeploy configure` asks a few questions and writes a validated `topology.toml`:
+`secdeploy configure` asks a few questions and writes a validated **`secsite.toml`** (this
+page's placement model plus the deploy options `secsite.toml` adds — see
+[secsite.md](secsite.md) for those):
 
 ```bash
-secdeploy configure                          # writes ./topology.toml
-secdeploy configure --topology sites/prod.toml
+secdeploy configure                     # writes ./secsite.toml
+secdeploy configure --site sites/prod.toml
 ```
 
 Pick a layout preset:
@@ -85,12 +94,18 @@ Pick a layout preset:
 - **single-host** — one resource, every tier on it (equivalent to having no topology file).
 - **gpu-split** — a `core` host (identity + gateway + collaboration) plus one or more `gpu`
   hosts (inference) — answer with a comma-separated list of names (e.g. `gpu1,gpu2`) for
-  several SecLLM instances.
+  several SecLLM instances; also asks where (if anywhere) to place the `edge` tier
+  (secproxy — default: `core`, the common case of one HTTPS front door).
 - **custom** — define N resources, then place each tier yourself; `inference` accepts a
   comma-separated list of resources.
 
 The wizard validates before writing and won't clobber an existing file without confirmation.
-Run `secdeploy verify --topology <file>` afterwards to review the placement.
+Run `secdeploy verify` (or `secdeploy verify --site <file>`) afterwards to review the placement.
+See [secsite.md](secsite.md#the-configure-wizard) for the full flow, including the per-resource
+deploy-option questions and the optional operator-secret seeding step.
+
+A bare `topology.toml` (this file, hand-authored or from an older `configure` run) still works
+unchanged — see [secsite.md's back-compat note](secsite.md#precedence-and-back-compat).
 
 ## Addressing — how components find each other
 

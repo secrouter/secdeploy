@@ -206,15 +206,22 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
     for svc in services:
         steps.append((["bash", "-c", f"rm -rf {OPT}/{svc} && cp -a {work}/{svc} {OPT}/{svc}"],
                       f"install {svc} code → {OPT}/{svc}"))
-    # env files from examples (don't clobber) — secdns/secllm instead get a generated env below;
-    # secproxy needs no env file at all — its only configuration is the generated nginx config
-    # installed below (nginx takes no other environment-driven config from secdeploy).
+    # env files (don't clobber an already-installed one) — secdns/secllm instead get a
+    # generated env below; secproxy needs no env file at all — its only configuration is the
+    # generated nginx config installed below (nginx takes no other environment-driven config
+    # from secdeploy). PREFER a filled deploy/fedora-fips/<svc>.env over the .example when one
+    # exists — that's what `secdeploy configure`'s optional secret-seeding step writes (see
+    # configure.py's _write_env_seeds); a checkout no one has seeded still falls back to the
+    # shipped .example exactly as before.
     for svc in services:
         if svc in ("secdns", "secllm", "secproxy"):
             continue
-        ex = root / f"deploy/fedora-fips/{svc}.env.example"
-        steps.append((["bash", "-c", f"test -f {ETC}/{svc}.env || install -m 640 {ex} {ETC}/{svc}.env"],
-                      f"config {ETC}/{svc}.env (from example if absent)"))
+        filled = root / f"deploy/fedora-fips/{svc}.env"
+        example = root / f"deploy/fedora-fips/{svc}.env.example"
+        src = filled if filled.exists() else example
+        label = "seeded env" if src == filled else "example"
+        steps.append((["bash", "-c", f"test -f {ETC}/{svc}.env || install -m 640 {src} {ETC}/{svc}.env"],
+                      f"config {ETC}/{svc}.env (from {label} if absent)"))
     # secdns — install the topology-generated zone (readable by the service user) + env
     if "secdns" in services and addr_dir is not None:
         steps.append((["install", "-m", "644", "-o", "secsuite-secdns", "-g", "secsuite-secdns",

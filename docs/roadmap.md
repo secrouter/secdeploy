@@ -48,6 +48,17 @@ brought up via their own `bootstrap` where placed — the first deploy writes th
 the example for you to fill in secrets, then the bootstrap does the compose up + wiring.
 Single-host behavior is unchanged (secdns + stacks only deploy with a topology).
 
+**Landed — single-file site config (`secsite.toml`) + secret-seeding.** `secsite.toml` carries
+everything `topology.toml` did plus the deploy options that were CLI-flags-only (a suite-wide
+`[deploy]` table — `without`/`ssh` — and per-resource `with_inference`/`with_agent`/
+`configure_resolver`/`tls`/`configure_hosts`/`trust_ca`/`model_dir`), so a routine `deploy` needs
+no flags; CLI flags still override it one-off. `secdeploy configure` now writes a validated
+`secsite.toml` — every deploy option is asked, but only where it actually applies to a given
+resource — and can optionally seed operator secrets (SecCert's admin token/CA passphrase,
+SecAgent's SecSSO secret/Mattermost bot token, SecRecorder's Hugging Face token, SecRouter's
+`FREEROUTER_CONFIG` path) into the gitignored `*.env` files, never into `secsite.toml` itself.
+See [secsite.md](secsite.md). A bare `topology.toml` still works byte-identically.
+
 Still to do, building on that:
 
 - **Dynamic plan steps** — the per-target `plan` step list is currently static; make it reflect

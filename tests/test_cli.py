@@ -776,3 +776,34 @@ def test_bundle_picks_up_explicit_site(tmp_path):
     assert tarball.exists()
     names = tarfile.open(tarball).getnames()
     assert any("/work/secllm" in n for n in names)
+
+
+# ── fedora-fips prefers a wizard-seeded deploy/fedora-fips/<svc>.env over the .env.example ──
+# (`secdeploy configure`'s optional secret-seeding step writes the former — see configure.py's
+# _write_env_seeds); the `test -f /etc/secsuite/<svc>.env ||` non-clobber guard is unchanged
+# either way. Uses a throwaway "repo root" (a copy of the real suite.toml + nothing else) so
+# `_root(args)` — Path(args.manifest).resolve().parent — points at a tmp dir instead of the
+# actual checkout; --dry-run never reads either file's contents, only whether it EXISTS, so no
+# other deploy/fedora-fips/* assets are needed to exercise this.
+def test_deploy_prefers_seeded_env_over_example(tmp_path, capsys):
+    manifest_copy = tmp_path / "suite.toml"
+    manifest_copy.write_text(Path(MANIFEST).read_text())
+    seeded = tmp_path / "deploy" / "fedora-fips" / "seccert.env"
+    seeded.parent.mkdir(parents=True)
+    seeded.write_text("SECCERT_ADMIN_TOKEN=test-value\n")
+
+    assert main(["--manifest", str(manifest_copy), "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "config /etc/secsuite/seccert.env (from seeded env if absent)" in out
+
+
+def test_deploy_falls_back_to_example_when_no_seeded_env(tmp_path, capsys):
+    manifest_copy = tmp_path / "suite.toml"
+    manifest_copy.write_text(Path(MANIFEST).read_text())
+    # deliberately NOT creating deploy/fedora-fips/seccert.env — only the .example fallback
+    # path is exercised here.
+
+    assert main(["--manifest", str(manifest_copy), "deploy", "fedora-fips", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "config /etc/secsuite/seccert.env (from example if absent)" in out
+    assert "seeded env" not in out
