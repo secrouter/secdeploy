@@ -66,6 +66,7 @@ capabilities = ["fips"]     # gpu | fips | arch tags
 # configure_hosts = false     # macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts
 # trust_ca = false            # macOS only: trust the SecCert root in the System keychain
 # model_dir = ""              # macOS only, air-gapped: pre-downloaded model snapshots dir
+# autostart_models = []       # SecLLM catalog ids to download + load at boot (e.g. ["fast"])
 
 [resources.gpu]
 target = "fedora-fips"
@@ -75,6 +76,7 @@ capabilities = ["fips", "gpu"]
 # wiring for an externally-run SecLLM. Here it's turned ON, so this GPU box actually runs it:
 with_inference = true
 # model_dir = ""              # air-gapped hosts only — see docs/macos.md (macOS target only)
+# autostart_models = ["fast"] # download + load "fast" at boot instead of waiting on the first request
 
 # ── Tier → resource assignments ──────────────────────────────────────────────────────
 # Multiple tiers may share one resource. Omit an all-optional tier (identity, edge) to skip
