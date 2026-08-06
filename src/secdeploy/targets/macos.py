@@ -47,7 +47,8 @@ PLAN = [
     "(--with-inference) Install SecLLM as a launchd daemon (SECLLM_BACKEND=mlx — Apple's "
     "mlx-lm, real local inference — falling back to mock if mlx-lm isn't installed)",
     "(--with-agent) Install SecAgent's chat bridge as a launchd daemon (env layered from the "
-    "generated addressing env + deploy/macos/secrets.env)",
+    "generated addressing env + deploy/macos/secrets.env), then run `secagent init` to wire "
+    "up pi + the secagent CLI for the deploying user (OAuth, not a stored secret)",
     "(--with-agent) Install the pinned LeanCTX binary + pi extension and wire pi for context "
     "compression (air-gapped: no update phone-home; best-effort — see secagent docs/leanctx.md)",
     "Install SecRecorder as a launchd daemon (native MLX/Metal; --tls issues a SecCert cert via "
@@ -518,6 +519,18 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
         elif not P.which("uv"):
             P.warn(f"uv not found — build {name}'s venv on the Mac before deploy "
                    f"(uv sync --project work/{name})")
+    # pi (the agent runtime secagent's tools/skills plug into — see work/secagent/docs/pi.md) is
+    # a global npm tool, not part of secagent's own checkout/venv. Optional: secagent's own
+    # install.sh treats a missing npm the same way (installs everything else, warns, continues)
+    # since pi is only needed for interactive use, never for secagent's own chat/review services.
+    if "secagent" not in without:
+        if P.which("npm"):
+            P.run(["npm", "install", "-g", "@earendil-works/pi-coding-agent"], check=False)
+        else:
+            P.warn("npm not found — pi (the agent runtime secagent's tools/skills plug into) "
+                   "won't be installed; install Node.js, then `npm install -g "
+                   "@earendil-works/pi-coding-agent` yourself, or ignore this if you don't plan "
+                   "to use pi interactively on this Mac")
     P.log(f"built images: {', '.join(_image(manifest, n) for n in images)}")
 
 
@@ -889,6 +902,45 @@ def deploy(
             )
             _install_or_note(secagent, staging_dir, native_services=native_services,
                              dry_run=dry_run, fallback_note=fallback)
+
+        # pi, wired for the DEPLOYING USER (not the chat service above — pi is never in that
+        # service's own request path, see work/secagent/docs/pi.md): `secagent init` writes
+        # ~/.pi/agent/models.json + ~/.secagent/config.yaml using `!secagent token --user` as
+        # the credential (never a stored secret) — the same one-command onboarding secagent's
+        # own install.sh documents for a standalone client (docs/installation.md), just
+        # triggered here instead of typed by hand.
+        #
+        # `secagent init --domain` alone derives raw-port guesses (secrouter.<domain>:47002,
+        # secsso.<domain>:9000) that only work on a topology where those services are reached
+        # directly — WRONG here, where secproxy fronts everything on :443 with no port in the
+        # FQDN (confirmed live: https://secrouter.sec.internal:47002/v1 doesn't even speak TLS,
+        # only plain HTTP does). Pass the ALREADY-CORRECT fronted URLs explicitly instead of
+        # letting it re-derive its own — the exact same SECAGENT_LLM__BASE_URL/SECSSO_URL the
+        # chat bridge above just got wired with, so pi and the chat service agree on how this
+        # topology is actually reachable. Non-fatal: a developer who doesn't want pi shouldn't
+        # have their deploy fail over it.
+        secagent_bin = _venv_bin(root, "secagent", "secagent")
+        secrouter_url = agent_env.get("SECAGENT_LLM__BASE_URL", "")
+        secsso_url = agent_env.get("SECSSO_URL", "")
+        init_args = ["init", "--domain", topology.domain]
+        if secrouter_url:
+            init_args += ["--secrouter-url", secrouter_url]
+        if secsso_url:
+            init_args += ["--secsso-url", secsso_url]
+        init_cmd = " ".join([str(secagent_bin), *init_args])
+        if dry_run:
+            print(f"  · secagent {' '.join(init_args)} (wire up pi + secagent CLI for you; "
+                  "run `secagent login` afterwards)")
+        elif not secagent_bin.exists():
+            P.warn(f"secagent: no project venv — run `secdeploy build macos` first, then: {init_cmd}")
+        else:
+            r = P.run([str(secagent_bin), *init_args], check=False)
+            if r.returncode == 0:
+                P.log("pi wired for you (~/.pi/agent/models.json, ~/.secagent/config.yaml) — "
+                      "run `secagent login` to authenticate, then `pi --extension "
+                      "work/secagent/pi/extensions/secagent.ts`")
+            else:
+                P.warn(f"secagent init failed — wire up pi yourself: {init_cmd}")
 
     # SecRecorder — native MLX/Metal (never containerized on macOS). Runs as the user; TLS optional
     # (a SecCert cert via certbot, reachable across the container boundary through
