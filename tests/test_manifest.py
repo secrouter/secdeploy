@@ -19,7 +19,7 @@ def test_load_shipped_manifest():
     assert m.suite == "1.6.0"
     assert ALL <= set(m.components)
     assert m.components["secrecorder"].ref == "v0.8.2"
-    assert m.components["secagent"].ref == "v0.2.1"
+    assert m.components["secagent"].ref == "v0.3.0"   # LeanCTX-bearing release
     assert set(m.targets) == {"macos", "fedora-fips"}
 
 

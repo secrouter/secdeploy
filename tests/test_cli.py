@@ -368,6 +368,36 @@ def test_macos_venv_helpers(tmp_path):
     assert macos._ensure_native_venv(root, "secllm") is False
 
 
+def test_deploy_macos_with_agent_installs_leanctx(tmp_path, capsys):
+    """--with-agent on macOS installs the pinned LeanCTX binary + pi extension and wires pi,
+    air-gapped (no update phone-home). secagent v0.3.0 ships LeanCTX on by default."""
+    tp = tmp_path / "t.toml"
+    tp.write_text("""
+domain = "sec.internal"
+upstream_dns = ["1.1.1.1"]
+[resources.mac]
+target = "macos"
+address = "127.0.0.1"
+[groups.identity]
+resource = "mac"
+[groups.inference]
+resource = "mac"
+[groups.gateway]
+resource = "mac"
+[groups.collab]
+resource = "mac"
+[groups.edge]
+resource = "mac"
+""")
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run",
+                 "--topology", str(tp), "--resource", "mac", "--with-agent"]) == 0
+    out = capsys.readouterr().out
+    assert "LeanCTX" in out
+    assert "lean-ctx-bin@3.9.17" in out and "pi-lean-ctx@3.9.17" in out
+    assert "LEAN_CTX_NO_UPDATE_CHECK=1" in out          # air-gapped: no update phone-home
+    assert "lean-ctx init --agent pi" in out
+
+
 def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):
     # no topology → single-host mode → secproxy is topology-gated, same rule as secdns —
     # byte-identical to every pre-secproxy macOS deploy.
