@@ -144,8 +144,16 @@ def install_command(svc: LaunchdService, staging_dir: Path) -> tuple[list[str], 
     """
     stage = shlex.quote(str(staging_path(svc, staging_dir)))
     dest = shlex.quote(str(svc.plist_path))
+    out_log = shlex.quote(str(svc.stdout_path))
+    err_log = shlex.quote(str(svc.stderr_path))
+    owner = shlex.quote(svc.user or "root")
     script = (
         f"cp {stage} {dest} && chown root:wheel {dest} && chmod 644 {dest} && "
+        # launchd opens StandardOut/ErrorPath AS THE JOB'S USER, so a log left owned by a prior
+        # run as a DIFFERENT user (e.g. SecDNS moving from a root :53 daemon to a user high-port
+        # one) makes the open fail and the whole spawn abort with EX_CONFIG (78) — before the
+        # program runs a line. Make sure the logs exist and are owned by this service's user.
+        f"touch {out_log} {err_log} && chown {owner} {out_log} {err_log} && "
         f"{{ launchctl bootout system {dest} 2>/dev/null || true; }} && "
         f"launchctl bootstrap system {dest}"
     )

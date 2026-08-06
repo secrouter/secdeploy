@@ -85,6 +85,17 @@ def test_install_command_copies_fixes_ownership_and_bootstraps(tmp_path):
     assert "internal.secsuite.secdns" in desc
 
 
+def test_install_command_owns_logs_to_service_user(tmp_path):
+    """launchd opens the log paths as the job's user, so a log left owned by a prior run as a
+    different user aborts the spawn (EX_CONFIG). The install touch+chowns them to this service's
+    user — root for a root service, the named user otherwise."""
+    user_script = launchd.install_command(_svc(name="secllm", user="probe"), tmp_path)[0][3]
+    assert "touch " in user_script
+    assert "chown probe " in user_script            # user service → logs owned by that user
+    root_script = launchd.install_command(_svc(name="secproxy", user=None), tmp_path)[0][3]
+    assert "chown root " in root_script             # root service → logs owned by root
+
+
 def test_staging_path_under_staging_dir(tmp_path):
     assert launchd.staging_path(_svc(name="secllm"), tmp_path) == \
         tmp_path / "internal.secsuite.secllm.plist"
