@@ -299,6 +299,79 @@ resource = "mac"
     assert "secdns serve" in out
 
 
+def test_deploy_macos_with_agent_dry_run_shows_secagent_init(tmp_path, monkeypatch, capsys):
+    """--with-agent's dry-run mentions BOTH the launchd chat-bridge daemon and the follow-up
+    `secagent init` call that wires up pi + the secagent CLI for the deploying user (see
+    targets/macos.py's deploy()) — distinct from the chat service itself, which never uses pi.
+
+    monkeypatch.chdir(tmp_path) isolates this from any secsite.toml/topology.toml an operator
+    happens to have sitting in the repo root (active_site prefers those over --topology — see
+    test_deploy_secsite_toml_autodetected_in_cwd) — most of this file's deploy/plan tests skip
+    this and so break the moment a real one exists there; a pre-existing gap, not something to
+    fix wholesale here, but not worth reproducing in a new test either."""
+    monkeypatch.chdir(tmp_path)
+    topo = """
+domain = "sec.internal"
+[resources.mac]
+target = "macos"
+address = "127.0.0.1"
+[groups.identity]
+resource = "mac"
+[groups.inference]
+resource = "mac"
+[groups.gateway]
+resource = "mac"
+[groups.collab]
+resource = "mac"
+"""
+    tp = tmp_path / "t.toml"
+    tp.write_text(topo)
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run", "--with-agent",
+                 "--topology", str(tp), "--resource", "mac"]) == 0
+    out = capsys.readouterr().out
+    assert "launchd internal.secsuite.secagent" in out
+    assert "secagent init --domain sec.internal" in out
+
+
+def test_deploy_macos_with_agent_secagent_init_uses_fronted_urls_not_raw_ports(
+    tmp_path, monkeypatch, capsys,
+):
+    """secagent init's OWN --domain-derived guess (secrouter.<domain>:47002, secsso.<domain>:9000)
+    is wrong on a topology where secproxy fronts everything on :443 with no port in the FQDN —
+    confirmed live against a real deploy (that URL doesn't even speak TLS). deploy() must pass
+    the already-correct fronted URLs (the same SECAGENT_LLM__BASE_URL/SECSSO_URL the chat bridge
+    itself is wired with) explicitly, once the addressing env exists to read them from."""
+    monkeypatch.chdir(tmp_path)
+    topo = """
+domain = "sec.internal"
+[resources.mac]
+target = "macos"
+address = "127.0.0.1"
+[groups.identity]
+resource = "mac"
+[groups.inference]
+resource = "mac"
+[groups.gateway]
+resource = "mac"
+[groups.collab]
+resource = "mac"
+"""
+    tp = tmp_path / "t.toml"
+    tp.write_text(topo)
+    env_dir = tmp_path / "out" / "addressing" / "env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "secagent.env").write_text(
+        "SECAGENT_LLM__BASE_URL=https://secrouter.sec.internal/v1\n"
+        "SECSSO_URL=https://secsso.sec.internal\n"
+    )
+    assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run", "--with-agent",
+                 "--topology", str(tp), "--resource", "mac"]) == 0
+    out = capsys.readouterr().out
+    assert "--secrouter-url https://secrouter.sec.internal/v1" in out
+    assert "--secsso-url https://secsso.sec.internal" in out
+    assert ":47002" not in out and ":9000" not in out
+
+
 # ── secproxy on macOS: native nginx (not a container — see targets/macos.py's module
 #    docstring), gated on topology placement only, exactly like secdns above ─────────────
 def test_deploy_macos_topology_secproxy_native(tmp_path, capsys):
