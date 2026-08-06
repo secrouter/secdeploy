@@ -48,6 +48,8 @@ PLAN = [
     "mlx-lm, real local inference — falling back to mock if mlx-lm isn't installed)",
     "(--with-agent) Install SecAgent's chat bridge as a launchd daemon (env layered from the "
     "generated addressing env + deploy/macos/secrets.env)",
+    "(--with-agent) Install the pinned LeanCTX binary + pi extension and wire pi for context "
+    "compression (air-gapped: no update phone-home; best-effort — see secagent docs/leanctx.md)",
     "Install SecRecorder as a launchd daemon (native MLX/Metal; --tls issues a SecCert cert via "
     "certbot; HF_TOKEN/--model-dir layered in)",
     "Install secproxy (nginx :443/:80, root) as a launchd daemon — macOS-local conf + a "
@@ -71,6 +73,11 @@ SECRECORDER_PORT = 47003
 # _configure_resolver + the secdns launchd unit in deploy(). fedora-fips keeps the standard :53
 # (systemd, root, no Lima).
 SECDNS_MACOS_PORT = 15353
+
+# Pinned LeanCTX version (matches secagent's config.LEANCTX_VERSION) — the context-compression
+# binary + pi extension the secagent standup installs + wires into pi. Air-gapped (no update
+# phone-home); secagent's own-call compression daemon is a separate, deferred piece.
+LEANCTX_VERSION = "3.9.17"
 
 
 def _image(manifest: Manifest, name: str) -> str:
@@ -176,6 +183,40 @@ def _ensure_nginx() -> None:
     else:
         P.warn("nginx not found and brew is unavailable — install nginx manually for secproxy "
                "(https://nginx.org/en/docs/install.html)")
+
+
+def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
+    """Install the pinned LeanCTX binary + pi extension and wire them into pi on this box —
+    context compression for the developer's pi (secagent v0.3.0 ships LeanCTX on by default; see
+    its docs/leanctx.md). Best-effort + air-gapped: ``LEAN_CTX_NO_UPDATE_CHECK=1`` so it never
+    phones home, and a missing ``npm`` just skips it (secagent degrades gracefully — ``secagent
+    doctor`` reports whether LeanCTX is actually present).
+
+    Scope note: this wires the pi-side compression only. secagent's OWN-CALL compression needs
+    LeanCTX's persistent daemon, which it self-manages (its own LaunchAgents, incl. an
+    auto-updater) — a separate, deliberately-deferred piece to verify live before enabling."""
+    install = f"npm install -g lean-ctx-bin@{LEANCTX_VERSION} pi-lean-ctx@{LEANCTX_VERSION}"
+    if dry_run:
+        print(f"  · (--with-agent) LeanCTX: {install}, then LEAN_CTX_NO_UPDATE_CHECK=1 "
+              "lean-ctx harden && lean-ctx init --agent pi (air-gapped; best-effort)")
+        return
+    if not P.which("npm"):
+        P.warn(f"npm not found — skipping LeanCTX (context compression). Install it, then: {install} "
+               "(see secagent docs/leanctx.md)")
+        return
+    P.log(f"installing LeanCTX (binary + pi extension, pinned {LEANCTX_VERSION})")
+    P.run(["npm", "install", "-g", f"lean-ctx-bin@{LEANCTX_VERSION}",
+           f"pi-lean-ctx@{LEANCTX_VERSION}"], check=False)
+    if not P.which("lean-ctx"):
+        P.warn("LeanCTX binary not on PATH after install — pi-side compression won't run yet "
+               "(re-run once `lean-ctx` is installed; see secagent docs/leanctx.md)")
+        return
+    # Air-gapped: never phone home for updates. harden tightens the MCP/shell surface; init --agent
+    # pi writes pi's LeanCTX config. Both best-effort — a failure here never aborts the deploy.
+    env = {**_os_environ(), "LEAN_CTX_NO_UPDATE_CHECK": "1"}
+    P.run(["lean-ctx", "harden"], check=False, env=env)
+    P.run(["lean-ctx", "init", "--agent", "pi"], check=False, env=env)
+    P.log("LeanCTX wired into pi (hardened, update-check disabled)")
 
 
 def _configure_hosts(assume_yes: bool = False) -> None:
@@ -822,6 +863,9 @@ def deploy(
     # into the launchd job's EnvironmentVariables — the macOS equivalent of fedora's two
     # EnvironmentFile= layers, closing the old "source it yourself" eval gap. Runs as the user.
     if with_agent and topology is not None and _here("secagent"):
+        # LeanCTX (secagent v0.3.0 ships it on by default): install the pinned binary + pi
+        # extension and wire pi for context compression on this box — air-gapped, best-effort.
+        _wire_leanctx_for_pi(dry_run)
         # Listen on secagent's MANIFEST port (fronted by secproxy at that port) — not the CLI's
         # own 8070 default — so the secagent.<domain> reverse-proxy route actually reaches it
         # (secproxy dials the topology port). Mirrors secllm using its manifest port above.

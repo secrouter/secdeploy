@@ -102,6 +102,14 @@ launchd job's `EnvironmentVariables` — the macOS equivalent of fedora-fips's t
 layers, closing the old "source it yourself" gap. See
 [SecAgent and Mattermost](fedora-fips.md#secagent-and-mattermost) for the full turnkey standup.
 
+`--with-agent` also installs **LeanCTX** (context compression — SecAgent v0.3.0 ships it on by
+default): the pinned `lean-ctx` binary + `pi-lean-ctx` extension are installed and wired into pi
+(`lean-ctx harden` + `lean-ctx init --agent pi`), **air-gapped** (`LEAN_CTX_NO_UPDATE_CHECK=1`, no
+update phone-home), best-effort (a missing `npm` just skips it — SecAgent degrades gracefully; run
+`secagent doctor` to check). This wires the pi-side compression only; SecAgent's own-call
+compression daemon is a deferred follow-on (LeanCTX self-manages that, incl. an auto-updater to
+suppress). See SecAgent's `docs/leanctx.md` for the full security posture.
+
 ### Internal DNS (`*.internal`) on macOS
 
 A single-host eval has no topology and no `.internal` names — reach everything at

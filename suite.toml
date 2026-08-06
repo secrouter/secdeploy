@@ -72,7 +72,7 @@ role = "governed AI gateway"
 # ── Agents & collaboration ──
 [components.secagent]
 repo = "secrouter/secagent"
-ref = "v0.2.1"
+ref = "v0.3.0"
 kind = "service"
 tier = "collab"
 port = 47007
