@@ -349,6 +349,10 @@ resource = "mac"
     secdns_line = next(ln for ln in out.splitlines() if "internal.secsuite.secdns (" in ln)
     prog = secdns_line.split("): ", 1)[1].split()[0]
     assert prog.startswith("/") and prog.endswith("/work/secdns/.venv/bin/secdns")
+    # SecDNS runs as the user on the high port 15353 (NOT root on :53 — Colima's limactl holds :53),
+    # and the resolver is pointed at that high port
+    assert "as root" not in secdns_line
+    assert "15353" in out
 
 
 def test_macos_venv_helpers(tmp_path):

@@ -1,13 +1,13 @@
 """macOS (Apple Silicon) target.
 
 SecCert + SecRouter run as containers via Docker Compose (Colima). The native services —
-SecDNS (:53), SecLLM, SecAgent, SecRecorder (MLX/Metal — can't run in Docker on macOS) and
+SecDNS, SecLLM, SecAgent, SecRecorder (MLX/Metal — can't run in Docker on macOS) and
 secproxy's nginx (:443/:80) — run **natively**, installed and supervised as **launchd
 daemons** (see :mod:`secdeploy.launchd`) so a deploy actually starts and keeps them running
 rather than printing a run command for the operator to paste. SecCert comes up first as the
 internal CA; its root is exported so hosts/clients can trust the suite. SecDNS is installed
 before the resolver is pointed at it (``--configure-resolver``), so ``<domain>`` names resolve
-immediately instead of hitting a not-yet-started :53. ``--no-native-services`` falls back to
+immediately instead of hitting a not-yet-started server. ``--no-native-services`` falls back to
 printing the run commands (foreground, DIY).
 """
 
@@ -40,7 +40,8 @@ PLAN = [
     "Ensure ffmpeg is installed (SecRecorder transcoding — installs via brew if missing)",
     "(--configure-hosts) Map host.docker.internal to 127.0.0.1 in /etc/hosts (sudo, asks first)",
     "(--trust-ca) Trust the SecCert root in the System keychain (sudo, asks first)",
-    "Install SecDNS as a launchd daemon (:53, root) — BEFORE the resolver step",
+    "Install SecDNS as a launchd daemon (high port SECDNS_MACOS_PORT, as the user — :53 is "
+    "Colima's) — BEFORE the resolver step",
     "(--configure-resolver) Point /etc/resolver/<domain> at the now-running SecDNS (sudo)",
     "(--with-inference) Install SecLLM as a launchd daemon (GPU-free eval via SECLLM_BACKEND=mock)",
     "(--with-agent) Install SecAgent's chat bridge as a launchd daemon (env layered from the "
@@ -60,6 +61,14 @@ IMAGES = ("seccert", "secrouter")  # secrecorder is native on macOS
 CERT_HOST = "host.docker.internal"
 HTTP01_PORT = 47080
 SECRECORDER_PORT = 47003
+
+# SecDNS listens on this HIGH port on macOS instead of the privileged :53. Colima's own VM manager
+# (`limactl`) binds host :53, so a :53 SecDNS collides with it and crash-loops; and a high port
+# also lets SecDNS run as the invoking user (no root). macOS's /etc/resolver/<domain> supports a
+# `port` directive (resolver(5)), so the resolver is pointed at 127.0.0.1:<this> — see
+# _configure_resolver + the secdns launchd unit in deploy(). fedora-fips keeps the standard :53
+# (systemd, root, no Lima).
+SECDNS_MACOS_PORT = 15353
 
 
 def _image(manifest: Manifest, name: str) -> str:
@@ -143,19 +152,24 @@ def _configure_hosts(assume_yes: bool = False) -> None:
     P.run(["sudo", "sh", "-c", f"echo '127.0.0.1 {CERT_HOST}' >> /etc/hosts"])
 
 
-def _configure_resolver(domain: str, dns_ip: str, assume_yes: bool = False) -> bool:
+def _configure_resolver(domain: str, dns_ip: str, port: int = 53, assume_yes: bool = False) -> bool:
     """Point macOS at secdns for ``domain`` via /etc/resolver/<domain> — the multi-host
     replacement for the /etc/hosts ``host.docker.internal`` trick. macOS routes queries for a
-    domain to the nameserver named in that file. Returns whether the resolver was actually
-    pointed at secdns (``False`` if the operator declined the confirm prompt) — the deploy
-    audit artifact (audit.py) records this as a security-relevant authorization."""
+    domain to the nameserver named in that file. When secdns listens on a non-standard ``port``
+    (it does on macOS — :53 is taken by Colima's ``limactl``, see :data:`SECDNS_MACOS_PORT`), a
+    ``port`` line is added — macOS's resolver(5) honours it, so the stub resolver dials
+    ``dns_ip:port``. Returns whether the resolver was actually pointed at secdns (``False`` if the
+    operator declined) — the deploy audit artifact (audit.py) records this as a security-relevant
+    authorization."""
     path = f"/etc/resolver/{domain}"
-    if not P.confirm(f"Point {domain} at secdns ({dns_ip}) via {path}?", assume_yes):
+    where = f"{dns_ip}:{port}" if port != 53 else dns_ip
+    if not P.confirm(f"Point {domain} at secdns ({where}) via {path}?", assume_yes):
         P.warn(f"skipped resolver config — {domain} names won't resolve via secdns on this host")
         return False
+    body = f"nameserver {dns_ip}\\n" + (f"port {port}\\n" if port != 53 else "")
     P.run(["sudo", "mkdir", "-p", "/etc/resolver"])
-    P.run(["sudo", "sh", "-c", f"printf 'nameserver {dns_ip}\\n' > {path}"])
-    P.log(f"{domain} → secdns {dns_ip} ({path})")
+    P.run(["sudo", "sh", "-c", f"printf '{body}' > {path}"])
+    P.log(f"{domain} → secdns {where} ({path})")
     return True
 
 
@@ -381,15 +395,16 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
 # The macOS runtime for the suite's native services: rather than PRINT a run command and leave the
 # operator to start (and re-start) each one by hand — the gap that left SecDNS down and `.internal`
 # unresolvable after a deploy — deploy() installs each as a launchd daemon via these helpers (see
-# launchd.py). The UNPRIVILEGED services run as the invoking user; SecDNS (:53) and secproxy
-# (:443/:80) run as root.
+# launchd.py). Only secproxy (binds :443/:80) runs as root; the rest — including SecDNS, which uses
+# the high SECDNS_MACOS_PORT rather than the privileged :53 (Colima's limactl holds :53) — run as
+# the invoking user.
 
 
 def _native_user() -> tuple[str, str]:
-    """The user (and home dir) the UNPRIVILEGED launchd services run as — the real invoking user
-    even if the deploy was started under sudo (``SUDO_USER``), so ``uv``/its project venv/``$HOME``
-    resolve exactly as they did when ``build`` created them. The privileged services (SecDNS :53,
-    secproxy :443/:80) ignore this and run as root (``LaunchdService.user is None``)."""
+    """The user (and home dir) the user-run launchd services run as — the real invoking user even
+    if the deploy was started under sudo (``SUDO_USER``), so ``uv``/its project venv/``$HOME``
+    resolve exactly as they did when ``build`` created them. Only secproxy (:443/:80) runs as root
+    (``LaunchdService.user is None``); SecDNS is a user service too (high port, not :53)."""
     user = os.environ.get("SUDO_USER") or getpass.getuser()
     try:
         home = pwd.getpwnam(user).pw_dir
@@ -602,12 +617,14 @@ def deploy(
     # Each is installed as a launchd daemon (RunAtLoad + KeepAlive) so the deploy actually STARTS
     # and supervises it — the fix for "I deployed but nothing is running / .internal won't resolve"
     # (--no-native-services / --dry-run print the run command instead). SecDNS is installed FIRST,
-    # so the resolver step below points at a RUNNING server rather than a dead 127.0.0.1:53 — the
-    # footgun that made every .internal name fail after a deploy.
+    # so the resolver step below points at a RUNNING server rather than a not-yet-started one.
+    # SecDNS runs on the HIGH port SECDNS_MACOS_PORT (not :53 — Colima's limactl holds host :53) and
+    # therefore as the invoking user, not root; the resolver below carries a matching `port` line.
     if topology is not None and _here("secdns"):
         zone = base_out / "addressing" / "secdns.zone"
-        fallback = (f"sudo SECDNS_DOMAIN={topology.domain} SECDNS_ZONE={zone} "
+        fallback = (f"SECDNS_DOMAIN={topology.domain} SECDNS_ZONE={zone} "
                     f"SECDNS_UPSTREAM={','.join(topology.upstream_dns)} "
+                    f"SECDNS_PORT={SECDNS_MACOS_PORT} SECDNS_BIND=127.0.0.1 "
                     f"uv run --project work/secdns secdns serve")
         if not dry_run and native_services and not _ensure_native_venv(root, "secdns"):
             P.warn(f"secdns: no project venv — run `secdeploy build macos`, then start it: {fallback}")
@@ -616,16 +633,18 @@ def deploy(
                 name="secdns",
                 program_args=[str(_venv_bin(root, "secdns", "secdns")), "serve"],
                 log_dir=log_dir,
-                env={**_base_env(), "SECDNS_DOMAIN": topology.domain, "SECDNS_ZONE": str(zone),
-                     "SECDNS_UPSTREAM": ",".join(topology.upstream_dns), "SECDNS_PORT": "53",
+                env={**_base_env(home), "SECDNS_DOMAIN": topology.domain, "SECDNS_ZONE": str(zone),
+                     "SECDNS_UPSTREAM": ",".join(topology.upstream_dns),
+                     "SECDNS_PORT": str(SECDNS_MACOS_PORT), "SECDNS_BIND": "127.0.0.1",
                      "SECDNS_ADMIN_BIND": "127.0.0.1", "SECDNS_ADMIN_PORT": "47053"},
                 working_dir=str(root),
-                user=None,  # root — binds :53
+                user=user,  # high port → no root needed (and :53 is Colima's anyway)
             )
             _install_or_note(secdns, staging_dir, native_services=native_services,
                              dry_run=dry_run, fallback_note=fallback)
 
-    # Point this host's resolver at secdns — AFTER secdns is up (see above).
+    # Point this host's resolver at secdns — AFTER secdns is up (see above). On macOS secdns is on
+    # SECDNS_MACOS_PORT, so the resolver entry carries a matching `port` line (resolver(5)).
     resolver_configured = False
     if configure_resolver and topology is not None:
         dns_ip = wiring.secdns_address_for(topology, resource, without)
@@ -633,13 +652,14 @@ def deploy(
             if not dry_run:
                 P.warn("--configure-resolver: secdns isn't placed in this topology — nothing to point at")
         elif dry_run:
-            print(f"  · (--configure-resolver) point {topology.domain} at secdns {dns_ip} "
-                  f"via /etc/resolver/{topology.domain} (sudo, asks first)")
+            print(f"  · (--configure-resolver) point {topology.domain} at secdns "
+                  f"{dns_ip}:{SECDNS_MACOS_PORT} via /etc/resolver/{topology.domain} (sudo, asks first)")
         else:
             if not native_services:
                 P.warn(f"--no-native-services: {topology.domain} won't resolve until you start "
                        "secdns yourself (note above) — pointing the resolver at it regardless")
-            resolver_configured = _configure_resolver(topology.domain, dns_ip, assume_yes)
+            resolver_configured = _configure_resolver(
+                topology.domain, dns_ip, SECDNS_MACOS_PORT, assume_yes)
 
     # secllm — opt-in inference; GPU-free eval via SECLLM_BACKEND=mock (no GPU passthrough into
     # Colima). Runs as the user (high port).

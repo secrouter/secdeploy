@@ -61,16 +61,18 @@ What `deploy macos` does:
 
 ### Native services (launchd)
 
-SecCert and SecRouter are containers; everything else that runs on macOS — **SecDNS** (`:53`),
-**SecLLM**, **SecAgent**, **SecRecorder** (MLX/Metal, never containerized here) and **secproxy**'s
-nginx (`:443`/`:80`) — runs natively and is installed as a **launchd daemon** so `deploy` actually
-starts and *keeps* it running (`RunAtLoad` + `KeepAlive`) instead of printing a command for you to
-paste and babysit. The units live at `/Library/LaunchDaemons/internal.secsuite.<name>.plist`:
+SecCert and SecRouter are containers; everything else that runs on macOS — **SecDNS**, **SecLLM**,
+**SecAgent**, **SecRecorder** (MLX/Metal, never containerized here) and **secproxy**'s nginx
+(`:443`/`:80`) — runs natively and is installed as a **launchd daemon** so `deploy` actually starts
+and *keeps* it running (`RunAtLoad` + `KeepAlive`) instead of printing a command for you to paste
+and babysit. The units live at `/Library/LaunchDaemons/internal.secsuite.<name>.plist`:
 
-- **SecDNS** and **secproxy** bind privileged ports (`:53`, `:443`/`:80`), so they run as **root**
-  (macOS has no per-port capability like Linux's `CAP_NET_BIND_SERVICE`). SecLLM, SecAgent and
-  SecRecorder run as **you** (the invoking user), so `uv`/their project venvs/`$HOME` resolve
-  exactly as they did at `build` time.
+- Only **secproxy** binds privileged ports (`:443`/`:80`), so it's the one service that runs as
+  **root** (macOS has no per-port capability like Linux's `CAP_NET_BIND_SERVICE`). SecDNS, SecLLM,
+  SecAgent and SecRecorder run as **you** (the invoking user), so `uv`/their project venvs/`$HOME`
+  resolve exactly as they did at `build` time. SecDNS in particular listens on a **high port**
+  (`15353`), not `:53` — Colima's own VM manager (`limactl`) holds host `:53`, so a `:53` SecDNS
+  would collide with it; the resolver is pointed at that high port instead (below).
 - Installing a LaunchDaemon writes a root-owned directory, so it uses `sudo` (the same escalation
   the resolver/keychain steps already ask for; macOS caches it, so you're prompted at most once).
 - Logs are captured under `out/logs/<name>.{out,err}.log`. Check status with
@@ -106,20 +108,22 @@ A single-host eval has no topology and no `.internal` names — reach everything
 `localhost:<port>` (see [Verify](#verify)). With a `topology.toml`, though, the suite's
 `<component>.<domain>` hostnames **do** work on macOS; it isn't a Linux-only feature:
 
-- **SecDNS runs natively** on `:53`, installed as a launchd daemon (as root) and **started by the
-  deploy** — no `sudo … secdns serve` to run by hand.
+- **SecDNS runs natively** on the high port `15353` (not `:53` — Colima's `limactl` holds host
+  `:53`), installed as a launchd daemon (as your user) and **started by the deploy** — no
+  `secdns serve` to run by hand.
 - **`deploy macos --configure-resolver`** writes `/etc/resolver/<domain>` pointing that domain
-  at SecDNS — macOS's native per-domain resolver — so `secrouter.<domain>` and friends resolve
-  on the host. The deploy installs **SecDNS first, then** points the resolver at it, so there's no
-  window where `<domain>` names are routed to a not-yet-running `:53` (an earlier version
-  configured the resolver against a SecDNS you still had to start yourself — every `.internal`
+  at SecDNS with a matching `port 15353` line (macOS's resolver(5) honours it) — so
+  `secrouter.<domain>` and friends resolve on the host. The deploy installs **SecDNS first, then**
+  points the resolver at it, so there's no window where `<domain>` names are routed to a
+  not-yet-running server (an earlier version configured the resolver against a SecDNS you still
+  had to start yourself — every `.internal`
   lookup failed until you did; that's fixed).
 
 Verify resolution once the deploy finishes:
 
 ```bash
-dig @127.0.0.1 secrouter.sec.internal +short   # ask SecDNS directly
-sudo killall -HUP mDNSResponder                 # flush the macOS resolver cache
+dig @127.0.0.1 -p 15353 secrouter.sec.internal +short   # ask SecDNS directly (its high port)
+sudo killall -HUP mDNSResponder                          # flush the macOS resolver cache
 dscacheutil -q host -a name secrouter.sec.internal
 ```
 
