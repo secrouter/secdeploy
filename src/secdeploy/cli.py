@@ -60,6 +60,15 @@ def _resolved_without(cli_value: str | None, site_without: list[str]) -> list[st
     return [s.strip() for s in cli_value.split(",") if s.strip()]
 
 
+def _resolved_list(cli_value: str | None, site_value: list[str]) -> list[str]:
+    """Same tri-state resolution as :func:`_resolved_without`, generalized to any
+    comma-separated list flag (here: ``--autostart-models``) — ``None`` means "the operator
+    didn't pass this flag," not "clear the list.\""""
+    if cli_value is None:
+        return list(site_value)
+    return [s.strip() for s in cli_value.split(",") if s.strip()]
+
+
 def _site_or_topology_path(args) -> str:
     """The effective placement FILE PATH for commands that only need placement, not deploy
     options (verify/plan already resolve a full SiteConfig instead; bundle uses this) —
@@ -262,6 +271,7 @@ def cmd_deploy(args) -> int:
         with_inference=_resolved(args.with_inference, opts.with_inference),
         with_agent=_resolved(args.with_agent, opts.with_agent),
         native_services=args.native_services,
+        autostart_models=_resolved_list(args.autostart_models, opts.autostart_models),
     )
     return 0
 
@@ -398,6 +408,13 @@ def build_parser() -> argparse.ArgumentParser:
              "this additionally installs + starts the secllm service). fedora-fips only; macOS "
              "prints a native run command instead (see docs/macos.md). Overrides the resource's "
              "secsite.toml `with_inference` when given.",
+    )
+    sub.choices["deploy"].add_argument(
+        "--autostart-models", default=None,
+        help="comma-separated SecLLM catalog ids (e.g. fast,gemma-31b) to download (if not "
+             "already cached) and load the moment the secllm service starts, instead of on "
+             "first request via /admin. Only takes effect with --with-inference. Overrides the "
+             "resource's secsite.toml `autostart_models` when given.",
     )
     sub.choices["deploy"].add_argument(
         "--with-agent", action="store_true", default=None, dest="with_agent",

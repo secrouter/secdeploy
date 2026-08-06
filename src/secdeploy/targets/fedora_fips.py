@@ -122,6 +122,49 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     P.log("native build complete (SecRouter dist + SecCert/SecRecorder/secdns/secllm/secagent venvs)")
 
 
+def _secrecorder_hf_token_set() -> bool:
+    """Whether HF_TOKEN is already set in the installed secrecorder.env (see targets/macos.py's
+    ``_read_hf_token`` — same idea, different path: fedora's env file IS the final one the
+    operator edits directly, no staging secrets.env)."""
+    env_path = ETC / "secrecorder.env"
+    if not env_path.exists():
+        return False
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("HF_TOKEN=") and line[len("HF_TOKEN="):]:
+            return True
+    return False
+
+
+def _secproxy_setup_actions(
+    services: list[str], stacks: list[str], *, resolver_configured: bool,
+) -> list[str]:
+    """The landing page's 'finish setup' checklist — mirrors ``targets/macos.py``'s helper of the
+    same name. CA trust is automatic here (``update-ca-trust`` runs whenever seccert is part of
+    the deploy — see ``_deploy_steps``), so unlike macOS there's no separate trust-anchor action;
+    only the resolver/HF_TOKEN/SecChat items can still be outstanding."""
+    actions: list[str] = []
+    if not resolver_configured:
+        actions.append(
+            "Point this host's resolver at SecDNS: "
+            "<code>secdeploy deploy fedora-fips --configure-resolver</code>."
+        )
+    if "secrecorder" in services and not _secrecorder_hf_token_set():
+        actions.append(
+            "SecRecorder's speaker diarization needs a Hugging Face token (transcription "
+            'works fine without one): accept <a href="https://huggingface.co/pyannote/'
+            "speaker-diarization-community-1\">the gated model's terms</a>, create a read "
+            "token, then set <code>HF_TOKEN</code> in <code>/etc/secsuite/secrecorder.env</code> "
+            "and <code>systemctl restart secrecorder</code>."
+        )
+    if "secchat" in stacks:
+        actions.append(
+            "Finish SecChat's bot + team setup (safe to re-run): "
+            "<code>bash work/secchat/bootstrap/secchat.sh bot</code>."
+        )
+    return actions
+
+
 def _issue_secproxy_cert(topology, without: list[str] | None = None) -> list[tuple[list[str], str]]:
     """Deploy steps that get secproxy ONE SAN certificate from SecCert — covering every fronted,
     placed FQDN — via ``certbot --standalone``, then install it to the cert dir nginx reads
@@ -151,6 +194,8 @@ def _issue_secproxy_cert(topology, without: list[str] | None = None) -> list[tup
     fqdns = [fqdn for fqdn, _addr, _port in wiring.fronted_instances(topology, without)]
     if not fqdns or seccert is None or not seccert.port:
         return []
+    # The bare domain too — it's what wiring.nginx_conf_text's landing-page server block serves.
+    fqdns = [topology.domain] + fqdns
     acme = f"http://{topology.fqdn('seccert')}:{seccert.port}/acme/directory"
     cb = VAR / "secproxy" / "certbot"
     live = cb / "config" / "live" / "secproxy"
@@ -324,7 +369,8 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
     if "secproxy" in services and addr_dir is not None:
         for sub, desc in ((SECPROXY_CERT_DIR, "cert dir"),
                           (VAR / "secproxy" / "acme", "ACME-challenge webroot"),
-                          (VAR / "secproxy" / "tmp", "nginx temp/runtime dir")):
+                          (VAR / "secproxy" / "tmp", "nginx temp/runtime dir"),
+                          (VAR / "secproxy" / "www", "landing page www root")):
             steps.append((
                 ["install", "-d", "-m", "750", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
                  str(sub)],
@@ -334,6 +380,13 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
             ["install", "-m", "644", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
              str(addr_dir / "secproxy.nginx.conf"), str(SECPROXY_NGINX_CONF)],
             f"install generated nginx config → {SECPROXY_NGINX_CONF}",
+        ))
+        # Landing page (see wiring.landing_page_html) — generated + written to addr_dir alongside
+        # the nginx config in deploy(), same pattern as everything else staged there.
+        steps.append((
+            ["install", "-m", "644", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
+             str(addr_dir / "secproxy-index.html"), str(VAR / "secproxy" / "www" / "index.html")],
+            f"install landing page → {VAR / 'secproxy' / 'www' / 'index.html'}",
         ))
         if topology is not None:
             steps += _issue_secproxy_cert(topology, without)
@@ -375,6 +428,7 @@ def deploy(
     with_inference: bool = False,
     with_agent: bool = False,
     native_services: bool = True,
+    autostart_models: list[str] | None = None,
 ) -> None:
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
     # systemd-native, so it's accepted for calling-convention parity with macos.deploy() and
@@ -498,6 +552,9 @@ def deploy(
                 trust_anchor=trust_anchor_added, resolver=resolver_configured,
             )
             print(f"  · {note}")
+        if ("secproxy" in services and topology is not None
+                and wiring.fronted_instances(topology, without)):
+            print(f"  · landing page → https://{topology.domain}/")
         return
     if platform.system() != "Linux":
         P.die(f"fedora-fips deploy must run on the Fedora host (this is {platform.system()}). "
@@ -512,6 +569,15 @@ def deploy(
     if addr_dir is not None:
         written = wiring.write_addressing(topology, addr_dir, resource, without,
                                           secrouter_egress_path=str(SECROUTER_EGRESS_FILE))
+        if "secproxy" in services and topology is not None:
+            # Landing page (see wiring.landing_page_html) — staged here alongside the nginx
+            # config write_addressing just produced; _deploy_steps installs it from this path.
+            actions = _secproxy_setup_actions(
+                services, stacks, resolver_configured=resolver_configured,
+            )
+            (addr_dir / "secproxy-index.html").write_text(
+                wiring.landing_page_html(topology, without, setup_actions=actions)
+            )
         if "secdns" in services:
             (addr_dir / "secdns.env").write_text(wiring.secdns_env_text(topology, str(SECDNS_ZONE)))
         if "secllm" in services:
@@ -520,7 +586,9 @@ def deploy(
             # this reads back exactly what write_addressing just generated/reused, not a fresh
             # independent token.
             api_token = wiring.secllm_shared_token(addr_dir)
-            (addr_dir / "secllm.env").write_text(wiring.secllm_env_text(api_token=api_token))
+            (addr_dir / "secllm.env").write_text(
+                wiring.secllm_env_text(api_token=api_token, autostart=autostart_models)
+            )
         if secagent_enabled:
             # pi's models.json (service api-key auth) — generated from secagent's OWN checked-
             # out example (never hardcoded here, so secdeploy can't drift from secagent's
@@ -570,6 +638,9 @@ def deploy(
             secagent_enabled=secagent_enabled,
         )
         P.log(f"deploy audit artifact written → {audit_path}")
+    if ("secproxy" in services and topology is not None
+            and wiring.fronted_instances(topology, without)):
+        P.log(f"landing page → https://{topology.domain}/")
     P.log("suite deployed — check `secdeploy status fedora-fips`")
 
 
