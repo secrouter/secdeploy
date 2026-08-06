@@ -275,14 +275,22 @@ class Topology:
         exactly as before secproxy existed."""
         records: list[tuple[str, str, str]] = []
         edge_addr = self._proxy_address()
+        any_fronted = False
         for name, c in self.manifest.select(without).items():
             if c.tier not in self.groups:
                 continue
-            proxy_addr = edge_addr if self.is_fronted(name) else None
+            fronted = self.is_fronted(name)
+            any_fronted = any_fronted or fronted
+            proxy_addr = edge_addr if fronted else None
             for instance_name, _res, addr in self.instances(name):
                 records.append(
                     (self.fqdn(instance_name), "A", proxy_addr if proxy_addr is not None else addr)
                 )
+        # The bare domain too, when secproxy has a landing page to serve there (see
+        # wiring.nginx_conf_text) — same gating (something actually fronted), so this record
+        # only appears when nginx actually has a :443 server block listening for it.
+        if edge_addr is not None and any_fronted:
+            records.append((self.domain, "A", edge_addr))
         return records
 
     def urls(self, without: list[str] | None = None, scheme: str = "https") -> dict[str, str]:

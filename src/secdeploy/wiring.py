@@ -15,6 +15,7 @@ synthesis, so everything documented above still holds.
 
 from __future__ import annotations
 
+import html
 import json
 import secrets
 from pathlib import Path
@@ -167,6 +168,178 @@ def fronted_instances(
     return result
 
 
+def landing_page_html(
+    topology: Topology, without: list[str] | None = None, *, setup_actions: list[str] | None = None,
+) -> str:
+    """A minimal static HTML landing page for secproxy's BARE domain (``topology.domain``) — the
+    one URL an operator naturally tries first, with nothing else served there otherwise. Lists
+    every fronted service (:func:`fronted_instances`'s same set, HTTPS via secproxy) plus SecLLM
+    as a direct HTTP link on its own port (never fronted — inference dials direct, see
+    :func:`fronted_instances`'s docstring) — each row shows the component's manifest ``role`` for
+    a one-line description — and, if given, a "finish setup" checklist.
+
+    ``setup_actions`` is HTML the CALLER supplies (each string becomes one ``<li>``) rather than
+    hardcoded here: the specific follow-up commands (trusting the CA root, the DNS resolver,
+    secrets, a chat bootstrap script...) are target/OS-specific, and this module stays free of
+    that (see module docstring) — each target builds its own list and passes it in.
+
+    Deterministic manifest order, so output is stable/testable. Only meaningful once secproxy is
+    actually placed (nginx is what serves this); an empty topology still renders a valid page
+    (no services listed) rather than erroring.
+    """
+    selected = topology.manifest.select(without)
+    services: list[tuple[str, str, str]] = []   # (href, fqdn, role)
+    for name, c in selected.items():
+        # secagent has no browsable UI here at all (a Mattermost webhook receiver, 404 at "/")
+        # — see the GitHub footer below instead, for setting up a local instance.
+        if name in ("secproxy", "secdns", "secagent") or not c.port:
+            continue
+        for instance_name, _res, _addr in topology.instances(name):
+            fqdn = topology.fqdn(instance_name)
+            if name == "secllm":
+                # Never fronted (inference dials direct, see fronted_instances) — plain HTTP,
+                # its own port, no secproxy/edge TLS in front of it. /admin is its model console
+                # (load/switch models) — nothing useful at "/" itself.
+                services.append((f"http://{fqdn}:{c.port}/admin", fqdn, c.role))
+            elif topology.is_fronted(name):
+                # secrouter has no useful landing page of its own at "/" — its actual UI is
+                # the admin console at /admin.
+                path = "/admin" if name == "secrouter" else "/"
+                services.append((f"https://{fqdn}{path}", fqdn, c.role))
+
+    if services:
+        rows = "\n".join(
+            f'\t\t<tr><td><a href="{href}">{html.escape(fqdn)}</a></td><td>{html.escape(role)}</td></tr>'
+            for href, fqdn, role in services
+        )
+    else:
+        rows = '\t\t<tr><td colspan="2" class="muted">No fronted services in this topology.</td></tr>'
+
+    actions_card = ""
+    if setup_actions:
+        items = "\n".join(f"\t\t\t<li>{a}</li>" for a in setup_actions)
+        actions_card = f"""\t<div class="card">
+\t\t<h3>Finish setup</h3>
+\t\t<ol class="actions">
+{items}
+\t\t</ol>
+\t</div>
+"""
+
+    secagent_footer = ""
+    if "secagent" in selected:
+        secagent_url = selected["secagent"].url.removesuffix(".git")
+        secagent_footer = (
+            f'\t<p class="muted footer-note">SecAgent (chat-ops/review bridge) has no '
+            f'browsable UI — it only takes Mattermost webhooks. Set up a local instance from '
+            f'<a href="{html.escape(secagent_url)}">{html.escape(selected["secagent"].repo)}'
+            f"</a> on GitHub.</p>\n"
+        )
+
+    domain = html.escape(topology.domain)
+    # Same "field console" theme as SecRouter's admin UI (secrouter/src/... admin.html) — warm
+    # manila/olive-drab light, charcoal/olive dark, following OS by default with a persisted
+    # toggle — so this page reads as part of the same suite rather than a bolt-on. Kept as one
+    # inline, dependency-free file (no shared asset path across nginx server blocks/targets).
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+\t<meta charset="utf-8">
+\t<meta name="viewport" content="width=device-width, initial-scale=1">
+\t<title>{domain} — SecRouter Suite</title>
+\t<style>
+\t\t:root {{
+\t\t\t--mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+\t\t\t--sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+\t\t\t--bg:#e7e3d8; --panel:#f3f0e8; --panel2:#fbfaf4; --fg:#211f18; --muted:#6c6552;
+\t\t\t--accent:#4f6a2e; --accent-ink:#f6f3ea; --accent-soft:rgba(79,106,46,.18);
+\t\t\t--border:#cdc6b2; --rule:#dad4c2; --shadow:2px 2px 0 rgba(33,31,24,.06);
+\t\t\t--code-bg:#e2ddcd;
+\t\t}}
+\t\t:root[data-theme="dark"] {{
+\t\t\t--bg:#171511; --panel:#201e17; --panel2:#29271e; --fg:#e8e3d3; --muted:#9a9077;
+\t\t\t--accent:#94ad50; --accent-ink:#16140e; --accent-soft:rgba(148,173,80,.26);
+\t\t\t--border:#3a3730; --rule:#272520; --shadow:2px 2px 0 rgba(0,0,0,.30);
+\t\t\t--code-bg:#2b2920;
+\t\t}}
+\t\t@media (prefers-color-scheme: dark) {{
+\t\t\t:root:not([data-theme="light"]) {{
+\t\t\t\t--bg:#171511; --panel:#201e17; --panel2:#29271e; --fg:#e8e3d3; --muted:#9a9077;
+\t\t\t\t--accent:#94ad50; --accent-ink:#16140e; --accent-soft:rgba(148,173,80,.26);
+\t\t\t\t--border:#3a3730; --rule:#272520; --shadow:2px 2px 0 rgba(0,0,0,.30);
+\t\t\t\t--code-bg:#2b2920;
+\t\t\t}}
+\t\t}}
+\t\t* {{ box-sizing:border-box; }}
+\t\tbody {{ margin:0; font:14px/1.55 var(--sans); background:var(--bg); color:var(--fg);
+\t\t       background-image:linear-gradient(var(--rule) 1px, transparent 1px);
+\t\t       background-size:100% 28px; background-attachment:fixed; }}
+\t\theader {{ display:flex; align-items:center; gap:14px; padding:14px 22px; background:var(--panel);
+\t\t         border-bottom:1px solid var(--border); border-top:3px solid var(--accent); }}
+\t\theader h1 {{ font-size:15px; margin:0; font-weight:700; text-transform:uppercase; letter-spacing:.14em; }}
+\t\theader .lock {{ color:var(--accent); }}
+\t\theader .who {{ margin-left:auto; color:var(--muted); font:11px var(--mono);
+\t\t              text-transform:uppercase; letter-spacing:.08em; }}
+\t\tmain {{ padding:24px 22px; max-width:900px; margin:0 auto; }}
+\t\t.card {{ background:var(--panel); border:1px solid var(--border); border-radius:2px;
+\t\t         padding:18px; margin-bottom:16px; box-shadow:var(--shadow); }}
+\t\t.card h3 {{ margin:0 0 12px; font:11px var(--mono); font-weight:700; text-transform:uppercase;
+\t\t           letter-spacing:.12em; color:var(--muted); padding-bottom:8px; border-bottom:1px solid var(--rule); }}
+\t\ttable {{ width:100%; border-collapse:collapse; font-size:13px; }}
+\t\tth, td {{ text-align:left; padding:7px 10px; border-bottom:1px solid var(--rule); }}
+\t\ttd {{ font:12.5px var(--mono); }}
+\t\tth {{ color:var(--muted); font:10px var(--mono); font-weight:700; text-transform:uppercase;
+\t\t     letter-spacing:.1em; border-bottom:1px solid var(--border); }}
+\t\ttr:last-child td {{ border-bottom:none; }}
+\t\ta {{ color:var(--accent); text-decoration:none; }}
+\t\ta:hover {{ text-decoration:underline; }}
+\t\t.muted {{ color:var(--muted); }}
+\t\t.footer-note {{ font-size:12px; margin:20px 4px 0; }}
+\t\tol.actions {{ margin:0; padding-left:1.3em; }}
+\t\tol.actions li {{ margin:.6rem 0; }}
+\t\tcode {{ background:var(--code-bg); padding:1px 5px; border-radius:2px; font:12px var(--mono); }}
+\t\t.btn.ghost {{ background:var(--panel2); color:var(--fg); border:1px solid var(--border); border-radius:2px;
+\t\t             padding:5px 11px; font:11px var(--mono); text-transform:uppercase; letter-spacing:.08em;
+\t\t             cursor:pointer; }}
+\t\t.btn.ghost:hover {{ filter:brightness(1.08); }}
+\t</style>
+\t<script>
+\t\t/* Apply the saved theme before first paint (no flash). Default = follow OS. */
+\t\t(function(){{ try {{ var t = localStorage.getItem('secrouter-theme');
+\t\t\tif (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t); }} catch (e) {{}} }})();
+\t</script>
+</head>
+<body>
+\t<header>
+\t\t<span class="lock">🔒</span>
+\t\t<h1>SecRouter Suite</h1>
+\t\t<span class="who">{domain}</span>
+\t\t<button class="btn ghost theme-toggle" title="Toggle light / dark" onclick="toggleTheme()">DARK</button>
+\t</header>
+\t<main>
+\t\t<div class="card">
+\t\t\t<h3>Services</h3>
+\t\t\t<table>
+\t\t\t\t<tr><th>Service</th><th>Role</th></tr>
+{rows}
+\t\t\t</table>
+\t\t</div>
+{actions_card}{secagent_footer}\t</main>
+\t<script>
+\t\tfunction effectiveTheme(){{ var a=document.documentElement.getAttribute("data-theme");
+\t\t\tif(a==="dark"||a==="light") return a;
+\t\t\treturn (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"; }}
+\t\tfunction setTheme(t){{ document.documentElement.setAttribute("data-theme", t);
+\t\t\ttry {{ localStorage.setItem("secrouter-theme", t); }} catch(e){{}}
+\t\t\tvar b=document.querySelector(".theme-toggle"); if(b) b.textContent = effectiveTheme()==="dark" ? "LIGHT" : "DARK"; }}
+\t\tfunction toggleTheme(){{ setTheme(effectiveTheme()==="dark" ? "light" : "dark"); }}
+\t\tsetTheme(effectiveTheme());
+\t</script>
+</body>
+</html>
+"""
+
+
 # nginx runs its writable state (pid, logs, temp dirs, the ACME webroot) out of this dir, which
 # the fedora-fips secproxy.service grants via ReadWritePaths under ProtectSystem=strict — so no
 # default nginx path (/var/log/nginx, /var/lib/nginx, /run) is ever touched. This is the
@@ -256,7 +429,10 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
     if user:
         lines.insert(lines.index("worker_processes auto;"), f"user {user};")
     if fronted:
-        server_names = " ".join(fqdn for fqdn, _addr, _port in fronted)
+        # The bare domain gets the redirect + landing page (below) alongside every fronted FQDN —
+        # it's the one URL an operator naturally tries first, and secproxy's cert covers it too
+        # (see each target's _issue_secproxy_cert).
+        server_names = " ".join([topology.domain] + [fqdn for fqdn, _addr, _port in fronted])
         lines += [
             "\t# Port 80: the ACME HTTP-01 webroot (certbot renewal writes challenges under this",
             "\t# root) plus a blanket redirect of everything else to HTTPS.",
@@ -272,6 +448,21 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             "\t\tlocation / {",
             "\t\t\treturn 301 https://$host$request_uri;",
             "\t\t}",
+            "\t}",
+            "",
+            "\t# Landing page: browsing the bare domain directly lists every fronted service +",
+            "\t# any finish-setup steps. index.html is written by the target (see deploy()), not",
+            "\t# here — this just serves whatever's in <state_dir>/www.",
+            "\tserver {",
+            "\t\tlisten 443 ssl;",
+            "\t\thttp2 on;",
+            f"\t\tserver_name {topology.domain};",
+            "",
+            f"\t\tssl_certificate {cert_dir}/fullchain.pem;",
+            f"\t\tssl_certificate_key {cert_dir}/privkey.pem;",
+            "",
+            f"\t\troot {state_dir}/www;",
+            "\t\tindex index.html;",
             "\t}",
             "",
         ]
@@ -455,6 +646,30 @@ def secagent_webhook_secret(out_dir: str | Path) -> str:
     token = secrets.token_urlsafe(32)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(token + "\n")
+    path.chmod(0o600)
+    return token
+
+
+def secllm_admin_token(out_dir: str | Path) -> str:
+    """This SecLLM instance's own admin-surface token (``SECLLM_ADMIN_TOKEN`` — model
+    load/switch via ``/admin``; independently random per instance, no cross-instance
+    coordination needed, unlike :func:`secllm_shared_token`).
+
+    Cached at ``<out_dir>/secllm-admin-token`` — same generate-once-reuse-forever pattern as
+    :func:`secagent_webhook_secret`, for the same reason: without it, a target that doesn't
+    pass ``SECLLM_ADMIN_TOKEN`` explicitly (e.g. targets/macos.py's launchd env) leaves SecLLM
+    to generate a fresh one at EVERY process start and only log it (see secllm/config.py) —
+    fine for a single session, useless the moment it restarts.
+    """
+    path = Path(out_dir) / "secllm-admin-token"
+    if path.exists():
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    token = secrets.token_urlsafe(32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token + "\n")
+    path.chmod(0o600)
     return token
 
 
@@ -485,6 +700,7 @@ def secllm_shared_token(out_dir: str | Path) -> str:
     token = secrets.token_urlsafe(32)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(token + "\n")
+    path.chmod(0o600)
     return token
 
 
@@ -514,7 +730,10 @@ def secdns_env_text(topology: Topology, zone_path: str) -> str:
     )
 
 
-def secllm_env_text(admin_token: str | None = None, api_token: str | None = None) -> str:
+def secllm_env_text(
+    admin_token: str | None = None, api_token: str | None = None,
+    autostart: list[str] | None = None,
+) -> str:
     """Render one SecLLM instance's env (host/port/backend/tokens) for ``--with-inference``.
 
     Unlike ``secdns_env_text`` (safe to regenerate every deploy — it carries no secret), the
@@ -535,9 +754,20 @@ def secllm_env_text(admin_token: str | None = None, api_token: str | None = None
       :func:`secllm_shared_token` result into each instance's ``secllm_env_text`` call rather
       than letting each mint its own (which would leave SecRouter unable to authenticate to
       more than one of them).
+
+    ``autostart`` (``SECLLM_AUTOSTART``) is a list of CATALOG MODEL IDS (e.g. ``["fast",
+    "gemma-31b"]``, not a boolean) to load — downloading the weights first, if not already
+    cached — the moment the service starts, instead of waiting for the first request routed
+    to that model. Empty/``None`` (the default) leaves the line commented out as
+    documentation, matching this file's pre-``autostart_models`` behavior.
     """
     token = admin_token if admin_token is not None else secrets.token_urlsafe(32)
     api = api_token if api_token is not None else secrets.token_urlsafe(32)
+    autostart_line = (
+        f"SECLLM_AUTOSTART={','.join(autostart)}\n" if autostart
+        else "# Autostart model(s) at boot instead of lazy first-request load — comma-separated "
+             "catalog ids, e.g. fast,reasoning.\n# SECLLM_AUTOSTART=\n"
+    )
     return (
         "# secllm — generated by secdeploy (--with-inference); kept across redeploys\n"
         "SECLLM_HOST=0.0.0.0\n"
@@ -545,8 +775,7 @@ def secllm_env_text(admin_token: str | None = None, api_token: str | None = None
         "SECLLM_BACKEND=vllm\n"
         f"SECLLM_ADMIN_TOKEN={token}\n"
         f"SECLLM_API_TOKEN={api}\n"
-        "# Autostart the backend on boot instead of lazy first-request load; uncomment to enable.\n"
-        "# SECLLM_AUTOSTART=1\n"
+        f"{autostart_line}"
     )
 
 

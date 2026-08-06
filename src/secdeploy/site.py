@@ -52,7 +52,7 @@ RESOURCE_PLACEMENT_KEYS = {"target", "address", "ssh", "capabilities"}
 # fields exactly.
 RESOURCE_DEPLOY_KEYS = {
     "with_inference", "with_agent", "configure_resolver",
-    "tls", "configure_hosts", "trust_ca", "model_dir",
+    "tls", "configure_hosts", "trust_ca", "model_dir", "autostart_models",
 }
 
 # The suite-wide [deploy] table's keys. Mirrors SiteConfig's own without/ssh fields exactly.
@@ -66,8 +66,11 @@ class DeployOptions:
     ``with_inference``/``with_agent``/``configure_resolver`` apply on both targets;
     ``tls``/``configure_hosts``/``trust_ca`` are macOS-only (fedora-fips warns and ignores
     them, exactly as it does for the equivalent CLI flags today); ``model_dir`` is macOS-only
-    too (air-gapped pre-downloaded model snapshots — see ``targets/macos.py``). Every bool
-    defaults ``False`` and ``model_dir`` defaults ``""`` — a resource that declares none of
+    too (air-gapped pre-downloaded model snapshots — see ``targets/macos.py``).
+    ``autostart_models`` applies on both targets — SecLLM catalog ids to load (downloading
+    the weights first, if not already cached) at boot instead of on first request via
+    ``/admin`` — see ``SECLLM_AUTOSTART`` in ``secllm/config.py``. Every bool defaults
+    ``False`` and every string/list field defaults empty — a resource that declares none of
     these keys behaves exactly as it does without a secsite.toml at all.
     """
 
@@ -78,6 +81,7 @@ class DeployOptions:
     configure_hosts: bool = False
     trust_ca: bool = False
     model_dir: str = ""
+    autostart_models: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -146,6 +150,7 @@ class SiteConfig:
                 configure_hosts=bool(rdata.get("configure_hosts", False)),
                 trust_ca=bool(rdata.get("trust_ca", False)),
                 model_dir=str(rdata.get("model_dir", "")),
+                autostart_models=[str(m) for m in rdata.get("autostart_models", [])],
             )
 
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
@@ -264,6 +269,7 @@ class SiteConfig:
             out.append(f"configure_hosts = {_bool(opts.configure_hosts)}")
             out.append(f"trust_ca = {_bool(opts.trust_ca)}")
             out.append(f'model_dir = "{opts.model_dir}"')
+            out.append(f"autostart_models = {_arr(opts.autostart_models)}")
             out.append("")
         for tier, res_list in topo.groups.items():
             out.append(f"[groups.{tier}]")

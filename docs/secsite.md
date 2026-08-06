@@ -49,11 +49,12 @@ tls = false                 # macOS only
 configure_hosts = false     # macOS only
 trust_ca = false            # macOS only
 model_dir = ""              # macOS only — air-gapped SecRecorder model dir
+autostart_models = []       # SecLLM catalog ids to download + load at boot (both targets)
 ```
 
 Every per-resource toggle mirrors a `deploy` flag that used to be the only way to set it
 (`--with-inference`, `--with-agent`, `--configure-resolver`, `--tls`, `--configure-hosts`,
-`--trust-ca`, `--model-dir`). **CLI flags still exist and override whatever `secsite.toml`
+`--trust-ca`, `--model-dir`, `--autostart-models`). **CLI flags still exist and override whatever `secsite.toml`
 sets** — see `secdeploy deploy --help`; each one resolves to *the flag if you actually passed
 it, else the file's value* (a one-off `--without ""` on the command line, for instance,
 overrides the file's `without` entirely for that run).
@@ -91,6 +92,7 @@ secdeploy configure --site sites/prod.toml
    | `tls`, `configure_hosts` | the resource's `target` is `macos` | no |
    | `trust_ca` | the resource's `target` is `macos` | yes |
    | `model_dir` | the resource's `target` is `macos` **and** the `collab` tier (SecRecorder) is placed here | blank (fetch from Hugging Face) |
+   | `autostart_models` | `with_inference` was answered yes | blank (no autostart — SecLLM loads a model lazily on its first routed request via `/admin`) |
 
    A resource nothing applies to (say, a bare fedora-fips box hosting only inference, with
    SecDNS dropped) is asked nothing here — every toggle simply stays at its default, exactly

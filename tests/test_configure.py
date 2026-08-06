@@ -97,6 +97,7 @@ def test_gpu_split_preset_edge_placement_without_and_toggles(tmp_path):
         "secdns",        # [deploy].without: drop secdns
         "y",             # core: with_agent -> True (collab is on core)
         "y",             # gpu: with_inference -> True (inference is on gpu)
+        "",              # gpu: autostart_models -> [] (none)
         "N",             # set up operator secrets now? no
     ]
     result = configure.run(_manifest(), dest=dest, input_fn=_driver(answers), out=lambda *_: None)
@@ -118,6 +119,7 @@ def test_gpu_split_preset_edge_placement_without_and_toggles(tmp_path):
     gpu_opts = site.deploy_for("gpu")
     assert gpu_opts.with_inference is True
     assert gpu_opts.configure_resolver is False
+    assert gpu_opts.autostart_models == []
 
 
 def test_gpu_split_edge_none_omits_the_tier_entirely(tmp_path):
@@ -152,6 +154,7 @@ def test_custom_preset(tmp_path):
         "",              # [deploy].without: drop none
         "n",             # a: configure_resolver -> False (only applicable toggle here)
         "y",             # b: with_inference -> True
+        "fast,reasoning", # b: autostart_models
         "y",             # b: with_agent -> True
         "",              # b: configure_resolver -> True (default)
         "y",             # b: tls -> True
@@ -175,6 +178,7 @@ def test_custom_preset(tmp_path):
 
     b_opts = site.deploy_for("b")
     assert b_opts.with_inference is True
+    assert b_opts.autostart_models == ["fast", "reasoning"]
     assert b_opts.with_agent is True
     assert b_opts.configure_resolver is True
     assert b_opts.tls is True

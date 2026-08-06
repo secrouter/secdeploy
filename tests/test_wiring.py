@@ -248,7 +248,8 @@ def test_nginx_conf_text_ssl_cert_paths_use_cert_dir(tmp_path):
     # one SAN cert covers all five — every :443 block reads the SAME cert_dir
     assert f"ssl_certificate {CERT_DIR}/fullchain.pem;" in text
     assert f"ssl_certificate_key {CERT_DIR}/privkey.pem;" in text
-    assert text.count("ssl_certificate ") == len(FRONTED)  # one per fronted server block
+    # one per fronted server block, plus one for the bare-domain landing page
+    assert text.count("ssl_certificate ") == len(FRONTED) + 1
     # cert_dir is a parameter
     other = wiring.nginx_conf_text(topo, "/opt/tls")
     assert "ssl_certificate /opt/tls/fullchain.pem;" in other
@@ -271,9 +272,9 @@ def test_nginx_conf_text_port_80_acme_webroot_and_redirect(tmp_path):
     topo = _edge_topo(tmp_path)
     text = wiring.nginx_conf_text(topo, CERT_DIR)
     assert "listen 80;" in text and "listen [::]:80;" in text
-    # all five fronted names share the one :80 server (ACME webroot + HTTPS redirect)
-    assert ("server_name secsso.sec.internal secrouter.sec.internal secagent.sec.internal "
-            "secchat.sec.internal secrecorder.sec.internal;") in text
+    # the bare domain + all five fronted names share the one :80 server (ACME webroot + redirect)
+    assert ("server_name sec.internal secsso.sec.internal secrouter.sec.internal "
+            "secagent.sec.internal secchat.sec.internal secrecorder.sec.internal;") in text
     assert "location /.well-known/acme-challenge/ {" in text
     assert "root /var/lib/secsuite/secproxy/acme;" in text
     assert "return 301 https://$host$request_uri;" in text
@@ -288,8 +289,9 @@ def test_nginx_conf_text_is_a_complete_config_with_http2(tmp_path):
     assert "pid /var/lib/secsuite/secproxy/nginx.pid;" in text
     assert "proxy_temp_path /var/lib/secsuite/secproxy/tmp/proxy;" in text
     assert "edit topology.toml, not this file" in text
-    assert text.count("listen 443 ssl;") == len(FRONTED)
-    assert text.count("http2 on;") == len(FRONTED)
+    # one :443 server per fronted service, plus one for the bare-domain landing page
+    assert text.count("listen 443 ssl;") == len(FRONTED) + 1
+    assert text.count("http2 on;") == len(FRONTED) + 1
 
 
 def test_nginx_conf_text_deterministic_manifest_order(tmp_path):
