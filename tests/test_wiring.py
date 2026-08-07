@@ -713,6 +713,65 @@ def test_sync_secagent_service_secret_missing_secsso_secret_is_a_noop(tmp_path):
     assert "SECAGENT_CLIENT_SECRET=\n" in secrets_env.read_text()
 
 
+# ── env_for secassist branch + sync_secassist_env: turnkey SecAssist stack env ──
+def test_env_for_secassist_branch(tmp_path):
+    # GPU_SPLIT: secassist on 'core', no secproxy → plain ported http URLs (a fronted topology
+    # would front these on bare https:443 — same fronted logic every other peer URL follows).
+    topo = _topo(tmp_path)
+    env = topo.env_for("secassist")
+    assert env["OPENID_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secassist/"
+    assert env["SECSSO_TOKEN_URL"] == "http://secsso.sec.internal:9000/application/o/token/"
+    assert env["SECROUTER_BASE_URL"] == "http://secrouter.sec.internal:47002"  # no /v1 — proxy adds it
+    assert env["DOMAIN_CLIENT"] == env["DOMAIN_SERVER"] == "http://secassist.sec.internal:3080"
+    assert env["SECASSIST_SVC_CLIENT_ID"] == "secassist-svc"
+    assert env["SECROUTER_SCOPE"] == "openid secrouter"
+
+
+def _env_dict(path):
+    return {ln.split("=", 1)[0]: ln.split("=", 1)[1]
+            for ln in path.read_text().splitlines() if "=" in ln and not ln.startswith("#")}
+
+
+def test_sync_secassist_env_mirrors_secrets_and_writes_topology(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECASSIST_CLIENT_SECRET=login-abc\nSECASSIST_SVC_CLIENT_SECRET=svc-xyz\n")
+    # As the stack .env looks right after the generic seed randomized the blank mirror-targets;
+    # a topology key still at its .env.example placeholder; a per-instance secret to preserve.
+    secassist_env = tmp_path / "secassist.env"
+    secassist_env.write_text(
+        "OPENID_CLIENT_SECRET=RANDOMSEED\n"
+        "SECASSIST_SVC_CLIENT_SECRET=RANDOMSEED2\n"
+        "OPENID_ISSUER=https://secsso.sec.internal/application/o/secassist/\n"
+        "CREDS_KEY=keep-me\n"
+    )
+    written = wiring.sync_secassist_env(secsso_env, secassist_env, topo)
+    assert written is not None and "OPENID_CLIENT_SECRET" in written
+    vals = _env_dict(secassist_env)
+    # the mirrored secrets OVERWRITE the randomized seed — the whole reason this isn't blank-only
+    assert vals["OPENID_CLIENT_SECRET"] == "login-abc"
+    assert vals["SECASSIST_SVC_CLIENT_SECRET"] == "svc-xyz"
+    # topology env written (placeholder domain corrected to the real one + port)
+    assert vals["OPENID_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secassist/"
+    assert vals["SECROUTER_BASE_URL"] == "http://secrouter.sec.internal:47002"
+    # non-managed keys survive untouched
+    assert vals["CREDS_KEY"] == "keep-me"
+
+
+def test_sync_secassist_env_noop_without_secsso_secrets(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("PG_PASS=x\n")  # no SECASSIST_* secrets provisioned yet
+    secassist_env = tmp_path / "secassist.env"
+    secassist_env.write_text("OPENID_CLIENT_SECRET=\n")
+    assert wiring.sync_secassist_env(secsso_env, secassist_env, topo) is None
+
+
+def test_sync_secassist_env_noop_when_files_missing(tmp_path):
+    topo = _topo(tmp_path)
+    assert wiring.sync_secassist_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
+
+
 def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):
     assert wiring.sync_secagent_service_secret(
         tmp_path / "nope.env", tmp_path / "also-nope.env",
@@ -817,3 +876,37 @@ def test_write_addressing_shared_token_matches_secllm_and_secrouter(tmp_path):
     assert f"SECLLM_API_TOKEN={api_token}" in secllm_env
     # sanity: write_addressing("gpu") didn't mint a second, different token
     assert wiring.secllm_shared_token(out) == api_token
+
+
+# ── generate_secsso_users_blueprint: declared users → SecSSO users blueprint ───────────
+def test_generate_secsso_users_blueprint(tmp_path):
+    from secdeploy.site import UserSpec
+    users = [
+        UserSpec(username="alice", email="alice@x.mil", name="Alice", groups=["analysts"]),
+        UserSpec(username="bob"),  # no name/email/groups → those keys omitted
+    ]
+    dest = tmp_path / "users.generated.yaml"
+    creds = wiring.generate_secsso_users_blueprint(users, dest)
+    assert set(creds) == {"alice", "bob"}
+    assert all(len(pw) >= 12 for pw in creds.values())  # strong-ish random
+    text = dest.read_text()
+    assert "model: authentik_core.group" in text
+    assert 'name: "analysts"' in text
+    assert "model: authentik_core.user" in text
+    assert "state: created" in text          # create-once, never clobber a changed password
+    assert "reset_password: true" in text    # forced first-login reset
+    assert '!Find [authentik_core.group, [name, "analysts"]]' in text
+    assert 'username: "bob"' in text
+    # bob's password is written even though he has no name/email
+    assert f'password: "{creds["bob"]}"' in text
+
+
+def test_generate_secsso_users_blueprint_is_idempotent(tmp_path):
+    from secdeploy.site import UserSpec
+    dest = tmp_path / "users.generated.yaml"
+    first = wiring.generate_secsso_users_blueprint([UserSpec(username="alice")], dest)
+    # re-run with alice + a NEW user carol → alice's password is REUSED, only carol is "new"
+    second = wiring.generate_secsso_users_blueprint(
+        [UserSpec(username="alice"), UserSpec(username="carol")], dest)
+    assert set(second) == {"carol"}                   # only the newly-added user is returned
+    assert f'password: "{first["alice"]}"' in dest.read_text()  # alice's original survives

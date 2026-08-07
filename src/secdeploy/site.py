@@ -58,6 +58,9 @@ RESOURCE_DEPLOY_KEYS = {
 # The suite-wide [deploy] table's keys. Mirrors SiteConfig's own without/ssh fields exactly.
 DEPLOY_TABLE_KEYS = {"without", "ssh"}
 
+# The top-level [[users]] array-of-tables — declared accounts SecDeploy provisions in SecSSO.
+USER_KEYS = {"username", "email", "name", "groups"}
+
 
 @dataclass
 class DeployOptions:
@@ -85,6 +88,20 @@ class DeployOptions:
 
 
 @dataclass
+class UserSpec:
+    """A declared end-user account (secsite.toml's ``[[users]]``). SecDeploy renders these into
+    ``secsso/blueprints/users.generated.yaml`` with a RANDOM initial password + a forced reset on
+    first login (see ``wiring.generate_secsso_users_blueprint`` + secsso's
+    ``force-password-reset.yaml``). ``groups`` are created if absent and should match SecRouter's
+    ``security.policy.groups`` names so per-group tiers/budgets apply from the token."""
+
+    username: str
+    email: str = ""
+    name: str = ""
+    groups: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SiteConfig:
     """The whole site: WHERE things run (a :class:`Topology`) + how ``deploy`` should run them.
 
@@ -102,6 +119,7 @@ class SiteConfig:
     without: list[str] = field(default_factory=list)
     ssh: bool = False
     deploy_options: dict[str, DeployOptions] = field(default_factory=dict)
+    users: list[UserSpec] = field(default_factory=list)
     path: Path | None = None
 
     # ── construction ───────────────────────────────────────────────────────────────
@@ -153,13 +171,43 @@ class SiteConfig:
                 autostart_models=[str(m) for m in rdata.get("autostart_models", [])],
             )
 
+        # Declared end-user accounts — a top-level [[users]] array-of-tables. Fail-loud on
+        # unknown keys / missing username / duplicates (a typo'd account beats a silent drop);
+        # top-level tables are otherwise ignored, so this is additive and backward-compatible.
+        users: list[UserSpec] = []
+        seen_usernames: set[str] = set()
+        for i, u in enumerate(data.get("users") or []):
+            if not isinstance(u, dict):
+                errors.append(f"[[users]][{i}] must be a table")
+                continue
+            unknown_u = sorted(k for k in u if k not in USER_KEYS)
+            if unknown_u:
+                errors.append(
+                    f"[[users]][{i}]: unknown key(s) {', '.join(unknown_u)} "
+                    f"(expected: {', '.join(sorted(USER_KEYS))})"
+                )
+            username = str(u.get("username", "")).strip()
+            if not username:
+                errors.append(f"[[users]][{i}]: username is required")
+                continue
+            if username in seen_usernames:
+                errors.append(f"[[users]]: duplicate username {username!r}")
+                continue
+            seen_usernames.add(username)
+            users.append(UserSpec(
+                username=username,
+                email=str(u.get("email", "")).strip(),
+                name=str(u.get("name", "")).strip(),
+                groups=[str(g).strip() for g in (u.get("groups") or []) if str(g).strip()],
+            ))
+
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
         # rather than one tangled into the other (see validate() below).
         topology = Topology.from_data(data, manifest, path=path, validate=False)
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
-            deploy_options=deploy_options, path=path,
+            deploy_options=deploy_options, users=users, path=path,
         )
         site.validate()
         if errors:
@@ -278,4 +326,15 @@ class SiteConfig:
             else:
                 out.append(f"resources = {_arr(res_list)}")
             out.append("")
+        if self.users:
+            out.append("# Declared end-user accounts — SecDeploy provisions each in SecSSO with a")
+            out.append("# random initial password (printed once at deploy) that must be reset on")
+            out.append("# first login. `groups` should match SecRouter's security.policy.groups.")
+            for u in self.users:
+                out.append("[[users]]")
+                out.append(f'username = "{u.username}"')
+                out.append(f'email = "{u.email}"')
+                out.append(f'name = "{u.name}"')
+                out.append(f"groups = {_arr(u.groups)}")
+                out.append("")
         return "\n".join(out).rstrip() + "\n"

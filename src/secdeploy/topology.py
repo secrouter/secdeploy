@@ -433,6 +433,26 @@ class Topology:
             env["SECAGENT_AUDIT__ENABLED"] = "true"
             if secagent_webhook_secret:
                 env["SECAGENT_MATTERMOST__WEBHOOK_SECRET"] = secagent_webhook_secret
+        if component == "secassist":
+            # SecAssist (LibreChat) reads plain env keys (its own + the auth proxy's), not a
+            # nested convention. The proxy dials SecRouter (SECROUTER_BASE_URL, no /v1 — the
+            # request path carries it) and fetches its service token from SecSSO; LibreChat
+            # discovers OIDC from this app's per-provider issuer and uses its own external URL
+            # (DOMAIN_*) for the OIDC callback/cookies. Two client secrets are NOT set here —
+            # they're mirrored from SecSSO's generated .env by wiring.sync_secassist_env.
+            secrouter_url = peer_urls.get("SECROUTER")
+            if secrouter_url:
+                env["SECROUTER_BASE_URL"] = secrouter_url
+            secsso_url = peer_urls.get("SECSSO")
+            if secsso_url:
+                env["OPENID_ISSUER"] = f"{secsso_url}/application/o/secassist/"
+                env["SECSSO_TOKEN_URL"] = f"{secsso_url}/application/o/token/"
+            self_url = peer_urls.get("SECASSIST")
+            if self_url:
+                env["DOMAIN_CLIENT"] = self_url
+                env["DOMAIN_SERVER"] = self_url
+            env["SECASSIST_SVC_CLIENT_ID"] = "secassist-svc"
+            env["SECROUTER_SCOPE"] = "openid secrouter"
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────

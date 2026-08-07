@@ -710,8 +710,10 @@ def deploy(
     with_agent: bool = False,
     native_services: bool = True,
     autostart_models: list[str] | None = None,
+    users=None,
 ) -> None:
     without = without or []
+    users = users or []
     # Topology placement: only bring up the components placed on `resource` (single-host
     # synthesis places everything here, so this is a no-op without a topology.toml).
     placed = set(topology.components_on(resource, without)) if topology is not None else None
@@ -894,6 +896,36 @@ def deploy(
                        "fail with invalid_client. Blank the line to auto-sync on the next "
                        "deploy, or set it to match work/secsso/.env's "
                        "SECAGENT_SERVICE_CLIENT_SECRET yourself.")
+
+    # SecAssist (LibreChat stack) turnkey env: mirror SecSSO's two generated OIDC secrets and
+    # write the topology-derived OIDC/gateway env into work/secassist/.env BEFORE the stacks
+    # bring-up seeds it (same early-seed trick as the secagent mirror above — secsso deploys
+    # last in the sorted stack order, too late otherwise). Needs SecSSO in the topology (an
+    # external IdP means the operator supplies these). Single-host mode configures manually.
+    if not dry_run and topology is not None and placed and "secassist" in placed \
+            and "secassist" not in (without or []) and "secsso" in placed \
+            and "secsso" not in (without or []):
+        common.ensure_stack_secrets(work, ["secsso", "secassist"])
+        written = wiring.sync_secassist_env(
+            work / "secsso" / ".env", work / "secassist" / ".env", topology, without)
+        if written:
+            P.log(f"secassist: synced OIDC secrets + topology env → work/secassist/.env "
+                  f"({len(written)} keys)")
+
+    # Declared end-user accounts → SecSSO. Render work/secsso/blueprints/users.generated.yaml
+    # (random initial passwords, forced reset on first login) BEFORE the stacks bring-up so
+    # Authentik applies it on secsso's first boot. Print new credentials once, for distribution.
+    if not dry_run and users and placed and "secsso" in placed and "secsso" not in without:
+        users_bp = work / "secsso" / "blueprints" / "users.generated.yaml"
+        new_creds = wiring.generate_secsso_users_blueprint(users, users_bp)
+        if new_creds:
+            P.log(f"secsso: provisioned {len(new_creds)} user(s) → {users_bp} "
+                  "(each must reset their password on first login)")
+            P.log("  ── initial credentials — distribute securely, one-time ──")
+            for _uname, _pw in new_creds.items():
+                P.log(f"      {_uname}: {_pw}")
+        else:
+            P.log(f"secsso: {len(users)} declared user(s) already provisioned (passwords unchanged)")
 
     # secagent — opt-in chat bridge, now with REAL env layering: the generated addressing env
     # (LLM/SecSSO/Mattermost wiring + webhook secret) + the SECAGENT_* operator secrets are folded

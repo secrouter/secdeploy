@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .manifest import Manifest
-from .site import SiteConfig
+from .site import SiteConfig, UserSpec
 from .topology import Topology
 
 # This suite's internal-CUI classification level — the default `authorizedClassifications`
@@ -698,6 +698,164 @@ def sync_secagent_service_secret(
             secrets_env_path.chmod(0o600)
             return secsso_secret
     return None
+
+
+def _read_env_values(env_path: Path) -> dict[str, str]:
+    """Parse a ``.env`` into a dict (last wins; comments/blank lines skipped)."""
+    values: dict[str, str] = {}
+    for line in env_path.read_text().splitlines():
+        s = line.lstrip()
+        if "=" in s and not s.startswith("#"):
+            k, v = s.split("=", 1)
+            values[k.strip()] = v.strip()
+    return values
+
+
+def _set_env_keys(env_path: Path, values: dict[str, str]) -> None:
+    """Set/overwrite each ``KEY=value`` in ``env_path`` (update the existing line or append),
+    preserving every other line, then ``chmod 0600``."""
+    lines = env_path.read_text().splitlines()
+    remaining = dict(values)
+    for i, line in enumerate(lines):
+        s = line.lstrip()
+        if "=" in s and not s.startswith("#"):
+            key = s.split("=", 1)[0].strip()
+            if key in remaining:
+                lines[i] = f"{key}={remaining.pop(key)}"
+    for key, val in remaining.items():
+        lines.append(f"{key}={val}")
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+
+# The MANAGED keys secdeploy owns in secassist's stack .env — mirrored secrets from SecSSO +
+# topology-derived OIDC/gateway env. Everything else (CREDS_KEY, JWT_*, MEILI_MASTER_KEY,
+# OPENID_SESSION_SECRET) stays blank for deploy_stacks' generic seed to fill.
+_SECASSIST_MANAGED_KEYS = frozenset({
+    "OPENID_CLIENT_SECRET", "SECASSIST_SVC_CLIENT_SECRET", "OPENID_ISSUER",
+    "SECROUTER_BASE_URL", "SECSSO_TOKEN_URL", "DOMAIN_CLIENT", "DOMAIN_SERVER",
+    "SECASSIST_SVC_CLIENT_ID", "SECROUTER_SCOPE",
+})
+
+
+def sync_secassist_env(
+    secsso_env_path: str | Path, secassist_env_path: str | Path,
+    topology: Topology, without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Make SecAssist's stack ``.env`` turnkey: mirror the two OIDC secrets SecSSO generated and
+    write the topology-derived OIDC/gateway env into ``work/secassist/.env``.
+
+    Unlike :func:`sync_secagent_service_secret`'s blank-only fill, this **overwrites** a fixed set
+    of MANAGED keys (:data:`_SECASSIST_MANAGED_KEYS`), because SecAssist is a *stack*:
+    ``common.deploy_stacks``'s generic ``_seed_env_secrets`` would otherwise fill the blank
+    ``OPENID_CLIENT_SECRET`` / ``SECASSIST_SVC_CLIENT_SECRET`` with *random* tokens that don't match
+    SecSSO's provisioned client secrets. So after the early seed we overwrite:
+    ``OPENID_CLIENT_SECRET`` ← SecSSO's ``SECASSIST_CLIENT_SECRET`` (the login client),
+    ``SECASSIST_SVC_CLIENT_SECRET`` ← SecSSO's ``SECASSIST_SVC_CLIENT_SECRET`` (the proxy's service
+    account), plus the ``env_for("secassist")`` topology values (issuer, SecRouter base URL, token
+    URL, domain). The remaining per-instance secrets stay blank for ``deploy_stacks`` to seed.
+
+    Returns the sorted list of keys written, or ``None`` if either file is missing or SecSSO hasn't
+    generated its two secrets yet (stack never seeded).
+    """
+    secsso_env_path, secassist_env_path = Path(secsso_env_path), Path(secassist_env_path)
+    if not secsso_env_path.exists() or not secassist_env_path.exists():
+        return None
+    secsso = _read_env_values(secsso_env_path)
+    login_secret = secsso.get("SECASSIST_CLIENT_SECRET", "")
+    svc_secret = secsso.get("SECASSIST_SVC_CLIENT_SECRET", "")
+    if not login_secret or not svc_secret:
+        return None
+    managed = dict(topology.env_for("secassist", without, scheme))
+    managed["OPENID_CLIENT_SECRET"] = login_secret
+    managed["SECASSIST_SVC_CLIENT_SECRET"] = svc_secret
+    to_write = {k: v for k, v in managed.items() if k in _SECASSIST_MANAGED_KEYS}
+    _set_env_keys(secassist_env_path, to_write)
+    return sorted(to_write)
+
+
+def _read_generated_user_passwords(path: Path) -> dict[str, str]:
+    """Extract ``{username: password}`` from an existing generated users blueprint. Line-based on
+    the file's own fixed shape (username in identifiers, password in attrs) — no YAML dep."""
+    if not path.exists():
+        return {}
+    creds: dict[str, str] = {}
+    current: str | None = None
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("username:"):
+            current = s.split(":", 1)[1].strip().strip('"')
+        elif s.startswith("password:") and current:
+            creds[current] = s.split(":", 1)[1].strip().strip('"')
+            current = None
+    return creds
+
+
+def _yaml_q(v: str) -> str:
+    """Double-quote a YAML scalar (escaping ``\\`` and ``"``)."""
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def generate_secsso_users_blueprint(users: list[UserSpec], dest: str | Path) -> dict[str, str]:
+    """Render ``dest`` (``work/secsso/blueprints/users.generated.yaml``) from the declared users —
+    an ``authentik_core.group`` (state: present) per referenced group and an ``authentik_core.user``
+    (**state: created** — created once, never overwritten, so a later password change is not
+    clobbered) per account, each with a RANDOM initial password and ``attributes.reset_password:
+    true`` (which ``secsso/blueprints/force-password-reset.yaml`` turns into a forced reset on first
+    login).
+
+    Idempotent like the ``.env`` seed: a username already in an existing ``dest`` keeps its password
+    (``state: created`` ignores a rotated one anyway; re-printing a stale value would mislead).
+    Returns ``{username: initial_password}`` for accounts generated THIS run only — the operator's
+    one-time credential handout. Writes ``0600``; ``dest`` is gitignored.
+    """
+    dest = Path(dest)
+    existing = _read_generated_user_passwords(dest)
+    new_creds: dict[str, str] = {}
+    lines = [
+        "# GENERATED by secdeploy from secsite.toml [[users]] — do NOT edit (regenerated each",
+        "# deploy). Holds INITIAL passwords: keep secret (0600, gitignored). Requires",
+        "# blueprints/force-password-reset.yaml. state: created = create-once, never overwrite.",
+        "version: 1",
+        "metadata:",
+        '  name: "SecSSO — Users (generated)"',
+        "entries:",
+    ]
+    for g in sorted({g for u in users for g in u.groups}):
+        lines += [
+            "  - model: authentik_core.group",
+            "    state: present",
+            "    identifiers:",
+            f"      name: {_yaml_q(g)}",
+            "    attrs:",
+            f"      name: {_yaml_q(g)}",
+        ]
+    for u in users:
+        pw = existing.get(u.username) or secrets.token_urlsafe(12)
+        if u.username not in existing:
+            new_creds[u.username] = pw
+        lines += [
+            "  - model: authentik_core.user",
+            "    state: created",
+            "    identifiers:",
+            f"      username: {_yaml_q(u.username)}",
+            "    attrs:",
+            "      type: internal",
+            f"      password: {_yaml_q(pw)}",
+        ]
+        if u.name:
+            lines.append(f"      name: {_yaml_q(u.name)}")
+        if u.email:
+            lines.append(f"      email: {_yaml_q(u.email)}")
+        if u.groups:
+            lines.append("      groups:")
+            for g in u.groups:
+                lines.append(f"        - !Find [authentik_core.group, [name, {_yaml_q(g)}]]")
+        lines += ["      attributes:", "        reset_password: true"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(lines) + "\n")
+    dest.chmod(0o600)
+    return new_creds
 
 
 def secllm_admin_token(out_dir: str | Path) -> str:

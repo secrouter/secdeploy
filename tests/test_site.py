@@ -268,3 +268,53 @@ def test_roundtrip_bare_file_stays_all_default(tmp_path):
     assert reloaded.ssh is False
     assert reloaded.deploy_for("core") == DeployOptions()
     assert reloaded.deploy_for("gpu") == DeployOptions()
+
+
+# ── [[users]] declared accounts (SecDeploy → SecSSO onboarding) ───────────────────────
+SITE_USERS = BARE + """
+[[users]]
+username = "alice"
+email = "alice@example.mil"
+name = "Alice Analyst"
+groups = ["analysts", "cui-cleared"]
+
+[[users]]
+username = "bob"
+email = "bob@example.mil"
+"""
+
+
+def test_load_parses_users(tmp_path):
+    site = _site(tmp_path, SITE_USERS)
+    assert [u.username for u in site.users] == ["alice", "bob"]
+    alice = site.users[0]
+    assert alice.email == "alice@example.mil"
+    assert alice.name == "Alice Analyst"
+    assert alice.groups == ["analysts", "cui-cleared"]
+    assert site.users[1].groups == []  # optional — absent means no group membership
+
+
+def test_no_users_section_yields_empty_list(tmp_path):
+    assert _site(tmp_path, BARE).users == []
+
+
+def test_users_missing_username_rejected(tmp_path):
+    with pytest.raises(ValueError, match="username is required"):
+        _site(tmp_path, BARE + '\n[[users]]\nemail = "x@y.z"\n')
+
+
+def test_users_duplicate_username_rejected(tmp_path):
+    with pytest.raises(ValueError, match="duplicate username"):
+        _site(tmp_path, BARE + '\n[[users]]\nusername = "a"\n[[users]]\nusername = "a"\n')
+
+
+def test_users_unknown_key_rejected(tmp_path):
+    with pytest.raises(ValueError, match="unknown key"):
+        _site(tmp_path, BARE + '\n[[users]]\nusername = "a"\nrole = "admin"\n')
+
+
+def test_users_round_trip(tmp_path):
+    site = _site(tmp_path, SITE_USERS)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert [(u.username, u.email, u.name, u.groups) for u in reloaded.users] == \
+           [(u.username, u.email, u.name, u.groups) for u in site.users]
