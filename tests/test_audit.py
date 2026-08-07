@@ -511,7 +511,7 @@ def test_fedora_deploy_real_run_2instance_writes_egress_and_shared_token(tmp_pat
     work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
     # 'core' hosts identity + gateway + collab: secdns, seccert, secrouter, secrecorder
     # (services) plus secsso, secchat (stacks) — require_checkouts needs a dir for each.
-    for name in ("secdns", "seccert", "secrouter", "secrecorder", "secsso", "secchat"):
+    for name in ("secdns", "seccert", "secrouter", "secrecorder", "secsso", "secchat", "secassist"):
         (work / name).mkdir(parents=True)
     root.mkdir()
 
@@ -610,7 +610,7 @@ def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, 
     m = _manifest()
     topo = _topo(tmp_path, GPU_SPLIT)  # 'core': identity (secsso) + gateway (secrouter) + collab (secagent, secchat)
     work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
-    for name in ("secdns", "seccert", "secrouter", "secagent", "secrecorder", "secsso", "secchat"):
+    for name in ("secdns", "seccert", "secrouter", "secagent", "secrecorder", "secsso", "secchat", "secassist"):
         (work / name).mkdir(parents=True)
     root.mkdir()
     # A minimal but realistic pi/models.secrouter.example.json in the checkout — this is what
@@ -655,10 +655,12 @@ def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, 
     assert pi_models["providers"]["secrouter"]["models"] == \
         [{"id": "gemma-3-12b-it", "name": "Gemma 3 12B (SecRouter)"}]  # catalog passed through
 
-    # SecRouter's OIDC config fragment.
+    # SecRouter's OIDC config fragment. SecAssist is in this topology, so svc-secassist is
+    # trusted to skip MFA AND to forward the acting end-user (delegatingSubjects).
     oidc_path = addr_dir / "secrouter-oidc.json"
     oidc = json.loads(oidc_path.read_text())
-    assert oidc["serviceSubjects"] == ["svc-secagent"]
+    assert oidc["serviceSubjects"] == ["svc-secagent", "svc-secassist"]
+    assert oidc["delegatingSubjects"] == ["svc-secassist"]
     assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
     # The install steps actually ran (not just staging content generated).

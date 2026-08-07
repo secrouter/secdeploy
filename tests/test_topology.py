@@ -281,6 +281,7 @@ def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
         ("secrouter.sec.internal", "A", "10.0.0.5"),
         ("secagent.sec.internal", "A", "10.0.0.5"),
         ("secchat.sec.internal", "A", "10.0.0.5"),
+        ("secassist.sec.internal", "A", "10.0.0.5"),
         ("secrecorder.sec.internal", "A", "10.0.0.5"),
     ]
     # http, not the originally-pinned https: none of these terminate TLS themselves when
@@ -296,6 +297,7 @@ def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
         "SECROUTER": "http://secrouter.sec.internal:47002",
         "SECAGENT": "http://secagent.sec.internal:47007",
         "SECCHAT": "http://secchat.sec.internal:8065",
+        "SECASSIST": "http://secassist.sec.internal:3080",
         "SECRECORDER": "http://secrecorder.sec.internal:47003",
     }
 

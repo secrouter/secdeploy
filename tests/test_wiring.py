@@ -110,7 +110,7 @@ resource = "core"
 resources = ["gpu1", "gpu2"]
 """
 
-FRONTED = ("secsso", "secrouter", "secagent", "secchat", "secrecorder")
+FRONTED = ("secsso", "secrouter", "secagent", "secchat", "secassist", "secrecorder")
 
 
 def _manifest() -> Manifest:
@@ -272,9 +272,10 @@ def test_nginx_conf_text_port_80_acme_webroot_and_redirect(tmp_path):
     topo = _edge_topo(tmp_path)
     text = wiring.nginx_conf_text(topo, CERT_DIR)
     assert "listen 80;" in text and "listen [::]:80;" in text
-    # the bare domain + all five fronted names share the one :80 server (ACME webroot + redirect)
+    # the bare domain + all six fronted names share the one :80 server (ACME webroot + redirect)
     assert ("server_name sec.internal secsso.sec.internal secrouter.sec.internal "
-            "secagent.sec.internal secchat.sec.internal secrecorder.sec.internal;") in text
+            "secagent.sec.internal secchat.sec.internal secassist.sec.internal "
+            "secrecorder.sec.internal;") in text
     assert "location /.well-known/acme-challenge/ {" in text
     assert "root /var/lib/secsuite/secproxy/acme;" in text
     assert "return 301 https://$host$request_uri;" in text
@@ -563,14 +564,24 @@ def test_write_addressing_secrouter_egress_path_override(tmp_path):
 
 # ── secrouter_oidc_config: security.oidc fragment for SecSSO issuer_mode: global ────────
 def test_secrouter_oidc_config_shape(tmp_path):
-    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier)
+    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier); secassist is in the suite
     oidc = wiring.secrouter_oidc_config(topo)
     assert oidc == {
         "issuer": "http://secsso.sec.internal:9000/",
         "audience": "secrouter",
         "jwksUri": "http://secsso.sec.internal:9000/application/o/secrouter/jwks/",
-        "serviceSubjects": ["svc-secagent"],
+        # SecAssist present → its svc account is trusted to skip MFA AND to delegate.
+        "serviceSubjects": ["svc-secagent", "svc-secassist"],
+        "delegatingSubjects": ["svc-secassist"],
     }
+
+
+def test_secrouter_oidc_config_without_secassist_has_no_delegation(tmp_path):
+    # Drop SecAssist → no delegatingSubjects, and svc-secassist is not a serviceSubject.
+    topo = _topo(tmp_path)
+    oidc = wiring.secrouter_oidc_config(topo, without=["secassist"])
+    assert oidc["serviceSubjects"] == ["svc-secagent"]
+    assert "delegatingSubjects" not in oidc
 
 
 def test_secrouter_oidc_config_empty_without_secsso(tmp_path):

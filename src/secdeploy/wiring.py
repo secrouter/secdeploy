@@ -584,18 +584,30 @@ def secrouter_oidc_config(
     always includes ``"svc-secagent"`` — SecAgent's non-interactive service account, which
     otherwise trips ``requireMfa`` (client_credentials tokens can't carry an MFA assertion).
 
+    When SecAssist (LibreChat) is in the topology, ``svc-secassist`` is added to
+    ``serviceSubjects`` AND to a ``delegatingSubjects`` list: its auth proxy calls SecRouter on
+    each signed-in user's behalf, so SecRouter both admits the machine token and honors the
+    forwarded ``x-sec-acting-user`` — governing/auditing per end-user (see
+    ``secrouter/src/security/types.ts``'s ``delegatingSubjects`` + secassist/docs/governance.md).
+
     Empty when SecSSO isn't in this topology at all (nothing to configure).
     """
-    secsso_url = topology.urls(without).get("SECSSO")
+    urls = topology.urls(without)
+    secsso_url = urls.get("SECSSO")
     if not secsso_url:
         return {}
     issuer = f"{secsso_url}/"
-    return {
+    service_subjects = ["svc-secagent"]
+    fragment: dict[str, object] = {
         "issuer": issuer,
         "audience": "secrouter",
         "jwksUri": f"{issuer}application/o/secrouter/jwks/",
-        "serviceSubjects": ["svc-secagent"],
+        "serviceSubjects": service_subjects,
     }
+    if urls.get("SECASSIST"):
+        service_subjects.append("svc-secassist")
+        fragment["delegatingSubjects"] = ["svc-secassist"]
+    return fragment
 
 
 def secagent_pi_models_json(

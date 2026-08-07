@@ -10,16 +10,17 @@ from secdeploy.manifest import Manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "secchat", "secrecorder",
-       "secproxy"}
-FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder"}
+       "secproxy", "secassist"}
+FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder", "secassist"}
 
 
 def test_load_shipped_manifest():
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.suite == "1.6.0"
+    assert m.suite == "1.7.0"
     assert ALL <= set(m.components)
     assert m.components["secrecorder"].ref == "v0.8.2"
     assert m.components["secagent"].ref == "v0.3.0"   # LeanCTX-bearing release
+    assert m.components["secassist"].ref == "v0.1.0"  # LibreChat chat UI
     assert set(m.targets) == {"macos", "fedora-fips"}
 
 
@@ -28,11 +29,14 @@ def test_kinds_and_optional_flags():
     assert m.components["secsso"].kind == "stack"
     assert m.components["secchat"].kind == "stack"
     assert m.components["secrouter"].kind == "service"
-    assert m.optionals() == ["seccert", "secsso", "secdns", "secproxy"]
+    assert m.optionals() == ["seccert", "secsso", "secdns", "secassist", "secproxy"]
     assert m.components["seccert"].optional and m.components["secsso"].optional
     assert m.components["secdns"].optional and m.components["secdns"].kind == "service"
     assert not m.components["secrouter"].optional
     assert m.components["secproxy"].optional and m.components["secproxy"].kind == "service"
+    # SecAssist (LibreChat) is an optional collab-tier stack, fronted at :443.
+    assert m.components["secassist"].optional and m.components["secassist"].kind == "stack"
+    assert m.components["secassist"].tier == "collab" and m.components["secassist"].port == 3080
 
 
 def test_select_drops_optionals():
