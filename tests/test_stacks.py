@@ -107,3 +107,29 @@ def test_deploy_stacks_dry_run_writes_nothing(tmp_path, capsys):
 
     assert not env.exists()
     assert "auto-generate" in capsys.readouterr().out
+
+
+# ── ensure_stack_secrets: deploy_stacks' seeding half, callable standalone ───────────────
+def test_ensure_stack_secrets_creates_and_seeds_without_bringing_up(tmp_path):
+    work = tmp_path / "work"
+    env = _stack(work, "secsso", "SECAGENT_SERVICE_CLIENT_SECRET=\nPG_USER=authentik\n")
+
+    common.ensure_stack_secrets(work, ["secsso"])
+
+    assert env.exists()
+    assert _val(env.read_text(), "SECAGENT_SERVICE_CLIENT_SECRET")
+    assert stat.S_IMODE(env.stat().st_mode) == 0o600
+
+
+def test_deploy_stacks_seeding_is_a_noop_after_ensure_stack_secrets(tmp_path):
+    """A caller that seeds early (see targets/macos.py's secagent block) must not have
+    deploy_stacks' own later pass generate a SECOND, different value — the whole point of
+    reading the secret back before bring-up is that it's already the final one."""
+    work = tmp_path / "work"
+    env = _stack(work, "secsso", "SECAGENT_SERVICE_CLIENT_SECRET=\n")
+
+    common.ensure_stack_secrets(work, ["secsso"])
+    seeded = _val(env.read_text(), "SECAGENT_SERVICE_CLIENT_SECRET")
+
+    common.deploy_stacks(work, ["secsso"], dry_run=False)
+    assert _val(env.read_text(), "SECAGENT_SERVICE_CLIENT_SECRET") == seeded

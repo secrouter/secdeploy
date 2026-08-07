@@ -26,11 +26,51 @@ services:
     image: secrouter/secrouter:${SECSUITE_VERSION:-1.0.0}
     build:
       context: ../../work/secrouter
+    # The generated peer-wiring env (SECROUTER_SECLLM_ENDPOINTS/_TOKEN, SECAGENT_URL, etc. —
+    # see wiring.write_addressing) — deploy() writes this BEFORE bringing the container up, so
+    # it's always present for a real (non-dry-run) secdeploy deploy. `required: false` so a
+    # standalone `docker compose up` (no secdeploy run first) doesn't hard-fail on a missing
+    # file — it just falls back to this service's own `environment:` defaults below, same as
+    # before this existed. This was a real gap: SecRouter ran with ZERO topology-derived
+    # config on macOS (unlike the native launchd services, which already got it) — confirmed
+    # live, "auto"-model routing 502'd because SECROUTER_SECLLM_ENDPOINTS never reached the
+    # container despite being correctly generated in out/addressing/env/secrouter.env.
+    env_file:
+      - path: ../../out/addressing/env/secrouter.env
+        required: false
+    volumes:
+      # SECROUTER_EGRESS_FILE (from the env_file above) is a HOST-relative path
+      # (out/addressing/secrouter-egress.json) — meaningless inside the container's own
+      # filesystem without this mount. Read-only: this container only ever reads it.
+      - ../../out/addressing:/addressing:ro
     environment:
       # server.ts defaults to 127.0.0.1, which is unreachable through the published
       # port — Docker's healthcheck passes because it runs inside the same container.
       SECROUTER_HOST: "0.0.0.0"
       SECROUTER_PORT: "47002"
+      # Overrides the env_file's host-relative value with the in-container mount path above
+      # (environment: wins over env_file for the same key — see Compose's own precedence
+      # rules). Confirmed live: without this SecRouter FATALs on boot (ENOENT) the moment
+      # SECROUTER_SECLLM_ENDPOINTS is also set, since turnkey-routing to SecLLM requires this
+      # file to actually authorize the egress.
+      SECROUTER_EGRESS_FILE: /addressing/secrouter-egress.json
+      # Overrides the env_file's secllm.sec.internal FQDN — that name only resolves on the
+      # HOST (macOS's /etc/resolver/sec.internal, served by SecDNS as a native launchd
+      # service), which a Docker container has no visibility into at all. SecLLM ALSO runs
+      # natively on macOS (never containerized — see targets/macos.py), so it's reachable
+      # from inside this container via Docker's own host.docker.internal, same mechanism
+      # already used for SecCert's HTTP-01 responder above. Confirmed live: without this,
+      # every request 502s "fetch failed" (DNS ENOTFOUND) despite the endpoint URL otherwise
+      # being correct. Port 11400 is SecLLM's fixed manifest port (suite.toml), not derived
+      # per-deploy like the FQDN was — matches this file's own SECROUTER_PORT convention of
+      # hardcoding stable suite ports directly rather than templating them.
+      #
+      # LIMITATION: this assumes a single-host topology (this Mac IS the one SecLLM
+      # instance) — the common macOS eval shape this whole compose file targets. A genuine
+      # multi-instance SecLLM pool spanning OTHER resources needs real per-instance
+      # reachability (some local via host.docker.internal, some remote via DNS/IP), which a
+      # single static override can't express; that scenario needs hand-tuning here.
+      SECROUTER_SECLLM_ENDPOINTS: http://host.docker.internal:11400/v1
     depends_on:
       - seccert
     ports:
