@@ -265,12 +265,19 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
   "issuer": "https://secsso.<domain>/",
   "audience": "secrouter",
   "jwksUri": "https://secsso.<domain>/application/o/secrouter/jwks/",
-  "serviceSubjects": ["svc-secagent"]
+  "serviceSubjects": ["svc-secagent", "svc-secassist"],
+  "delegatingSubjects": ["svc-secassist"]
 }
 ```
 
 These values match `secsso.sh`'s own `oidc-config`/`secagent-config` output exactly (both
 derive from the same SecSSO external URL), so the two never disagree.
+
+When **SecAssist** (the LibreChat chat UI) is in the topology, `svc-secassist` is added to
+`serviceSubjects` **and** to `delegatingSubjects`: its auth proxy calls SecRouter on each
+signed-in user's behalf, forwarding `x-sec-acting-user`, so SecRouter governs and audits chat
+per end-user rather than as one shared account (see SecRouter's
+`security.oidc.delegatingSubjects` and secassist/docs/governance.md).
 
 ## SecProxy (edge reverse proxy)
 

@@ -13,8 +13,8 @@
 #           set on secllm (inference must dial direct, never through the proxy), secdns (not
 #           HTTP), or secproxy itself.
 
-suite = "1.6.0"
-released = "2026-08-04"
+suite = "1.7.0"
+released = "2026-08-07"
 description = "SecRouter secure-AI suite"
 
 # ── Identity & trust (optional infra) ──
@@ -88,6 +88,16 @@ tier = "collab"
 port = 8065
 fronted = true
 role = "team chat + chat-ops (Mattermost) — bridges to SecAgent"
+
+[components.secassist]
+repo = "secrouter/secassist"
+ref = "v0.1.0"
+kind = "stack"
+tier = "collab"
+port = 3080
+fronted = true
+optional = true
+role = "governed AI chat UI (LibreChat) — SSO login; per-user governance via SecRouter"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
