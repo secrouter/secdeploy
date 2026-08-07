@@ -117,7 +117,7 @@ def test_write_deploy_audit_single_instance_has_expected_keys(tmp_path):
 
     # single-instance inference → secrouter's pool is the one plain secllm URL
     assert record["addressing"]["secrouter_secllm_backend_pool"] == [
-        "https://secllm.sec.internal:11400/v1"
+        "http://secllm.sec.internal:11400/v1"
     ]
     assert record["addressing"]["secdns_zone"]["record_count"] == len(topo.zone())
     assert record["addressing"]["secdns_zone"]["path"] == str(out / "addressing" / "secdns.zone")
@@ -155,8 +155,8 @@ def test_write_deploy_audit_multi_instance_pool_captured(tmp_path):
     record = json.loads(json_path.read_text())
     pool = record["addressing"]["secrouter_secllm_backend_pool"]
     assert pool == wiring.secllm_endpoints(topo) == [
-        "https://secllm-gpu1.sec.internal:11400/v1",
-        "https://secllm-gpu2.sec.internal:11400/v1",
+        "http://secllm-gpu1.sec.internal:11400/v1",
+        "http://secllm-gpu2.sec.internal:11400/v1",
     ]
     hosts = record["authorizations"]["egress"]["secllm_backend_pool_hosts"]
     assert hosts == ["secllm-gpu1.sec.internal:11400", "secllm-gpu2.sec.internal:11400"]
@@ -535,8 +535,8 @@ def test_fedora_deploy_real_run_2instance_writes_egress_and_shared_token(tmp_pat
     # would actually read on the deployed host.
     assert "SECROUTER_EGRESS_FILE=/etc/secsuite/secrouter-egress.json" in secrouter_env
     assert (
-        "SECROUTER_SECLLM_ENDPOINTS=https://secllm-gpu1.sec.internal:11400/v1,"
-        "https://secllm-gpu2.sec.internal:11400/v1"
+        "SECROUTER_SECLLM_ENDPOINTS=http://secllm-gpu1.sec.internal:11400/v1,"
+        "http://secllm-gpu2.sec.internal:11400/v1"
     ) in secrouter_env
     token_line = next(
         ln for ln in secrouter_env.splitlines() if ln.startswith("SECROUTER_SECLLM_TOKEN=")
@@ -635,11 +635,11 @@ def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, 
     # Generated addressing env: full LLM/SecSSO/Mattermost wiring + webhook secret.
     secagent_env_path = addr_dir / "env" / "secagent.env"
     secagent_env = secagent_env_path.read_text()
-    assert "SECAGENT_LLM__BASE_URL=https://secrouter.sec.internal:47002/v1" in secagent_env
+    assert "SECAGENT_LLM__BASE_URL=http://secrouter.sec.internal:47002/v1" in secagent_env
     assert "SECAGENT_LLM__API_KEY=!secagent token" in secagent_env
-    assert "SECAGENT_SECSSO__TOKEN_URL=https://secsso.sec.internal:9000/application/o/token/" \
+    assert "SECAGENT_SECSSO__TOKEN_URL=http://secsso.sec.internal:9000/application/o/token/" \
         in secagent_env
-    assert "SECAGENT_MATTERMOST__URL=https://secchat.sec.internal:8065" in secagent_env
+    assert "SECAGENT_MATTERMOST__URL=http://secchat.sec.internal:8065" in secagent_env
     webhook_line = next(
         ln for ln in secagent_env.splitlines()
         if ln.startswith("SECAGENT_MATTERMOST__WEBHOOK_SECRET=")
@@ -650,7 +650,7 @@ def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, 
     # pi's models.json: adapted from the REAL checked-out example.
     pi_models_path = addr_dir / "secagent-pi-models.json"
     pi_models = json.loads(pi_models_path.read_text())
-    assert pi_models["providers"]["secrouter"]["baseUrl"] == "https://secrouter.sec.internal:47002/v1"
+    assert pi_models["providers"]["secrouter"]["baseUrl"] == "http://secrouter.sec.internal:47002/v1"
     assert pi_models["providers"]["secrouter"]["apiKey"] == "!secagent token"
     assert pi_models["providers"]["secrouter"]["models"] == \
         [{"id": "gemma-3-12b-it", "name": "Gemma 3 12B (SecRouter)"}]  # catalog passed through
@@ -659,7 +659,7 @@ def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, 
     oidc_path = addr_dir / "secrouter-oidc.json"
     oidc = json.loads(oidc_path.read_text())
     assert oidc["serviceSubjects"] == ["svc-secagent"]
-    assert oidc["issuer"] == "https://secsso.sec.internal:9000/"
+    assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
     # The install steps actually ran (not just staging content generated).
     def _ran(*, cmd0: str, last: str) -> bool:
