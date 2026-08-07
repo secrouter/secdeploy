@@ -650,6 +650,44 @@ def secagent_webhook_secret(out_dir: str | Path) -> str:
     return token
 
 
+def sync_secagent_service_secret(
+    secsso_env_path: str | Path, secrets_env_path: str | Path,
+) -> str | None:
+    """Mirror SecSSO's auto-generated ``SECAGENT_SERVICE_CLIENT_SECRET`` (in ``secsso/.env`` —
+    seeded by ``targets/common.ensure_stack_secrets``, read by
+    ``secsso/blueprints/secagent-service.yaml``'s ``!Env`` to provision the confidential
+    ``secagent`` client_credentials provider) into SecAgent's own ``SECAGENT_CLIENT_SECRET``
+    (``deploy/macos/secrets.env`` or the fedora-fips equivalent). The two must be the IDENTICAL
+    value — ``secagent token``'s client_credentials grant authenticates by comparing its
+    ``client_secret`` against exactly what SecSSO's provider was given.
+
+    Only fills a BLANK ``SECAGENT_CLIENT_SECRET=`` line — the same "blank key = fill me"
+    convention :func:`~secdeploy.targets.common._seed_env_secrets` uses for the stacks' own
+    secrets — so a value an operator (or an earlier sync) already set is never silently
+    overwritten. Returns the synced value, or ``None`` if nothing changed: either file is
+    missing, SecSSO hasn't generated its secret yet (stack never deployed), or SecAgent's own
+    value is already non-blank (including a stale/mismatched one — see the caller's warning).
+    """
+    secsso_env_path, secrets_env_path = Path(secsso_env_path), Path(secrets_env_path)
+    if not secsso_env_path.exists() or not secrets_env_path.exists():
+        return None
+    secsso_secret = ""
+    for line in secsso_env_path.read_text().splitlines():
+        if line.strip().startswith("SECAGENT_SERVICE_CLIENT_SECRET="):
+            secsso_secret = line.split("=", 1)[1].strip()
+            break
+    if not secsso_secret:
+        return None
+    lines = secrets_env_path.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "SECAGENT_CLIENT_SECRET=":
+            lines[i] = f"SECAGENT_CLIENT_SECRET={secsso_secret}"
+            secrets_env_path.write_text("\n".join(lines) + "\n")
+            secrets_env_path.chmod(0o600)
+            return secsso_secret
+    return None
+
+
 def secllm_admin_token(out_dir: str | Path) -> str:
     """This SecLLM instance's own admin-surface token (``SECLLM_ADMIN_TOKEN`` — model
     load/switch via ``/admin``; independently random per instance, no cross-instance
