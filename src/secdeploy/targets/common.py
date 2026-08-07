@@ -45,6 +45,34 @@ def _seed_env_secrets(text: str) -> tuple[str, list[str]]:
     return new_text, generated
 
 
+def ensure_stack_secrets(work: Path, stacks: list[str]) -> None:
+    """Ensure each stack's ``.env`` exists (from ``.env.example``) and every blank required
+    secret in it is filled — the seeding half of :func:`deploy_stacks`, split out so a caller
+    that needs a stack's generated secret BEFORE that stack's own bring-up runs later in the
+    same deploy (e.g. SecAgent reading SecSSO's generated ``SECAGENT_SERVICE_CLIENT_SECRET`` to
+    mirror into its own env — see targets/macos.py/fedora_fips.py) can seed it early without
+    duplicating :func:`deploy_stacks`'s secret-generation logic. :func:`deploy_stacks` calls
+    this too, so its own seeding pass is then just a no-op (values are already non-blank) —
+    every value still originates from exactly one place.
+    """
+    for name in stacks:
+        proj = work / name
+        env, example = proj / ".env", proj / ".env.example"
+        if not env.exists():
+            if not example.exists():
+                continue  # deploy_stacks' own pass below warns; nothing to seed yet
+            shutil.copy(example, env)
+            env.chmod(0o600)
+            P.log(f"stack {name}: created {env} from .env.example")
+        new_text, generated = _seed_env_secrets(env.read_text())
+        if generated:
+            env.write_text(new_text)
+            env.chmod(0o600)
+            P.log(f"stack {name}: generated {len(generated)} secret(s) in {env} "
+                  f"({', '.join(generated)}) — stored 0600, gitignored, kept across redeploys "
+                  f"(read them back from {env} if you need e.g. the Authentik admin credentials)")
+
+
 def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
     """Bring up ``stack`` components via each checkout's ``bootstrap/<name>.sh up``.
 
@@ -60,6 +88,8 @@ def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
     SecAgent client secret shared with SecAgent's own env) can still pre-fill ``.env`` before
     deploying; only blank keys are generated.
     """
+    if not dry_run:
+        ensure_stack_secrets(work, stacks)
     for name in stacks:
         proj = work / name
         boot = proj / "bootstrap" / f"{name}.sh"
@@ -72,21 +102,9 @@ def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
             P.warn(f"stack {name}: no bootstrap/{name}.sh in {proj} — skipping")
             continue
         if not env.exists():
-            if example.exists():
-                shutil.copy(example, env)
-                env.chmod(0o600)
-                P.log(f"stack {name}: created {env} from .env.example")
-            else:
-                P.warn(f"stack {name}: no .env / .env.example in {proj} — configure it, "
-                       f"then run:  bash {boot} up")
-                continue
-        new_text, generated = _seed_env_secrets(env.read_text())
-        if generated:
-            env.write_text(new_text)
-            env.chmod(0o600)
-            P.log(f"stack {name}: generated {len(generated)} secret(s) in {env} "
-                  f"({', '.join(generated)}) — stored 0600, gitignored, kept across redeploys "
-                  f"(read them back from {env} if you need e.g. the Authentik admin credentials)")
+            P.warn(f"stack {name}: no .env / .env.example in {proj} — configure it, "
+                   f"then run:  bash {boot} up")
+            continue
         P.log(f"stack {name}: bringing up via bootstrap/{name}.sh up")
         P.run(["bash", str(boot), "up"], check=False)
 

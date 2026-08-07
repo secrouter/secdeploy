@@ -871,6 +871,30 @@ def deploy(
                     P.log(f"secllm autostart: {', '.join(autostart_models)} — downloaded (if not "
                           "already cached) and loaded the moment the service starts")
 
+    # SecSSO's SECAGENT_SERVICE_CLIENT_SECRET (secsso/blueprints/secagent-service.yaml's
+    # client_credentials provider) must exist BEFORE secagent's own block below can mirror it
+    # into SECAGENT_CLIENT_SECRET — seed it here rather than waiting for the stacks bring-up
+    # later in this function (too late for THIS deploy's secagent env), using the same
+    # generate-if-blank pass deploy_stacks itself uses (so a fresh deploy's first run already
+    # has the matching secret, not just a redeploy's second pass).
+    if not dry_run and with_agent and placed and "secsso" in placed and "secsso" not in without:
+        common.ensure_stack_secrets(work, ["secsso"])
+        secrets_path = root / "deploy" / "macos" / "secrets.env"
+        synced = wiring.sync_secagent_service_secret(work / "secsso" / ".env", secrets_path)
+        if synced:
+            P.log(f"secagent: SECAGENT_CLIENT_SECRET synced from SecSSO's generated service "
+                  f"client secret → {secrets_path}")
+        elif secrets_path.exists():
+            current = _parse_env_file(secrets_path).get("SECAGENT_CLIENT_SECRET", "")
+            provisioned = _parse_env_file(work / "secsso" / ".env").get(
+                "SECAGENT_SERVICE_CLIENT_SECRET", "")
+            if current and provisioned and current != provisioned:
+                P.warn(f"secagent: {secrets_path}'s SECAGENT_CLIENT_SECRET doesn't match "
+                       "SecSSO's provisioned secagent client secret — `secagent token` will "
+                       "fail with invalid_client. Blank the line to auto-sync on the next "
+                       "deploy, or set it to match work/secsso/.env's "
+                       "SECAGENT_SERVICE_CLIENT_SECRET yourself.")
+
     # secagent — opt-in chat bridge, now with REAL env layering: the generated addressing env
     # (LLM/SecSSO/Mattermost wiring + webhook secret) + the SECAGENT_* operator secrets are folded
     # into the launchd job's EnvironmentVariables — the macOS equivalent of fedora's two
@@ -892,12 +916,20 @@ def deploy(
         if not dry_run and native_services and not _ensure_native_venv(root, "secagent"):
             P.warn(f"secagent: no project venv — run `secdeploy build macos`, then start it: {fallback}")
         else:
+            # secagent's SecSSO calls (secsso.py) go through httpx, which bundles its own CA
+            # list (certifi) rather than using the macOS System keychain — so --trust-ca
+            # trusting SecCert's root there does NOTHING for secagent/pi's own TLS validation
+            # (confirmed live: CERTIFICATE_VERIFY_FAILED even with the root already trusted
+            # system-wide). Point httpx at the same root directly instead.
+            root_pem = root / "out" / "seccert-root.pem"
+            tls_env = {"SSL_CERT_FILE": str(root_pem), "REQUESTS_CA_BUNDLE": str(root_pem)} \
+                if root_pem.exists() else {}
             secagent = launchd.LaunchdService(
                 name="secagent",
                 program_args=[str(_venv_bin(root, "secagent", "secagent")), "chat", "serve",
                               "--port", str(port)],
                 log_dir=log_dir,
-                env={**_base_env(home), **agent_env, **agent_secrets},
+                env={**_base_env(home), **agent_env, **agent_secrets, **tls_env},
                 working_dir=str(root), user=user,
             )
             _install_or_note(secagent, staging_dir, native_services=native_services,
@@ -1136,6 +1168,22 @@ def _secproxy_setup_actions(
         actions.append(
             "Finish SecChat's bot + team setup (safe to re-run): "
             "<code>bash work/secchat/bootstrap/secchat.sh bot</code>."
+        )
+    if "secagent" in placed and not (Path.home() / ".secagent" / "auth" / "user-token.json").exists():
+        # `secagent init` (see the with_agent block above) already wrote ~/.pi/agent/models.json
+        # + ~/.secagent/config.yaml for whoever ran this deploy — the one step that can't be
+        # automated is the actual login (needs a human to approve in a browser). Disappears
+        # once that per-user token is cached, same "shrinks as things get done" convention as
+        # every other item here.
+        actions.append(
+            "Configure your pi instance: <code>secagent</code>/pi validate TLS via httpx's own "
+            "bundled CA list, not the System keychain, so <code>--trust-ca</code> alone isn't "
+            "enough for them — export <code>SSL_CERT_FILE=$PWD/out/seccert-root.pem "
+            "REQUESTS_CA_BUNDLE=$PWD/out/seccert-root.pem</code> first. Then authenticate as "
+            "yourself: <code>work/secagent/.venv/bin/secagent login</code> (prints a device-code "
+            "URL to approve in a browser) — then <code>pi --provider secrouter --model "
+            "balanced</code>, and to load secagent's own tools, <code>pi --extension "
+            "work/secagent/pi/extensions/secagent.ts</code>."
         )
     return actions
 

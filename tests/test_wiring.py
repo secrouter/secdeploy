@@ -671,6 +671,43 @@ def test_secagent_webhook_secret_distinct_from_secllm_shared_token(tmp_path):
     assert wiring.secagent_webhook_secret(out) != wiring.secllm_shared_token(out)
 
 
+# ── sync_secagent_service_secret: mirrors SecSSO's generated secret into secagent's env ──
+def test_sync_secagent_service_secret_fills_blank_value(tmp_path):
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECAGENT_SERVICE_CLIENT_SECRET=abc123\nOTHER=x\n")
+    secrets_env = tmp_path / "secrets.env"
+    secrets_env.write_text("SECAGENT_CLIENT_SECRET=\nOTHER_KEY=y\n")
+    synced = wiring.sync_secagent_service_secret(secsso_env, secrets_env)
+    assert synced == "abc123"
+    assert "SECAGENT_CLIENT_SECRET=abc123" in secrets_env.read_text()
+    assert "OTHER_KEY=y" in secrets_env.read_text()  # untouched lines survive
+
+
+def test_sync_secagent_service_secret_never_overwrites_non_blank_value(tmp_path):
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECAGENT_SERVICE_CLIENT_SECRET=abc123\n")
+    secrets_env = tmp_path / "secrets.env"
+    secrets_env.write_text("SECAGENT_CLIENT_SECRET=already-set\n")
+    synced = wiring.sync_secagent_service_secret(secsso_env, secrets_env)
+    assert synced is None
+    assert "SECAGENT_CLIENT_SECRET=already-set" in secrets_env.read_text()
+
+
+def test_sync_secagent_service_secret_missing_secsso_secret_is_a_noop(tmp_path):
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("OTHER=x\n")  # no SECAGENT_SERVICE_CLIENT_SECRET line at all
+    secrets_env = tmp_path / "secrets.env"
+    secrets_env.write_text("SECAGENT_CLIENT_SECRET=\n")
+    assert wiring.sync_secagent_service_secret(secsso_env, secrets_env) is None
+    assert "SECAGENT_CLIENT_SECRET=\n" in secrets_env.read_text()
+
+
+def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):
+    assert wiring.sync_secagent_service_secret(
+        tmp_path / "nope.env", tmp_path / "also-nope.env",
+    ) is None
+
+
 # ── Topology.env_for: the secagent branch ────────────────────────────────────────────────
 def test_env_for_secagent_llm_points_at_secrouter(tmp_path):
     topo = _topo(tmp_path)
