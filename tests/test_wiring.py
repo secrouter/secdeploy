@@ -200,7 +200,7 @@ def test_env_text_wires_peers(tmp_path):
     topo = _topo(tmp_path)
     text = wiring.env_text(topo, "secrouter")
     assert "SEC_DOMAIN=sec.internal" in text
-    assert "SECLLM_URL=https://secllm.sec.internal:11400" in text
+    assert "SECLLM_URL=http://secllm.sec.internal:11400" in text
     assert "SECROUTER_URL" not in text  # no self-reference
 
 
@@ -340,14 +340,14 @@ def test_write_addressing_no_nginx_conf_when_secproxy_not_in_topology(tmp_path):
 # ── multi-instance inference: SecRouter's backend pool (SECROUTER_SECLLM_ENDPOINTS) ─────
 def test_secllm_endpoints_single_instance(tmp_path):
     topo = _topo(tmp_path)
-    assert wiring.secllm_endpoints(topo) == ["https://secllm.sec.internal:11400/v1"]
+    assert wiring.secllm_endpoints(topo) == ["http://secllm.sec.internal:11400/v1"]
 
 
 def test_secllm_endpoints_multi_instance(tmp_path):
     topo = _multi_topo(tmp_path)
     assert wiring.secllm_endpoints(topo) == [
-        "https://secllm-gpu1.sec.internal:11400/v1",
-        "https://secllm-gpu2.sec.internal:11400/v1",
+        "http://secllm-gpu1.sec.internal:11400/v1",
+        "http://secllm-gpu2.sec.internal:11400/v1",
     ]
 
 
@@ -355,7 +355,7 @@ def test_env_for_secrouter_gets_secllm_endpoints_pool(tmp_path):
     topo = _multi_topo(tmp_path)
     env = topo.env_for("secrouter")
     assert env["SECROUTER_SECLLM_ENDPOINTS"] == (
-        "https://secllm-gpu1.sec.internal:11400/v1,https://secllm-gpu2.sec.internal:11400/v1"
+        "http://secllm-gpu1.sec.internal:11400/v1,http://secllm-gpu2.sec.internal:11400/v1"
     )
     # a single URL can't represent a 2-instance pool, so the generic peer URL is absent
     assert "SECLLM_URL" not in env
@@ -364,8 +364,8 @@ def test_env_for_secrouter_gets_secllm_endpoints_pool(tmp_path):
 def test_env_text_secrouter_gets_secllm_endpoints_pool(tmp_path):
     topo = _multi_topo(tmp_path)
     text = wiring.env_text(topo, "secrouter")
-    assert ("SECROUTER_SECLLM_ENDPOINTS=https://secllm-gpu1.sec.internal:11400/v1,"
-            "https://secllm-gpu2.sec.internal:11400/v1") in text
+    assert ("SECROUTER_SECLLM_ENDPOINTS=http://secllm-gpu1.sec.internal:11400/v1,"
+            "http://secllm-gpu2.sec.internal:11400/v1") in text
 
 
 def test_zone_text_has_both_secllm_instances(tmp_path):
@@ -566,9 +566,9 @@ def test_secrouter_oidc_config_shape(tmp_path):
     topo = _topo(tmp_path)  # secsso is on 'core' (identity tier)
     oidc = wiring.secrouter_oidc_config(topo)
     assert oidc == {
-        "issuer": "https://secsso.sec.internal:9000/",
+        "issuer": "http://secsso.sec.internal:9000/",
         "audience": "secrouter",
-        "jwksUri": "https://secsso.sec.internal:9000/application/o/secrouter/jwks/",
+        "jwksUri": "http://secsso.sec.internal:9000/application/o/secrouter/jwks/",
         "serviceSubjects": ["svc-secagent"],
     }
 
@@ -712,18 +712,18 @@ def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):
 def test_env_for_secagent_llm_points_at_secrouter(tmp_path):
     topo = _topo(tmp_path)
     env = topo.env_for("secagent")
-    assert env["SECAGENT_LLM__BASE_URL"] == "https://secrouter.sec.internal:47002/v1"
+    assert env["SECAGENT_LLM__BASE_URL"] == "http://secrouter.sec.internal:47002/v1"
     assert env["SECAGENT_LLM__API_KEY"] == "!secagent token"
-    assert env["SECAGENT_LLM__MODEL"] == "balanced"
+    assert env["SECAGENT_LLM__MODEL"] == "auto"
 
 
 def test_env_for_secagent_secsso_and_mattermost(tmp_path):
     topo = _topo(tmp_path)
     env = topo.env_for("secagent")
     assert env["SECAGENT_SECSSO__TOKEN_URL"] == \
-        "https://secsso.sec.internal:9000/application/o/token/"
+        "http://secsso.sec.internal:9000/application/o/token/"
     assert env["SECAGENT_SECSSO__CLIENT_ID"] == "secagent"
-    assert env["SECAGENT_MATTERMOST__URL"] == "https://secchat.sec.internal:8065"
+    assert env["SECAGENT_MATTERMOST__URL"] == "http://secchat.sec.internal:8065"
     assert env["SECAGENT_MATTERMOST__TEAM"] == "secrouter"
     assert env["SECAGENT_AUDIT__ENABLED"] == "true"
 
@@ -753,7 +753,7 @@ def test_write_addressing_secagent_env_has_full_wiring(tmp_path):
     out = tmp_path / "out"
     written = wiring.write_addressing(topo, out, "core")
     text = Path(written["env"]["secagent"]).read_text()
-    assert "SECAGENT_LLM__BASE_URL=https://secrouter.sec.internal:47002/v1" in text
+    assert "SECAGENT_LLM__BASE_URL=http://secrouter.sec.internal:47002/v1" in text
     assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET=" in text
     token_line = next(
         ln for ln in text.splitlines() if ln.startswith("SECAGENT_MATTERMOST__WEBHOOK_SECRET=")

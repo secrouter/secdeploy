@@ -300,13 +300,26 @@ class Topology:
 
         A FRONTED component (see :meth:`is_fronted`) gets a bare ``https://<fqdn>`` — secproxy
         always terminates :443, so the port is implied — instead of ``https://<fqdn>:<port>``.
+
+        A NON-fronted component gets ``http://`` regardless of ``scheme`` — it dials the
+        component's own listener directly, which never terminates TLS itself. EXCEPT
+        secproxy: it's never "fronted" (nothing fronts the fronter), but unlike every other
+        non-fronted component it genuinely IS the suite's TLS terminator, so it keeps
+        ``scheme`` unchanged. Confirmed all three live: SecCert/SecLLM only ever answer plain
+        HTTP directly (curl -k to either over https fails outright) while secproxy answers
+        https directly and 301s plain http to it — the exact opposite of what a blanket
+        "fronted → https" rule assumed. This is also what broke SecRouter's turnkey SecLLM
+        routing (see :meth:`instance_urls`): a bare "fetch failed" dialing the https URL this
+        used to generate for a plain-HTTP-only listener.
         """
         result: dict[str, str] = {}
         for name, c in self.manifest.select(without).items():
             if not c.port or len(self.groups.get(c.tier, [])) != 1:
                 continue
-            suffix = "" if self.is_fronted(name) else f":{c.port}"
-            result[name.upper()] = f"{scheme}://{self.fqdn(name)}{suffix}"
+            fronted = self.is_fronted(name)
+            terminates_tls = fronted or name == "secproxy"
+            suffix = "" if fronted else f":{c.port}"
+            result[name.upper()] = f"{scheme if terminates_tls else 'http'}://{self.fqdn(name)}{suffix}"
         return result
 
     def instance_urls(
@@ -318,17 +331,22 @@ class Topology:
         if ``component`` isn't selected or has no inbound port.
 
         A FRONTED instance (see :meth:`is_fronted`) gets a bare ``https://<fqdn>`` (443
-        implied); otherwise ``https://<fqdn>:<port>`` as before. SecLLM is never fronted
-        (inference must dial direct, never through the proxy), so its pool stays direct+ported
-        regardless of what else is fronted in this topology."""
+        implied); otherwise ``http://<fqdn>:<port>`` — NOT ``https``, regardless of ``scheme``
+        — SecLLM is never fronted (inference must dial direct, never through the proxy) and
+        never terminates TLS itself, so its pool stays direct+ported+PLAIN-HTTP regardless of
+        what else is fronted in this topology or what scheme the caller asks for. Confirmed
+        live: SecRouter's turnkey SecLLM routing FATALs with a bare "fetch failed" against the
+        https URL this used to generate."""
         if component not in self.manifest.select(without):
             return []
         port = self.manifest.components[component].port
         if not port:
             return []
-        suffix = "" if self.is_fronted(component) else f":{port}"
+        fronted = self.is_fronted(component)
+        suffix = "" if fronted else f":{port}"
+        effective_scheme = scheme if fronted else "http"
         return [
-            f"{scheme}://{self.fqdn(name)}{suffix}{path}"
+            f"{effective_scheme}://{self.fqdn(name)}{suffix}{path}"
             for name, _res, _addr in self.instances(component)
         ]
 
@@ -367,7 +385,10 @@ class Topology:
         other peer URL, and a handful of suite-wide conventions are fixed (client_id
         ``"secagent"``, team ``"secrouter"`` — matching secchat's own bootstrap script,
         ``SECAGENT_LLM__API_KEY="!secagent token"`` — never a secret, a resolved-at-request-time
-        command, ``SECAGENT_LLM__MODEL="balanced"``, audit enabled). ``secagent_webhook_secret``
+        command, ``SECAGENT_LLM__MODEL="auto"`` — SecRouter's own catalog, NOT one of SecLLM's
+        model ids (a different namespace; confirmed live that SecRouter 502s a SecLLM-style id
+        like "balanced" as an unrecognized/misrouted provider), audit enabled).
+        ``secagent_webhook_secret``
         (see ``wiring.secagent_webhook_secret``) is the one piece secagent needs that isn't
         derivable from the topology, so — like ``secllm_token`` above — a caller supplies it.
         """
@@ -401,7 +422,14 @@ class Topology:
             env["SECAGENT_SECSSO__CLIENT_ID"] = "secagent"
             env["SECAGENT_MATTERMOST__TEAM"] = "secrouter"
             env["SECAGENT_LLM__API_KEY"] = "!secagent token"
-            env["SECAGENT_LLM__MODEL"] = "balanced"
+            # "auto" (SecRouter's own routing policy picks the backend) — NOT "balanced", a
+            # SecLLM catalog id from a different namespace that doesn't exist in SecRouter's
+            # own model catalog. Confirmed live: SecRouter 502s "Unsupported provider:
+            # anthropic" for "balanced" (it apparently treats any unrecognized, unprefixed
+            # model id as an Anthropic model name and tries to route it there — a provider
+            # this SecRouter has no credentials for, only Bedrock's "bedrock/..." ids show up
+            # in its real /v1/models).
+            env["SECAGENT_LLM__MODEL"] = "auto"
             env["SECAGENT_AUDIT__ENABLED"] = "true"
             if secagent_webhook_secret:
                 env["SECAGENT_MATTERMOST__WEBHOOK_SECRET"] = secagent_webhook_secret
