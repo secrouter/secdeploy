@@ -30,7 +30,7 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 
 [components.secsso]
 repo = "secrouter/secsso"
-ref = "v1.0.0"
+ref = "v1.1.0"
 kind = "stack"
 tier = "identity"
 port = 9000
