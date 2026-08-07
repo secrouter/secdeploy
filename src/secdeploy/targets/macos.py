@@ -935,6 +935,23 @@ def deploy(
             _install_or_note(secagent, staging_dir, native_services=native_services,
                              dry_run=dry_run, fallback_note=fallback)
 
+        # `secagent` onto PATH globally via `uv tool install` — mirrors secagent's own
+        # install.sh (docs/installation.md), just pointed at the ALREADY-fetched local
+        # checkout instead of re-cloning from git. Without this, `secagent` only exists at
+        # work/secagent/.venv/bin/secagent — invisible to anything that shells out to the
+        # bare command name, which is exactly what pi's `!secagent token --user` apiKey does
+        # (confirmed live: pi's "API key auth failed... Failed to resolve API key" turned out
+        # to be a plain command-not-found, not an actual auth/TLS problem). --force so a
+        # redeploy re-installs whatever's now pinned in work/secagent, matching install.sh.
+        if dry_run:
+            print("  · uv tool install --force work/secagent (put `secagent` on PATH globally)")
+        elif P.which("uv"):
+            P.run(["uv", "tool", "install", "--force", str(root / "work" / "secagent")],
+                  check=False)
+        else:
+            P.warn("uv not found — secagent won't be on PATH; pi's \"!secagent token --user\" "
+                   "apiKey will fail with a command-not-found-shaped auth error")
+
         # pi, wired for the DEPLOYING USER (not the chat service above — pi is never in that
         # service's own request path, see work/secagent/docs/pi.md): `secagent init` writes
         # ~/.pi/agent/models.json + ~/.secagent/config.yaml using `!secagent token --user` as

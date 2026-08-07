@@ -175,9 +175,11 @@ def test_env_for_wires_peers_not_self(tmp_path):
     assert env["SELF_FQDN"] == "secrouter.sec.internal"
     assert env["SEC_DOMAIN"] == "sec.internal"
     assert env["SELF_PORT"] == "47002"
-    # peers get URLs pointing at their hosting resource; self is excluded
-    assert env["SECLLM_URL"] == "https://secllm.sec.internal:11400"
-    assert env["SECCERT_URL"] == "https://seccert.sec.internal:47001"
+    # peers get URLs pointing at their hosting resource; self is excluded. SecLLM is never
+    # fronted/TLS-terminated (inference dials direct) — http, not https, regardless of the
+    # default scheme every other (fronted) peer URL uses.
+    assert env["SECLLM_URL"] == "http://secllm.sec.internal:11400"
+    assert env["SECCERT_URL"] == "http://seccert.sec.internal:47001"
     assert "SECROUTER_URL" not in env
 
 
@@ -232,27 +234,36 @@ def test_urls_fronted_components_drop_the_port(tmp_path):
     assert urls["SECAGENT"] == "https://secagent.sec.internal"
     assert urls["SECCHAT"] == "https://secchat.sec.internal"
     assert urls["SECRECORDER"] == "https://secrecorder.sec.internal"
-    # never fronted — keep their explicit port (seccert = the CA, a direct trust anchor)
-    assert urls["SECCERT"] == "https://seccert.sec.internal:47001"
-    assert urls["SECLLM"] == "https://secllm.sec.internal:11400"
-    assert urls["SECDNS"] == "https://secdns.sec.internal:53"
+    # never fronted — keep their explicit port (seccert = the CA, a direct trust anchor).
+    # http, not https: none of these terminate TLS themselves — confirmed live (a direct
+    # https:// curl to seccert/secllm fails outright; only plain http answers).
+    assert urls["SECCERT"] == "http://seccert.sec.internal:47001"
+    assert urls["SECLLM"] == "http://secllm.sec.internal:11400"
+    assert urls["SECDNS"] == "http://secdns.sec.internal:53"
+    # secproxy is the ONE exception: never "fronted" (nothing fronts the fronter) but it IS
+    # the suite's real TLS terminator — confirmed live (https answers directly, http 301s to
+    # it) — so it keeps the caller's scheme instead of being forced to http like the others.
     assert urls["SECPROXY"] == "https://secproxy.sec.internal:443"
 
 
 def test_instance_urls_secllm_stays_direct_and_ported_when_fronting_is_active(tmp_path):
     """CRITICAL: SecLLM must NEVER be addressed through secproxy — inference traffic has to
-    dial SecRouter directly, even when everything else in this same topology is fronted."""
+    dial SecRouter directly, even when everything else in this same topology is fronted. Plain
+    http, not https — confirmed live SecLLM never terminates TLS itself, and SecRouter's
+    turnkey routing to it FATALs with a bare "fetch failed" against an https URL."""
     topo = _topo(tmp_path, EDGE_SPLIT)
-    assert topo.instance_urls("secllm", path="/v1") == ["https://secllm.sec.internal:11400/v1"]
+    assert topo.instance_urls("secllm", path="/v1") == ["http://secllm.sec.internal:11400/v1"]
 
 
 def test_env_for_secrouter_peers_are_bare_fronted_urls_but_secllm_pool_stays_direct(tmp_path):
     topo = _topo(tmp_path, EDGE_SPLIT)
     env = topo.env_for("secrouter")
-    assert env["SECCERT_URL"] == "https://seccert.sec.internal:47001"  # CA is direct, not fronted
+    # CA is direct, not fronted — and plain http, confirmed live it never terminates TLS itself
+    assert env["SECCERT_URL"] == "http://seccert.sec.internal:47001"
     assert env["SECAGENT_URL"] == "https://secagent.sec.internal"
-    # SECROUTER_SECLLM_ENDPOINTS (the backend pool) stays DIRECT + ported no matter what
-    assert env["SECROUTER_SECLLM_ENDPOINTS"] == "https://secllm.sec.internal:11400/v1"
+    # SECROUTER_SECLLM_ENDPOINTS (the backend pool) stays DIRECT + ported + plain-http no
+    # matter what — confirmed live an https URL here FATALs SecRouter's turnkey routing
+    assert env["SECROUTER_SECLLM_ENDPOINTS"] == "http://secllm.sec.internal:11400/v1"
 
 
 def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
@@ -272,15 +283,20 @@ def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
         ("secchat.sec.internal", "A", "10.0.0.5"),
         ("secrecorder.sec.internal", "A", "10.0.0.5"),
     ]
+    # http, not the originally-pinned https: none of these terminate TLS themselves when
+    # nothing fronts them (confirmed live for seccert/secllm; the same reasoning applies
+    # uniformly here — every manifest port in this no-secproxy topology is a plain listener,
+    # not a TLS one) — see Topology.urls()'s docstring. Updated deliberately, not a stale
+    # snapshot: this pinned value predates that fix and was never actually live-verified.
     assert topo.urls() == {
-        "SECCERT": "https://seccert.sec.internal:47001",
-        "SECSSO": "https://secsso.sec.internal:9000",
-        "SECDNS": "https://secdns.sec.internal:53",
-        "SECLLM": "https://secllm.sec.internal:11400",
-        "SECROUTER": "https://secrouter.sec.internal:47002",
-        "SECAGENT": "https://secagent.sec.internal:47007",
-        "SECCHAT": "https://secchat.sec.internal:8065",
-        "SECRECORDER": "https://secrecorder.sec.internal:47003",
+        "SECCERT": "http://seccert.sec.internal:47001",
+        "SECSSO": "http://secsso.sec.internal:9000",
+        "SECDNS": "http://secdns.sec.internal:53",
+        "SECLLM": "http://secllm.sec.internal:11400",
+        "SECROUTER": "http://secrouter.sec.internal:47002",
+        "SECAGENT": "http://secagent.sec.internal:47007",
+        "SECCHAT": "http://secchat.sec.internal:8065",
+        "SECRECORDER": "http://secrecorder.sec.internal:47003",
     }
 
 
