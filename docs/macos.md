@@ -110,6 +110,16 @@ update phone-home), best-effort (a missing `npm` just skips it — SecAgent degr
 compression daemon is a deferred follow-on (LeanCTX self-manages that, incl. an auto-updater to
 suppress). See SecAgent's `docs/leanctx.md` for the full security posture.
 
+### SecAssist + declared users
+
+**SecAssist** (the LibreChat chat UI) deploys with the suite as a stack — no flag — and its
+env is fully turnkey: when SecSSO is also placed, the deploy mirrors SecSSO's two generated
+OIDC secrets and writes the topology issuer/SecRouter/domain env into `work/secassist/.env`
+(nothing to reconcile by hand). And a `[[users]]` list in your `secsite.toml` provisions those
+accounts in SecSSO with random, must-reset-on-first-login passwords (printed once at deploy).
+Both work identically on Fedora — see [fedora-fips.md](fedora-fips.md#onboarding-users-users)
+for the `[[users]]` shape and the security notes.
+
 ### Internal DNS (`*.internal`) on macOS
 
 A single-host eval has no topology and no `.internal` names — reach everything at

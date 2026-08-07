@@ -429,7 +429,9 @@ def deploy(
     with_agent: bool = False,
     native_services: bool = True,
     autostart_models: list[str] | None = None,
+    users=None,
 ) -> None:
+    users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
     # systemd-native, so it's accepted for calling-convention parity with macos.deploy() and
     # otherwise ignored (same pattern as the macOS-only --tls/--configure-hosts flags above).
@@ -612,6 +614,31 @@ def deploy(
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)
+    # SecAssist (LibreChat stack) turnkey env — mirror SecSSO's two generated OIDC secrets and
+    # write the topology OIDC/gateway env into work/secassist/.env BEFORE deploy_stacks seeds it.
+    # (Fedora had no early-seed step; add one for secsso+secassist, matching the macOS mirror.)
+    if not dry_run and topology is not None and placed and "secassist" in placed \
+            and "secassist" not in (without or []) and "secsso" in placed \
+            and "secsso" not in (without or []):
+        common.ensure_stack_secrets(work, ["secsso", "secassist"])
+        sa_env = wiring.sync_secassist_env(
+            work / "secsso" / ".env", work / "secassist" / ".env", topology, without)
+        if sa_env:
+            P.log(f"secassist: synced OIDC secrets + topology env → work/secassist/.env "
+                  f"({len(sa_env)} keys)")
+    # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
+    # (random initial passwords, forced reset on first login) before the stacks bring-up.
+    if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):
+        users_bp = work / "secsso" / "blueprints" / "users.generated.yaml"
+        new_creds = wiring.generate_secsso_users_blueprint(users, users_bp)
+        if new_creds:
+            P.log(f"secsso: provisioned {len(new_creds)} user(s) → {users_bp} "
+                  "(each must reset their password on first login)")
+            P.log("  ── initial credentials — distribute securely, one-time ──")
+            for _uname, _pw in new_creds.items():
+                P.log(f"      {_uname}: {_pw}")
+        else:
+            P.log(f"secsso: {len(users)} declared user(s) already provisioned (passwords unchanged)")
     if stacks:
         common.deploy_stacks(work, stacks, dry_run=False)
     if secagent_enabled and "secchat" in stacks:

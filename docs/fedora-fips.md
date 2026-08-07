@@ -279,6 +279,29 @@ signed-in user's behalf, forwarding `x-sec-acting-user`, so SecRouter governs an
 per end-user rather than as one shared account (see SecRouter's
 `security.oidc.delegatingSubjects` and secassist/docs/governance.md).
 
+**Turnkey env.** When SecAssist and SecSSO are both in the topology, the deploy is fully
+turnkey — no manual reconciliation: it mirrors SecSSO's two generated OIDC secrets into
+`work/secassist/.env` and writes the topology-derived issuer / SecRouter URL / domain there
+(see `wiring.sync_secassist_env`), leaving the per-instance secrets for the stack's own seed.
+An external IdP (no SecSSO) means you supply those two secrets yourself, as before.
+
+## Onboarding users (`[[users]]`)
+
+Declare accounts once in `secsite.toml` and the deploy creates them in SecSSO with a random
+initial password that must be reset on first login:
+
+```toml
+[[users]]
+username = "alice"
+email = "alice@example.mil"
+groups = ["analysts"]      # created if absent; match SecRouter's security.policy.groups
+```
+
+`secdeploy deploy` renders these into `work/secsso/blueprints/users.generated.yaml` (state:
+`created` — never overwrites a password the user later changes) and **prints the initial
+credentials once** for you to distribute. It relies on secsso's `force-password-reset.yaml`
+(shipped) for the forced reset. Re-running never rotates an already-provisioned password.
+
 ## SecProxy (edge reverse proxy)
 
 Placing the `edge` tier stands up **secproxy** — [nginx](https://nginx.org) — as the suite's
