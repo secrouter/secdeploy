@@ -11,7 +11,7 @@ from secdeploy.manifest import Manifest
 ROOT = Path(__file__).resolve().parents[1]
 ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "secchat", "secrecorder",
        "secproxy", "secassist"}
-FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder", "secassist"}
+FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder", "secassist", "secchatng"}
 
 
 def test_load_shipped_manifest():
@@ -56,6 +56,45 @@ def test_select_rejects_unknown_component():
     m = Manifest.load(ROOT / "suite.toml")
     with pytest.raises(KeyError):
         m.select(["nope"])
+
+
+def test_experimental_off_by_default():
+    # secchatng (the native SecChat rebuild) ships experimental — present in the manifest, but
+    # NOT in the default selection, so it never joins the default suite unopted.
+    m = Manifest.load(ROOT / "suite.toml")
+    assert m.components["secchatng"].experimental is True
+    assert "secchatng" in m.experimentals()
+    assert "secchatng" in m.components  # registered in the manifest…
+    assert "secchatng" not in m.select()  # …but not in the default selection
+    assert m.components["secchat"].experimental is False  # incumbent Mattermost stays default-on
+
+
+def test_include_opts_experimental_in():
+    m = Manifest.load(ROOT / "suite.toml")
+    assert m.include(["secchatng"]) is m  # chainable
+    assert "secchatng" in m.select()
+    assert m.included == {"secchatng"}
+
+
+def test_include_rejects_non_experimental():
+    m = Manifest.load(ROOT / "suite.toml")
+    with pytest.raises(ValueError):  # secrouter isn't experimental — --with it is meaningless
+        m.include(["secrouter"])
+
+
+def test_include_rejects_unknown():
+    m = Manifest.load(ROOT / "suite.toml")
+    with pytest.raises(KeyError):
+        m.include(["nope"])
+
+
+def test_experimental_survives_toml_roundtrip(tmp_path):
+    m = Manifest.load(ROOT / "suite.toml")
+    out = tmp_path / "suite.toml"
+    out.write_text(m.to_toml())
+    reloaded = Manifest.load(out)
+    assert reloaded.components["secchatng"].experimental is True
+    assert "secchatng" not in reloaded.select()  # still off by default after a round-trip
 
 
 def test_tiers_and_ports():

@@ -8,7 +8,7 @@ set of component tags plus the deploy-target definitions. Read with the stdlib
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 TARGET_KINDS = {"compose", "systemd-native", "image"}
@@ -28,6 +28,11 @@ class Component:
     tier: str = ""  # placement tier: identity | inference | gateway | collab | edge
     port: int = 0  # primary inbound port for peer addressing (0 = no inbound listener)
     optional: bool = False  # optional infra — droppable with `--without`
+    # Experimental/transitional: NOT deployed by default — excluded from `select()` unless the
+    # operator opts in with `--with <name>`. Used to land a replacement component (e.g. the native
+    # SecChat rebuild alongside the incumbent Mattermost stack) so it can be deployed and evaluated
+    # without disturbing the default suite, ahead of a deliberate cutover.
+    experimental: bool = False
     fronted: bool = False  # HTTP service secproxy (nginx) puts behind :443 — see topology.is_fronted
     runtime: str = ""
     role: str = ""
@@ -52,6 +57,10 @@ class Manifest:
     components: dict[str, Component]
     targets: dict[str, Target]
     path: Path | None = None
+    # Runtime-only (never serialized): experimental components the operator opted into via
+    # `--with`. Set once after load (see :meth:`include`); consulted by :meth:`select`, so every
+    # downstream path (topology placement, wiring, targets) honors it without extra plumbing.
+    included: set[str] = field(default_factory=set)
 
     @staticmethod
     def load(path: str | Path) -> "Manifest":
@@ -66,6 +75,7 @@ class Manifest:
                 tier=c.get("tier", ""),
                 port=int(c.get("port", 0)),
                 optional=bool(c.get("optional", False)),
+                experimental=bool(c.get("experimental", False)),
                 fronted=bool(c.get("fronted", False)),
                 runtime=c.get("runtime", ""),
                 role=c.get("role", ""),
@@ -126,11 +136,34 @@ class Manifest:
     def optionals(self) -> list[str]:
         return [c.name for c in self.components.values() if c.optional]
 
-    def select(self, without: list[str] | None = None) -> dict[str, Component]:
-        """Components to act on after dropping the (optional) ones named in ``without``.
+    def experimentals(self) -> list[str]:
+        return [c.name for c in self.components.values() if c.experimental]
 
-        Only optional components may be dropped — naming a required one is an error, so a
-        deploy can't accidentally omit the gateway.
+    def include(self, names: list[str] | None = None) -> "Manifest":
+        """Opt experimental components in (the ``--with`` set). Only experimental components may be
+        named — enabling a non-experimental one is meaningless (it's already in), and a typo should
+        fail loudly rather than silently do nothing. Returns ``self`` for chaining after ``load``.
+        """
+        names = list(names or [])
+        unknown = [n for n in names if n not in self.components]
+        if unknown:
+            raise KeyError(f"unknown component(s) in --with: {', '.join(unknown)}")
+        not_exp = [n for n in names if not self.components[n].experimental]
+        if not_exp:
+            raise ValueError(
+                f"--with only enables experimental components; not experimental: {', '.join(not_exp)} "
+                f"(experimental: {', '.join(self.experimentals()) or 'none'})"
+            )
+        self.included = set(names)
+        return self
+
+    def select(self, without: list[str] | None = None) -> dict[str, Component]:
+        """Components to act on: everything, minus the (optional) ones named in ``without``, minus
+        any experimental component not opted into via :meth:`include` (``--with``).
+
+        Only optional components may be dropped — naming a required one is an error, so a deploy
+        can't accidentally omit the gateway. Experimental components are off by default (a
+        transitional/replacement component must not join the default suite until opted in).
         """
         without = list(without or [])
         unknown = [n for n in without if n not in self.components]
@@ -142,7 +175,11 @@ class Manifest:
                 f"cannot drop required component(s): {', '.join(required)} "
                 f"(droppable: {', '.join(self.optionals()) or 'none'})"
             )
-        return {n: c for n, c in self.components.items() if n not in without}
+        return {
+            n: c
+            for n, c in self.components.items()
+            if n not in without and not (c.experimental and n not in self.included)
+        }
 
     def to_toml(self) -> str:
         """Serialize back to TOML deterministically (used when cutting a new suite version)."""
@@ -163,6 +200,8 @@ class Manifest:
                 lines.append(f"port = {c.port}")
             if c.optional:
                 lines.append("optional = true")
+            if c.experimental:
+                lines.append("experimental = true")
             if c.fronted:
                 lines.append("fronted = true")
             if c.runtime:

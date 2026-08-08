@@ -54,6 +54,11 @@ def _without(args) -> list[str]:
     return [s.strip() for s in getattr(args, "without", "").split(",") if s.strip()]
 
 
+def _with(args) -> list[str]:
+    """The ``--with`` set: experimental components to opt into (see Manifest.include)."""
+    return [s.strip() for s in (getattr(args, "with_", "") or "").split(",") if s.strip()]
+
+
 def _resolved_without(cli_value: str | None, site_without: list[str]) -> list[str]:
     """``deploy``'s own ``--without`` resolution: the CLI value (parsed the same way
     :func:`_without` does) when given, else the site config's suite-wide ``[deploy].without``
@@ -111,9 +116,10 @@ def cmd_verify(args) -> int:
     root = _root(args)
     print(f"✓ manifest valid — suite {m.suite} ({m.released}): {m.description}")
     for c in m.components.values():
-        opt = "  (optional)" if c.optional else ""
-        print(f"    {c.name:<12} {c.ref:<8} {c.kind:<8} {c.repo}{opt}")
+        tag = "  (optional)" if c.optional else ("  (experimental)" if c.experimental else "")
+        print(f"    {c.name:<12} {c.ref:<8} {c.kind:<8} {c.repo}{tag}")
     print(f"  optional: {', '.join(m.optionals()) or '(none)'}")
+    print(f"  experimental (off by default; opt in with --with): {', '.join(m.experimentals()) or '(none)'}")
     print(f"  targets:  {', '.join(m.targets) or '(none)'}")
     missing = [
         str(f.relative_to(root))
@@ -169,7 +175,7 @@ def cmd_configure(args) -> int:
 
 
 def cmd_plan(args) -> int:
-    m = Manifest.load(args.manifest)
+    m = Manifest.load(args.manifest).include(_with(args))
     mod = _target_mod(args.target)
     t = m.target(args.target)
     without = _without(args)
@@ -209,14 +215,14 @@ def cmd_plan(args) -> int:
 
 
 def cmd_fetch(args) -> int:
-    m = Manifest.load(args.manifest)
+    m = Manifest.load(args.manifest).include(_with(args))
     selected = m.select(_without(args))
     common.fetch(m, Path(args.work), only=args.component, include=set(selected))
     return 0
 
 
 def cmd_build(args) -> int:
-    m = Manifest.load(args.manifest)
+    m = Manifest.load(args.manifest).include(_with(args))
     mod = _target_mod(args.target)
     without = _without(args)
     common.fetch(m, Path(args.work), include=set(m.select(without)))
@@ -227,7 +233,7 @@ def cmd_build(args) -> int:
 def cmd_bundle(args) -> int:
     from . import bundle
 
-    m = Manifest.load(args.manifest)
+    m = Manifest.load(args.manifest).include(_with(args))
     bundle.build_bundle(m, args.target, Path(args.work), Path(args.out),
                         root=_root(args), without=_without(args),
                         topology_path=_site_or_topology_path(args), resource=args.resource)
@@ -245,7 +251,7 @@ def cmd_deploy(args) -> int:
     resolved values are passed to ``mod.deploy(...)`` with EXACTLY the kwargs it took before
     secsite.toml existed — the target ``deploy()`` signatures never change.
     """
-    m = Manifest.load(args.manifest)
+    m = Manifest.load(args.manifest).include(_with(args))
     mod = _target_mod(args.target)
     site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
     without = _resolved_without(args.without, site.without)
@@ -344,6 +350,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--without", default="",
                         help="comma-separated optional components to drop (e.g. seccert,secsso)")
 
+    def _with_arg(sp):
+        sp.add_argument("--with", dest="with_", default="",
+                        help="comma-separated experimental components to opt into (e.g. secchatng) "
+                             "— off by default")
+
     def _topology_arg(sp):
         sp.add_argument("--topology", default="topology.toml",
                         help="site placement file (optional; single-host mode if absent)")
@@ -382,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name not in ("status", "deploy"):
             _without_arg(sp)
         if name in ("plan", "build", "deploy"):
+            _with_arg(sp)
             _topology_arg(sp)
             _resource_arg(sp)
         if name in ("plan", "deploy"):
@@ -549,11 +561,13 @@ def build_parser() -> argparse.ArgumentParser:
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")
     fp.add_argument("--component", help="only fetch this component")
     _without_arg(fp)
+    _with_arg(fp)
     fp.set_defaults(fn=cmd_fetch)
 
     bp = sub.add_parser("bundle", help="produce an air-gapped release bundle")
     bp.add_argument("target", help="deploy target")
     _without_arg(bp)
+    _with_arg(bp)
     _topology_arg(bp)
     _resource_arg(bp)
     _site_arg(bp)

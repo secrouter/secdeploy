@@ -96,6 +96,28 @@ def test_plan_without_drops_optionals(capsys):
     assert "secrouter @" in components
 
 
+def test_plan_opts_experimental_component_in(capsys):
+    # secchatng (the native SecChat rebuild) is experimental: absent from the default plan,
+    # present only when named via --with.
+    assert main(["--manifest", MANIFEST, "plan", "macos"]) == 0
+    assert "secchatng @" not in capsys.readouterr().out
+    assert main(["--manifest", MANIFEST, "plan", "macos", "--with", "secchatng"]) == 0
+    out = capsys.readouterr().out
+    assert "secchatng @ rearchitecture" in out
+
+
+def test_with_rejects_non_experimental():
+    import pytest
+    with pytest.raises(SystemExit):  # secrouter isn't experimental → --with it is an error
+        main(["--manifest", MANIFEST, "plan", "macos", "--with", "secrouter"])
+
+
+def test_verify_lists_experimental(capsys):
+    assert main(["--manifest", MANIFEST, "verify"]) == 0
+    out = capsys.readouterr().out
+    assert "secchatng" in out and "experimental" in out
+
+
 def test_deploy_fedora_dry_run(capsys):
     assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run"]) == 0
     out = capsys.readouterr().out
