@@ -120,6 +120,13 @@ accounts in SecSSO with random, must-reset-on-first-login passwords (printed onc
 Both work identically on Fedora — see [fedora-fips.md](fedora-fips.md#onboarding-users-users)
 for the `[[users]]` shape and the security notes.
 
+The **native SecChat rebuild** (`secchatng`, experimental — opt in with `--with secchatng`) is
+just as turnkey, with one client instead of two: when secchatng and SecSSO are both placed, the
+deploy mirrors SecSSO's generated `SECCHATNG_OIDC_CLIENT_SECRET` and writes the topology
+issuer/audience/client-id/public-url/SecRouter env into `work/secchatng/.env`. See
+[fedora-fips.md](fedora-fips.md#secrouter-oidc-config-fragment) for the full
+`wiring.sync_secchatng_env` details — identical on both targets.
+
 ### Internal DNS (`*.internal`) on macOS
 
 A single-host eval has no topology and no `.internal` names — reach everything at

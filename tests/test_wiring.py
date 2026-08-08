@@ -123,6 +123,14 @@ def _topo(tmp_path) -> Topology:
     return Topology.load(p, _manifest())
 
 
+def _topo_with_secchatng(tmp_path) -> Topology:
+    # secchatng is EXPERIMENTAL (see suite.toml) — excluded from select() unless explicitly
+    # .include()d, mirroring the --with secchatng opt-in a real deploy needs (see cli.py).
+    p = tmp_path / "topology.toml"
+    p.write_text(GPU_SPLIT)
+    return Topology.load(p, _manifest().include(["secchatng"]))
+
+
 def _multi_topo(tmp_path) -> Topology:
     p = tmp_path / "topology-multi.toml"
     p.write_text(MULTI_INFERENCE)
@@ -770,6 +778,95 @@ def test_sync_secassist_env_noop_without_secsso_secrets(tmp_path):
 def test_sync_secassist_env_noop_when_files_missing(tmp_path):
     topo = _topo(tmp_path)
     assert wiring.sync_secassist_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
+
+
+# ── env_for secchatng branch + sync_secchatng_env: turnkey native-SecChat stack env ──
+# secchatng is EXPERIMENTAL (suite.toml) — every topology here goes through
+# _topo_with_secchatng(), which .include()s it, mirroring the --with secchatng opt-in a real
+# deploy needs before it's ever selected/placed at all.
+def test_env_for_secchatng_branch_full(tmp_path):
+    # Mirrors test_env_for_secassist_branch: GPU_SPLIT (no secproxy/edge) → plain ported http
+    # URLs, including secchatng's OWN url (SECCHAT_PUBLIC_URL) — the same peer_urls-by-self-key
+    # source secassist's DOMAIN_CLIENT/DOMAIN_SERVER use.
+    topo = _topo_with_secchatng(tmp_path)
+    env = topo.env_for("secchatng")
+    assert env["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
+    assert env["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
+    assert env["SECCHAT_OIDC_CLIENT_ID"] == "secchatng"
+    assert env["SECROUTER_URL"] == "http://secrouter.sec.internal:47002"
+    assert env["SECCHAT_PUBLIC_URL"] == "http://secchatng.sec.internal:47010"
+    # the client secret is never topology-derived — sync_secchatng_env mirrors it from SecSSO
+    assert "SECCHAT_OIDC_CLIENT_SECRET" not in env
+
+
+def test_sync_secchatng_env_mirrors_secret_and_writes_topology(tmp_path):
+    topo = _topo_with_secchatng(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n")
+    # As the stack .env looks right after the generic seed randomized the blank mirror-target; a
+    # topology key still at its .env.example placeholder; a per-instance secret to preserve.
+    secchatng_env = tmp_path / "secchatng.env"
+    secchatng_env.write_text(
+        "SECCHAT_OIDC_CLIENT_SECRET=RANDOMSEED\n"
+        "SECCHAT_OIDC_ISSUER=https://secsso.sec.internal/application/o/secchatng/\n"
+        "SECCHAT_SESSION_SECRET=keep-me\n"
+    )
+    written = wiring.sync_secchatng_env(secsso_env, secchatng_env, topo)
+    assert written is not None and "SECCHAT_OIDC_CLIENT_SECRET" in written
+    assert written == sorted(wiring._SECCHATNG_MANAGED_KEYS)
+    vals = _env_dict(secchatng_env)
+    # the mirrored secret OVERWRITES the randomized seed — the whole reason this isn't blank-only
+    assert vals["SECCHAT_OIDC_CLIENT_SECRET"] == "login-abc"
+    # topology env written (placeholder domain corrected to the real one + port)
+    assert vals["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
+    assert vals["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
+    assert vals["SECCHAT_OIDC_CLIENT_ID"] == "secchatng"
+    assert vals["SECCHAT_PUBLIC_URL"] == "http://secchatng.sec.internal:47010"
+    assert vals["SECROUTER_URL"] == "http://secrouter.sec.internal:47002"
+    # non-managed keys survive untouched
+    assert vals["SECCHAT_SESSION_SECRET"] == "keep-me"
+
+
+def test_sync_secchatng_env_refreshes_managed_keys_on_rerun_and_keeps_operator_extra(tmp_path):
+    # A redeploy must REFRESH every managed key (not just fill it once) while an operator-added
+    # key outside the managed set survives untouched across both runs.
+    topo = _topo_with_secchatng(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=first-secret\n")
+    secchatng_env = tmp_path / "secchatng.env"
+    secchatng_env.write_text(
+        "SECCHAT_OIDC_CLIENT_SECRET=\n"
+        "SECCHAT_OIDC_ISSUER=https://stale.example/wrong\n"
+        "OPERATOR_EXTRA=do-not-touch\n"
+    )
+    first = wiring.sync_secchatng_env(secsso_env, secchatng_env, topo)
+    assert first is not None
+    vals1 = _env_dict(secchatng_env)
+    assert vals1["SECCHAT_OIDC_CLIENT_SECRET"] == "first-secret"
+    assert vals1["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
+    # SecSSO rotates/regenerates its secret (e.g. a fresh secsso deploy) between the two syncs —
+    # the re-run must pick up the NEW value, not leave the stale mirrored one in place.
+    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=rotated-secret\n")
+    second = wiring.sync_secchatng_env(secsso_env, secchatng_env, topo)
+    assert second == first  # same key set both times
+    vals2 = _env_dict(secchatng_env)
+    assert vals2["SECCHAT_OIDC_CLIENT_SECRET"] == "rotated-secret"
+    assert vals2["SECCHAT_OIDC_ISSUER"] == vals1["SECCHAT_OIDC_ISSUER"]  # refreshed, still correct
+    assert vals2["OPERATOR_EXTRA"] == "do-not-touch"  # untouched across both runs
+
+
+def test_sync_secchatng_env_noop_without_secsso_secret(tmp_path):
+    topo = _topo_with_secchatng(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("PG_PASS=x\n")  # no SECCHATNG_OIDC_CLIENT_SECRET provisioned yet
+    secchatng_env = tmp_path / "secchatng.env"
+    secchatng_env.write_text("SECCHAT_OIDC_CLIENT_SECRET=\n")
+    assert wiring.sync_secchatng_env(secsso_env, secchatng_env, topo) is None
+
+
+def test_sync_secchatng_env_noop_when_files_missing(tmp_path):
+    topo = _topo_with_secchatng(tmp_path)
+    assert wiring.sync_secchatng_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
 
 
 def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):

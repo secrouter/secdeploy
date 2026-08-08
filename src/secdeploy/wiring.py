@@ -774,6 +774,54 @@ def sync_secassist_env(
     return sorted(to_write)
 
 
+# The MANAGED keys secdeploy owns in secchatng's stack .env — mirrored secret from SecSSO +
+# topology-derived OIDC/gateway env. Everything else (SECCHAT_SESSION_SECRET, DATABASE_URL's
+# own PG_PASSWORD, ...) stays blank/untouched for deploy_stacks' generic seed to fill — see
+# secchat's own .env.example.
+_SECCHATNG_MANAGED_KEYS = frozenset({
+    "SECCHAT_OIDC_CLIENT_SECRET", "SECCHAT_OIDC_ISSUER", "SECCHAT_OIDC_AUDIENCE",
+    "SECCHAT_OIDC_CLIENT_ID", "SECCHAT_PUBLIC_URL", "SECROUTER_URL",
+})
+
+
+def sync_secchatng_env(
+    secsso_env_path: str | Path, secchatng_env_path: str | Path,
+    topology: Topology, without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Make the native SecChat's (``secchatng``, experimental) stack ``.env`` turnkey: mirror the
+    OIDC login-client secret SecSSO generated and write the topology-derived OIDC/gateway env
+    into ``work/secchatng/.env`` — the ``secchatng`` sibling of :func:`sync_secassist_env`.
+
+    Unlike :func:`sync_secagent_service_secret`'s blank-only fill, this **overwrites** a fixed set
+    of MANAGED keys (:data:`_SECCHATNG_MANAGED_KEYS`), because secchatng is a *stack*:
+    ``common.deploy_stacks``'s generic ``_seed_env_secrets`` would otherwise fill the blank
+    ``SECCHAT_OIDC_CLIENT_SECRET`` with a *random* token that doesn't match SecSSO's provisioned
+    client secret. So after the early seed we overwrite: ``SECCHAT_OIDC_CLIENT_SECRET`` ← SecSSO's
+    ``SECCHATNG_OIDC_CLIENT_SECRET`` (the confidential login client — secchatng's backend runs the
+    Authorization Code + PKCE dance itself, server-side, so unlike SecAssist's proxy there's no
+    second, client_credentials service secret to mirror), plus the ``env_for("secchatng")``
+    topology values (issuer, audience, client id, secchatng's own public URL, SecRouter's URL).
+    ``SECCHAT_SESSION_SECRET`` (the session-cookie signing key) is deliberately NOT managed here —
+    it stays blank for ``deploy_stacks``' generic seed to fill, same as SecAssist's own
+    per-instance secrets.
+
+    Returns the sorted list of keys written, or ``None`` if either file is missing or SecSSO
+    hasn't generated the secret yet (stack never seeded).
+    """
+    secsso_env_path, secchatng_env_path = Path(secsso_env_path), Path(secchatng_env_path)
+    if not secsso_env_path.exists() or not secchatng_env_path.exists():
+        return None
+    secsso = _read_env_values(secsso_env_path)
+    client_secret = secsso.get("SECCHATNG_OIDC_CLIENT_SECRET", "")
+    if not client_secret:
+        return None
+    managed = dict(topology.env_for("secchatng", without, scheme))
+    managed["SECCHAT_OIDC_CLIENT_SECRET"] = client_secret
+    to_write = {k: v for k, v in managed.items() if k in _SECCHATNG_MANAGED_KEYS}
+    _set_env_keys(secchatng_env_path, to_write)
+    return sorted(to_write)
+
+
 def _read_generated_user_passwords(path: Path) -> dict[str, str]:
     """Extract ``{username: password}`` from an existing generated users blueprint. Line-based on
     the file's own fixed shape (username in identifiers, password in attrs) — no YAML dep."""
