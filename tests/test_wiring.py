@@ -147,7 +147,7 @@ def test_active_topology_synthesizes_single_host(tmp_path):
     topo, from_file = wiring.active_topology(m, tmp_path / "nope.toml", "macos")
     assert from_file is False
     assert list(topo.resources) == ["local"]
-    assert set(topo.placement()) == set(m.components)  # everything on the one host
+    assert set(topo.placement()) == set(m.select())  # everything selected on the one host (experimental off)
 
 
 def test_active_topology_loads_file(tmp_path):

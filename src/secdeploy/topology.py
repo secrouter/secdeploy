@@ -453,6 +453,20 @@ class Topology:
                 env["DOMAIN_SERVER"] = self_url
             env["SECASSIST_SVC_CLIENT_ID"] = "secassist-svc"
             env["SECROUTER_SCOPE"] = "openid secrouter"
+        if component == "secchatng":
+            # The native SecChat rebuild reads plain SECCHAT_* env. Its ONLY trust root for user
+            # tokens is SecSSO's per-provider issuer (JWKS discovered from it); the audience is its
+            # own OIDC client id. The assistant path routes model calls through SecRouter (governed
+            # + audited), never straight at SecLLM. DATABASE_URL is derived in compose from the
+            # auto-seeded PG_PASSWORD, so it isn't set here. (A full SSO login also needs a SecSSO
+            # client blueprint + the client-side auth-code flow — the deliberate cutover follow-up.)
+            secsso_url = peer_urls.get("SECSSO")
+            if secsso_url:
+                env["SECCHAT_OIDC_ISSUER"] = f"{secsso_url}/application/o/secchatng/"
+                env["SECCHAT_OIDC_AUDIENCE"] = "secchatng"
+            secrouter_url = peer_urls.get("SECROUTER")
+            if secrouter_url:
+                env["SECROUTER_URL"] = secrouter_url
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────

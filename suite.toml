@@ -89,6 +89,22 @@ port = 8065
 fronted = true
 role = "team chat + chat-ops (Mattermost) — bridges to SecAgent"
 
+# The native SecChat rebuild (purpose-built auditable team + agentic chat: Node/TS + Postgres,
+# tamper-evident hash chains, owner-gated agents). Meant to replace BOTH the Mattermost `secchat`
+# above AND the LibreChat `secassist` below. EXPERIMENTAL: off by default — opt in with
+# `--with secchatng` to deploy it alongside for evaluation. Cutover (retire Mattermost/LibreChat,
+# rewire the SecAgent bridge) is a later, deliberate step. Ref tracks the rebuild branch until a
+# release tag is cut.
+[components.secchatng]
+repo = "secrouter/secchat"
+ref = "rearchitecture"
+kind = "stack"
+tier = "collab"
+port = 47010
+experimental = true
+fronted = true
+role = "native auditable team + agentic chat (SecChat rebuild) — transitional replacement for Mattermost + LibreChat"
+
 [components.secassist]
 repo = "secrouter/secassist"
 ref = "v0.1.0"

@@ -101,9 +101,14 @@ def test_single_host_places_everything():
     m = _manifest()
     topo = Topology.single_host(m, "macos", address="127.0.0.1")
     placement = topo.placement()
-    assert set(placement) == set(m.components)  # all components land on the one host
+    # "everything" = the default selection: experimental components (secchatng) are off unless
+    # opted into, so they aren't placed until --with names them (asserted just below).
+    assert set(placement) == set(m.select())
     assert set(placement.values()) == {"local"}
-    assert set(topo.components_on("local")) == set(m.components)
+    assert set(topo.components_on("local")) == set(m.select())
+    # opting the experimental component in places it too
+    m.include(["secchatng"])
+    assert "secchatng" in Topology.single_host(m, "macos", address="127.0.0.1").placement()
 
 
 def test_gpu_split_placement(tmp_path):
@@ -181,6 +186,19 @@ def test_env_for_wires_peers_not_self(tmp_path):
     assert env["SECLLM_URL"] == "http://secllm.sec.internal:11400"
     assert env["SECCERT_URL"] == "http://seccert.sec.internal:47001"
     assert "SECROUTER_URL" not in env
+
+
+def test_env_for_secchatng_wires_sso_and_secrouter():
+    # The experimental native SecChat reads plain SECCHAT_* env: its OIDC trust root is SecSSO's
+    # per-provider issuer, its audience is its own client id, and the assistant path dials
+    # SecRouter (governed), never SecLLM directly.
+    m = _manifest().include(["secchatng"])
+    topo = Topology.single_host(m, "macos", address="127.0.0.1")
+    env = topo.env_for("secchatng")
+    assert env["SECCHAT_OIDC_ISSUER"].endswith("/application/o/secchatng/")
+    assert env["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
+    assert env["SECROUTER_URL"]  # the SecRouter peer URL, for the assistant path
+    assert "SECCHAT_OIDC_ISSUER" not in topo.env_for("secrouter")  # block is secchatng-specific
 
 
 # ── fronting axis: secproxy (edge tier) fronts the 5 HTTP services on :443 ──────────────
