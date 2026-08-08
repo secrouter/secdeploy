@@ -13,6 +13,9 @@ Subcommands:
   teardown  remove what a deploy installed on THIS host (discovers what's actually here —
             never trusts topology.toml/deploy flags/the audit JSON; use --dry-run to preview,
             --purge to also remove persistent data)
+  backup    capture THIS host's suite state into one FIPS-encrypted archive (encrypt to a
+            recipient cert; the private key stays offline) — use --dry-run to preview
+  restore   decrypt + verify an archive and overwrite this host's state with it (asks first)
 
 Optional infra (SecCert, SecSSO) can be dropped with ``--without seccert,secsso`` when you
 already run that infrastructure.
@@ -294,6 +297,42 @@ def cmd_teardown(args) -> int:
     return 0
 
 
+def _resolve_resource_opt(args, m: Manifest) -> str | None:
+    """Best-effort resource label for a backup archive's name: ``--resource`` or the active
+    site/topology's resource for this target when one is present; ``None`` (→ ``local``) in
+    single-host mode. Never fatal — the label is cosmetic (which host's archive this is), so a
+    missing/oddly-shaped topology just falls back to ``--resource``/None rather than erroring."""
+    try:
+        site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+        if not from_file:
+            return getattr(args, "resource", None)
+        return wiring.resource_for(site.topology, args.target, getattr(args, "resource", None))
+    except (KeyError, ValueError, FileNotFoundError):
+        return getattr(args, "resource", None)
+
+
+def cmd_backup(args) -> int:
+    m = Manifest.load(args.manifest)
+    mod = _target_mod(args.target)
+    mod.backup(
+        m, work=Path(args.work), root=_root(args), recipient_cert=args.recipient,
+        resource=_resolve_resource_opt(args, m), dry_run=args.dry_run,
+        assume_yes=args.yes, out=Path(args.out),
+    )
+    return 0
+
+
+def cmd_restore(args) -> int:
+    m = Manifest.load(args.manifest)
+    mod = _target_mod(args.target)
+    mod.restore(
+        m, work=Path(args.work), root=_root(args), archive=args.archive, key=args.key,
+        recipient_cert=args.recipient, resource=_resolve_resource_opt(args, m),
+        dry_run=args.dry_run, assume_yes=args.yes, out=Path(args.out),
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="secdeploy", description=__doc__.splitlines()[0])
     p.add_argument("--manifest", default="suite.toml", help="release manifest (default: suite.toml)")
@@ -462,6 +501,50 @@ def build_parser() -> argparse.ArgumentParser:
              "/etc/resolver/<domain> entry to remove on macOS, when more than one exists",
     )
     tp.set_defaults(fn=cmd_teardown)
+
+    kp = sub.add_parser(
+        "backup",
+        help="capture THIS host's suite state (DBs, the SecCert CA, secrets) into one "
+             "FIPS-encrypted archive — public-key: encrypt to a recipient cert, keep its "
+             "private key offline (use --dry-run to preview)",
+    )
+    kp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+    kp.add_argument(
+        "--recipient",
+        help="X.509 recipient cert (PEM) to encrypt the archive to. SecCert can mint one; keep "
+             "the matching private key OFFLINE — it's the only thing that can decrypt the backup",
+    )
+    kp.add_argument("--dry-run", action="store_true", help="print the capture plan and stop — reads nothing")
+    kp.add_argument("-y", "--yes", action="store_true", help="skip confirmation prompts (automation)")
+    _topology_arg(kp)
+    _resource_arg(kp)
+    _site_arg(kp)
+    kp.set_defaults(fn=cmd_backup)
+
+    rp = sub.add_parser(
+        "restore",
+        help="decrypt + verify a backup archive and OVERWRITE this host's suite state with it "
+             "(SecCert CA first, then the stacks) — needs the offline private key; asks first",
+    )
+    rp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+    rp.add_argument("archive", help="the encrypted backup archive (…tar.cms) to restore from")
+    rp.add_argument(
+        "--key",
+        help="the recipient's OFFLINE private key (PEM) that decrypts the archive (required to restore)",
+    )
+    rp.add_argument(
+        "--recipient",
+        help="optional: the recipient cert, to disambiguate a multi-recipient archive",
+    )
+    rp.add_argument("--dry-run", action="store_true", help="print the fixed restore flow and stop — touches nothing")
+    rp.add_argument(
+        "-y", "--yes", action="store_true",
+        help="skip the destructive-overwrite confirmation (for automation)",
+    )
+    _topology_arg(rp)
+    _resource_arg(rp)
+    _site_arg(rp)
+    rp.set_defaults(fn=cmd_restore)
 
     fp = sub.add_parser("fetch", help="checkout components at pinned refs")
     fp.add_argument("--component", help="only fetch this component")

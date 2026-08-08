@@ -19,12 +19,15 @@ import os
 import pwd
 import re
 import shutil
+import tempfile
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import common
 from .. import audit
+from .. import backup as backup_mod
 from .. import launchd
 from .. import process as P
 from .. import wiring
@@ -1538,3 +1541,267 @@ def teardown(
                         "touched, nothing else."},
     )
     P.log("macOS teardown complete")
+
+
+# ── backup / restore ───────────────────────────────────────────────────────────────────────
+#
+# macOS holds much less durable native state than fedora-fips: SecCert + SecRouter run in the
+# root compose, but only SecCert has a persistent named volume (``seccert-data`` — the CA);
+# SecRouter runs dev-mode with an ephemeral DB (see deploy/macos/compose.yaml). So a macOS
+# backup captures: (1) every ``com.docker.compose.project=secsuite`` docker volume (the CA and
+# any future one), tarred via a small util container; (2) the host-side cached secrets under
+# ``out/`` (seccert-root.pem, the SecLLM/SecAgent tokens) + ``deploy/macos/secrets.env`` +
+# ``~/.secagent``/``~/.config/secrouter``; (3) the stacks, via their own bootstrap verbs. Same
+# encrypt-to-recipient-cert flow as fedora. Staging lives UNDER ``root`` (a Colima-shared path,
+# so the volume-tar container can bind-mount it) and is wiped after — plaintext never lands in
+# ``out/``. Pure step builders + a thin host wrapper, same split as teardown/fedora backup.
+
+# The utility image used only to `tar` a docker volume's contents in/out (the standard
+# volume-backup idiom). Overridable for air-gapped hosts that pre-load a different small image.
+_VOLUME_UTIL_IMAGE = os.environ.get("SECDEPLOY_VOLUME_UTIL_IMAGE", "docker.io/library/alpine:3")
+
+
+def _secsuite_volumes() -> list[str]:
+    """The docker volumes labeled for the ``secsuite`` compose project (read-only probe).
+    Empty (with a warning) if docker/Colima isn't up — same tolerate-absence spirit as
+    :func:`_discover`; the volume capture is then simply skipped."""
+    if not P.which("docker"):
+        return []
+    r = P.run(["docker", "volume", "ls", "-q",
+               "--filter", "label=com.docker.compose.project=secsuite"], check=False, capture=True)
+    if r.returncode != 0:
+        P.warn("could not list docker volumes (is Colima/Docker running?) — skipping compose-volume capture")
+        return []
+    return sorted(v for v in r.stdout.splitlines() if v.strip())
+
+
+def _macos_root_secret_paths(root: Path) -> list[str]:
+    """``root``-relative paths of the cached secrets a deploy leaves on the host: any token/
+    secret/PEM file directly under ``out/`` (secllm-*-token, secagent-webhook-secret,
+    seccert-root.pem), ``out/addressing`` (generated egress creds), and
+    ``deploy/macos/secrets.env`` (HF_TOKEN). Only the ones that exist — so the ``tar`` step's
+    explicit path list never names a missing file."""
+    rels: list[str] = []
+    outd = root / "out"
+    if outd.is_dir():
+        for p in sorted(outd.iterdir()):
+            if p.is_file() and ("token" in p.name or "secret" in p.name or p.suffix == ".pem"):
+                rels.append(f"out/{p.name}")
+        if (outd / "addressing").is_dir():
+            rels.append("out/addressing")
+    if (root / "deploy/macos/secrets.env").is_file():
+        rels.append("deploy/macos/secrets.env")
+    return rels
+
+
+def _macos_home_secret_paths(home: Path) -> list[str]:
+    """The invoking user's per-user config a deploy writes: ``~/.secagent`` (SecAgent config +
+    audit) and ``~/.config/secrouter``. Home-relative; only those present."""
+    return [rel for rel in (".secagent", ".config/secrouter") if (home / rel).exists()]
+
+
+def backup_volume_steps(volumes: list[str], staging: Path, util: str) -> list[common.Step]:
+    """Pure: one capture Step per docker volume — ``docker run --rm`` a util container that tars
+    the volume (mounted read-only) into ``staging/native/vol-<name>.tar.gz``."""
+    native = str((Path(staging) / "native").resolve())  # absolute — it's a docker -v source
+    steps: list[common.Step] = []
+    for vol in volumes:
+        note = " — the SecCert CA (the suite's root of trust)" if "seccert" in vol else ""
+        steps.append(common.Step(
+            f"volume: archive docker volume {vol}{note}",
+            ["docker", "run", "--rm", "-v", f"{vol}:/v:ro", "-v", f"{native}:/backup", util,
+             "tar", "czf", f"/backup/vol-{vol}.tar.gz", "-C", "/v", "."], "volumes"))
+    return steps
+
+
+def backup_host_steps(
+    root: Path, home: Path, root_rels: list[str], home_rels: list[str], staging: Path,
+) -> list[common.Step]:
+    """Pure: tar the host-side secret paths (``root``-relative and ``home``-relative sets) into
+    ``staging/native``. Two archives so restore can put each back at the right base dir."""
+    native = Path(staging) / "native"
+    steps: list[common.Step] = []
+    if root_rels:
+        steps.append(common.Step(
+            f"host: archive {len(root_rels)} cached-secret path(s) under {root} "
+            "(out/ tokens, seccert-root.pem, secrets.env)",
+            ["tar", "czf", str(native / "host-root.tar.gz"), "-C", str(root), *root_rels], "host"))
+    if home_rels:
+        steps.append(common.Step(
+            f"host: archive {', '.join(home_rels)} under {home}",
+            ["tar", "czf", str(native / "host-home.tar.gz"), "-C", str(home), *home_rels], "host"))
+    return steps
+
+
+def restore_volume_steps(vol_files: list[str], unpacked: Path, util: str) -> list[common.Step]:
+    """Pure inverse of :func:`backup_volume_steps`: for each ``vol-<name>.tar.gz`` present,
+    ``docker run`` a util container that untars it back into the (auto-created) volume."""
+    native = str((Path(unpacked) / "native").resolve())
+    steps: list[common.Step] = []
+    for fn in sorted(vol_files):
+        vol = fn[len("vol-"): -len(".tar.gz")]
+        steps.append(common.Step(
+            f"volume: restore {vol} from {fn}",
+            ["docker", "run", "--rm", "-v", f"{vol}:/v", "-v", f"{native}:/backup", util,
+             "sh", "-c", f"cd /v && tar xzf /backup/{fn}"], "volumes"))
+    return steps
+
+
+def restore_host_steps(root: Path, home: Path, unpacked: Path) -> list[common.Step]:
+    """Pure inverse of :func:`backup_host_steps`: extract whichever host archives are present
+    back to their base dir (``root`` / ``home``)."""
+    native = Path(unpacked) / "native"
+    steps: list[common.Step] = []
+    if (native / "host-root.tar.gz").exists():
+        steps.append(common.Step(
+            f"host: extract host-root.tar.gz → {root}",
+            ["tar", "xzf", str(native / "host-root.tar.gz"), "-C", str(root)], "host"))
+    if (native / "host-home.tar.gz").exists():
+        steps.append(common.Step(
+            f"host: extract host-home.tar.gz → {home}",
+            ["tar", "xzf", str(native / "host-home.tar.gz"), "-C", str(home)], "host"))
+    return steps
+
+
+def _macos_components_meta(
+    volumes: list[str], root_rels: list[str], home_rels: list[str], stacks: list[tuple[str, Path]],
+) -> list[dict]:
+    comps: list[dict] = []
+    for vol in volumes:
+        comps.append({"name": vol, "kind": "volume", "captured": [f"vol-{vol}.tar.gz"]})
+    if root_rels:
+        comps.append({"name": "host-root", "kind": "secrets", "captured": root_rels})
+    if home_rels:
+        comps.append({"name": "host-home", "kind": "secrets", "captured": home_rels})
+    for name, _boot in stacks:
+        comps.append({"name": name, "kind": "stack", "captured": ["db dump", "uploads", ".env"]})
+    return comps
+
+
+def backup(
+    manifest: Manifest, work: Path, root: Path, *, recipient_cert: str | None,
+    resource: str | None = None, dry_run: bool = False, assume_yes: bool = False,
+    out: Path | None = None, now: datetime | None = None,
+) -> None:
+    """Capture this Mac's suite state (compose volumes + host-cached secrets + stacks) into one
+    CMS/AES-256 archive encrypted to ``recipient_cert``. Doesn't need root; needs Colima/Docker
+    up for the volume capture. Staging lives under ``root`` so the util container can bind-mount it."""
+    out = Path(out) if out is not None else Path("out")
+    now = now or datetime.now(timezone.utc)
+    ts = backup_mod.format_ts(now)
+    _user, home_str = _native_user()
+    home = Path(home_str)
+    stacks = common.stack_checkouts(manifest, work)
+    volumes = _secsuite_volumes()
+    root_rels = _macos_root_secret_paths(root)
+    home_rels = _macos_home_secret_paths(home)
+    display = Path("<staging>")
+    plan = (backup_volume_steps(volumes, display, _VOLUME_UTIL_IMAGE)
+            + backup_host_steps(root, home, root_rels, home_rels, display)
+            + common.stack_backup_steps(stacks, display))
+    components = _macos_components_meta(volumes, root_rels, home_rels, stacks)
+    print(f"# macos backup plan — suite {manifest.suite} — one AES-256/CMS archive encrypted to "
+          "the recipient cert; keep its private key OFFLINE (docs/macos.md#backup)")
+    common.render_teardown_plan(plan)
+    print("\n" + backup_mod.dry_run_note(out, NAME, resource, ts))
+    if dry_run:
+        return
+    if not any(s.command for s in plan):
+        P.log("nothing found on this host to back up")
+        return
+    if not recipient_cert:
+        P.die("backup needs --recipient <cert.pem> — the X.509 cert to encrypt to (SecCert can mint one)")
+    if not Path(recipient_cert).exists():
+        P.die(f"recipient cert not found: {recipient_cert}")
+    tmp = Path(tempfile.mkdtemp(prefix=".secdeploy-backup-", dir=str(root)))  # Colima-shared
+    try:
+        staging = tmp / "staging"
+        (staging / "native").mkdir(parents=True)
+        real = (backup_volume_steps(volumes, staging, _VOLUME_UTIL_IMAGE)
+                + backup_host_steps(root, home, root_rels, home_rels, staging)
+                + common.stack_backup_steps(stacks, staging))
+        common.execute_capture_plan(real)
+        archive, json_path, txt_path = backup_mod.stage_to_encrypted_archive(
+            staging, out, NAME, resource, suite={"version": manifest.suite},
+            components=components, recipient_cert=recipient_cert, ts=ts, now=now)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)  # plaintext staging never lingers
+    P.log(f"encrypted backup → {archive}")
+    P.log(f"manifest → {json_path} (+ {txt_path.name})")
+    P.warn("store the archive like a secret; keep the recipient PRIVATE KEY offline — it is the "
+           "only thing that can decrypt it.")
+
+
+def restore(
+    manifest: Manifest, work: Path, root: Path, archive: str, *, key: str | None,
+    recipient_cert: str | None = None, resource: str | None = None,
+    dry_run: bool = False, assume_yes: bool = False, out: Path | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Decrypt + verify ``archive`` and OVERWRITE this Mac's suite state with it. Brings the
+    root compose down (volumes kept) so a util container can replace volume contents, restores,
+    then brings it back up. Confirm-gated — destructive."""
+    del out, now
+    archive_path = Path(archive)
+    _user, home_str = _native_user()
+    home = Path(home_str)
+    stacks = common.stack_checkouts(manifest, work)
+    manifest_json: Path | None = None
+    if archive_path.name.endswith(".tar.cms"):
+        manifest_json = archive_path.with_name(archive_path.name[: -len(".tar.cms")] + ".manifest.json")
+    print(f"# macos restore plan — suite {manifest.suite} — decrypt {archive_path.name}, verify "
+          "its manifest sha256, then OVERWRITE this host's state (docs/macos.md#backup)")
+    intent = [
+        common.Step("compose: docker compose down (keep volumes; release the containers holding them)",
+                    None, "services"),
+        common.Step(f"decrypt + verify {archive_path.name} against its manifest sha256 (needs --key)",
+                    None, "decrypt"),
+        common.Step("volumes: restore each docker volume (SecCert CA included)", None, "volumes"),
+        common.Step("host: restore out/ tokens + secrets.env + ~/.secagent + ~/.config/secrouter",
+                    None, "host"),
+        common.Step("stacks: bootstrap/<name>.sh restore each"
+                    + (f" — {', '.join(n for n, _ in stacks)}" if stacks else ""), None, "stacks"),
+        common.Step("compose: docker compose up -d (bring SecCert + SecRouter back)", None, "services"),
+    ]
+    common.render_teardown_plan(intent)
+    if dry_run:
+        print("\n[dry-run] archive contents are only visible after decrypt (needs --key); the "
+              "above is the fixed restore flow. Nothing was read or changed.")
+        return
+    if not archive_path.exists():
+        P.die(f"archive not found: {archive_path}")
+    if not key:
+        P.die("restore needs --key <recipient.key> — the OFFLINE private key for the recipient cert")
+    if not Path(key).exists():
+        P.die(f"recipient private key not found: {key}")
+    if manifest_json is not None and not manifest_json.exists():
+        P.warn(f"no {manifest_json.name} beside the archive — restoring WITHOUT the sha256 "
+               "integrity check")
+        manifest_json = None
+    if not P.confirm(
+        "restore OVERWRITES this host's suite state — the SecCert CA volume, the cached tokens, "
+        "and the Authentik/Mattermost/LibreChat databases — with the archive's contents. This "
+        "cannot be undone. Proceed?", assume_yes,
+    ):
+        P.warn("restore aborted — nothing changed")
+        return
+    dc, cf = _compose_cmd(), _compose_files(root)
+    tmp = Path(tempfile.mkdtemp(prefix=".secdeploy-restore-", dir=str(root)))  # Colima-shared
+    try:
+        unpacked = backup_mod.unpack_encrypted_archive(
+            archive_path, key, tmp, manifest_json=manifest_json, recipient_cert=recipient_cert)
+        native = unpacked / "native"
+        vol_files = [p.name for p in native.glob("vol-*.tar.gz")] if native.is_dir() else []
+        P.run(dc + cf + ["down"], check=False)  # keep volumes; free the containers holding them
+        plan = (restore_volume_steps(vol_files, unpacked, _VOLUME_UTIL_IMAGE)
+                + restore_host_steps(root, home, unpacked)
+                + common.stack_restore_steps(stacks, unpacked))
+        common.render_teardown_plan(plan)
+        common.execute_capture_plan(plan)
+        P.run(dc + cf + ["up", "-d"], check=False)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    P.log("macOS restore complete — root compose brought back up")
+    P.warn("verify the restored integrity chains before trusting the host: SecRouter's audit "
+           "chain (GET /audit/verify), SecAgent's (`secagent audit verify`), and SecCert's "
+           "issuing log should all report an unbroken chain.")

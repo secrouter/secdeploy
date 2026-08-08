@@ -425,6 +425,51 @@ listed under "NOT removed" only, since other tools on this Mac may depend on the
   Ctrl-C it, or `pkill` after confirming the PID with `pgrep -fl` (they bind shared ports). See
   [Native services (launchd): stopped + removed](#native-services-launchd-stopped--removed).
 
+## Backup and restore
+
+`secdeploy backup macos` captures this Mac's suite state into **one encrypted archive**:
+
+- every `com.docker.compose.project=secsuite` **docker volume** — on macOS that's
+  `seccert-data`, the **SecCert CA** (the suite's root of trust); SecRouter runs dev-mode with
+  an ephemeral DB, so it has no durable volume here;
+- the host-side cached secrets a deploy leaves under `out/` (`seccert-root.pem`, the
+  SecLLM/SecAgent tokens), `deploy/macos/secrets.env` (your `HF_TOKEN`), and
+  `~/.secagent` / `~/.config/secrouter`;
+- each stack's database + uploads + `.env` (SecSSO/SecChat/SecAssist), via their own
+  `bootstrap/<name>.sh backup`.
+
+It's the same public-key flow as the [fedora-fips runbook](fedora-fips.md#backup-and-restore)
+(read that for the full rationale) — **OpenSSL CMS + AES‑256**, encrypted to an X.509
+**recipient cert** whose private key you keep **offline**. SecCert can mint the recipient cert,
+or `openssl req -x509 -newkey rsa:4096 -nodes -keyout backup-key.pem -out backup-cert.pem
+-subj /CN=secsuite-backup`.
+
+```bash
+# Preview (needs Colima/Docker up to see the volumes):
+uv run secdeploy backup macos --dry-run
+
+# Real backup — encrypts to the recipient cert (stacks must be up to dump their DBs):
+uv run secdeploy backup macos --recipient backup-cert.pem
+# → out/backups/secsuite-macos-<resource>-<UTC>.tar.cms  (+ .manifest.json/.txt)
+
+# Restore — needs the OFFLINE private key; OVERWRITES state (asks first). Brings the root
+# compose down (volumes kept), replaces volume contents + host secrets, restores the stacks,
+# brings it back up:
+uv run secdeploy restore macos out/backups/secsuite-macos-<resource>-<UTC>.tar.cms --key backup-key.pem
+```
+
+macOS notes specific to this target:
+
+- Backup doesn't need `sudo` (it reads your own `out/`/`~` and drives Docker), but **Colima/
+  Docker must be running** for the volume capture, and the staging dir lives under the project
+  root so the util container can bind-mount it. The manifest records only metadata (filenames,
+  sizes, the plaintext SHA‑256, the recipient fingerprint) — never a secret value — and the
+  plaintext is wiped the moment the archive is encrypted.
+- The volume tar uses a small utility image (`alpine:3` by default) — on an air-gapped Mac,
+  pre-load it, or point `SECDEPLOY_VOLUME_UTIL_IMAGE` at an image you already have.
+- After a restore, confirm the integrity chains as on fedora (SecRouter `GET /audit/verify`,
+  `secagent audit verify`, SecCert's issuing log).
+
 ## Notes
 
 - SecRouter runs in **dev mode** here (security disabled). For anything real, mount a hardened
