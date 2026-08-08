@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import json
 import platform
+import shutil
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import common
 from .. import audit
+from .. import backup as backup_mod
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
@@ -957,3 +961,221 @@ def teardown(
             plan = teardown_plan(found, purge)
     common.execute_teardown_plan(plan, assume_yes)
     P.log("fedora-fips teardown complete")
+
+
+# ── backup / restore ───────────────────────────────────────────────────────────────────────
+#
+# The reverse of "deploy leaves state on the host": capture ALL of this host's suite state into
+# one FIPS-encrypted archive, and put it back. Native services (systemd) keep their state under
+# /var/lib/secsuite/<svc> and their secrets under /etc/secsuite/*.env — plain directory tarballs
+# here (each `tar -C <dir> .`); the stacks (Authentik/Mattermost/LibreChat) are dumped by their
+# own bootstrap `backup`/`restore` verbs (see common.stack_*_steps). Everything lands in a
+# throwaway staging tree, which backup.stage_to_encrypted_archive tars + CMS-encrypts to the
+# recipient cert; the plaintext never touches out/. Restore is the mirror: decrypt + verify the
+# manifest sha256, then overwrite (SecCert CA first), then the stacks, then restart. Pure step
+# builders (unit-tested with synthetic discovery) + a thin host-touching wrapper, same split as
+# teardown. SecRouter's SQLite is WAL-mode; a directory tar of db+wal+shm is a consistent-enough
+# hot snapshot (services are NOT stopped for backup — it's read-only), which restore documents.
+
+
+def _ordered_var(var_dirs: list[str]) -> list[str]:
+    """``var_dirs`` with ``seccert`` (the CA — the root of trust) first, then the rest
+    alphabetical. Used for both capture and restore so the crown jewels lead the plan."""
+    return sorted(var_dirs, key=lambda s: (s != "seccert", s))
+
+
+def backup_native_steps(found: FedoraFound, staging: Path) -> list[common.Step]:
+    """Pure: the capture Steps for this host's NATIVE state (config + per-service data),
+    each a ``tar`` into ``staging/native``. Stacks are added separately by the caller via
+    :func:`common.stack_backup_steps`. Order: config, then data with SecCert first."""
+    native = Path(staging) / "native"
+    steps: list[common.Step] = []
+    if found.etc_exists:
+        steps.append(common.Step(
+            f"config: archive {ETC}/*.env — SECCERT_CA_PASSPHRASE, SECCERT_ADMIN_TOKEN, "
+            "SECAGENT_* tokens (the secrets that decrypt/authorize everything else)",
+            ["tar", "czf", str(native / "etc-secsuite.tar.gz"), "-C", str(ETC), "."], "config"))
+    _notes = {
+        "seccert": " — the CA private key + issuing DB (the suite's root of trust)",
+        "secrouter": " — the hash-chained audit/usage SQLite (db+wal+shm captured together)",
+        "secagent": " — the CMMC audit log (audit.jsonl)",
+        "secdns": " — the generated zone (regenerable from topology; captured for completeness)",
+    }
+    for svc in _ordered_var(found.var_dirs):
+        steps.append(common.Step(
+            f"data: archive {VAR / svc}{_notes.get(svc, '')}",
+            ["tar", "czf", str(native / f"var-{svc}.tar.gz"), "-C", str(VAR / svc), "."], "data"))
+    return steps
+
+
+def restore_native_steps(native_files: list[str], unpacked: Path) -> list[common.Step]:
+    """Pure inverse of :func:`backup_native_steps`, given the filenames present under
+    ``unpacked/native``. Order: SecCert data FIRST, then ``/etc/secsuite``, then the rest —
+    so the CA is in place before anything that depends on it. Each restore is mkdir + extract."""
+    native = Path(unpacked) / "native"
+
+    def _rank(fn: str) -> tuple[int, str]:
+        if fn == "var-seccert.tar.gz":
+            return (0, fn)
+        if fn == "etc-secsuite.tar.gz":
+            return (1, fn)
+        return (2, fn)
+
+    steps: list[common.Step] = []
+    for fn in sorted(native_files, key=_rank):
+        if fn == "etc-secsuite.tar.gz":
+            steps.append(common.Step(f"config: (re)create {ETC}", ["mkdir", "-p", str(ETC)], "config"))
+            steps.append(common.Step(
+                f"config: extract {fn} → {ETC}",
+                ["tar", "xzf", str(native / fn), "-C", str(ETC)], "config"))
+        elif fn.startswith("var-") and fn.endswith(".tar.gz"):
+            svc = fn[len("var-"):-len(".tar.gz")]
+            d = VAR / svc
+            steps.append(common.Step(f"data: (re)create {d}", ["mkdir", "-p", str(d)], "data"))
+            steps.append(common.Step(
+                f"data: extract {fn} → {d}", ["tar", "xzf", str(native / fn), "-C", str(d)], "data"))
+    return steps
+
+
+def _backup_components_meta(found: FedoraFound, stacks: list[tuple[str, Path]]) -> list[dict]:
+    """The manifest's ``components`` list — names + WHAT each captured (filenames only, never a
+    secret value; see backup.write_backup_manifest)."""
+    comps: list[dict] = []
+    if found.etc_exists:
+        comps.append({"name": "config", "kind": "config", "captured": ["etc-secsuite.tar.gz"]})
+    for svc in _ordered_var(found.var_dirs):
+        comps.append({"name": svc, "kind": "service", "captured": [f"var-{svc}.tar.gz"]})
+    for name, _boot in stacks:
+        comps.append({"name": name, "kind": "stack",
+                      "captured": ["db dump", "uploads", ".env"]})
+    return comps
+
+
+def _require_root_linux(action: str) -> None:
+    import os
+    if platform.system() != "Linux":
+        P.die(f"fedora-fips {action} must run on the Fedora host (this is {platform.system()}). "
+              "Use --dry-run to preview.")
+    if os.geteuid() != 0:
+        P.die(f"fedora-fips {action} must run as root (touches /var/lib/secsuite + /etc/secsuite)")
+
+
+def backup(
+    manifest: Manifest, work: Path, root: Path, *, recipient_cert: str | None,
+    resource: str | None = None, dry_run: bool = False, assume_yes: bool = False,
+    out: Path | None = None, now: datetime | None = None,
+) -> None:
+    """Capture this host's suite state into one CMS/AES-256 archive encrypted to
+    ``recipient_cert``. ``root`` is unused (all host-absolute paths — parity with teardown).
+    Read-only: services are never stopped (see the section docstring's WAL note)."""
+    del root
+    out = Path(out) if out is not None else Path("out")
+    now = now or datetime.now(timezone.utc)
+    ts = backup_mod.format_ts(now)
+    found = _discover(work)
+    stacks = common.stack_checkouts(manifest, work)
+    components = _backup_components_meta(found, stacks)
+    display = Path("<staging>")
+    plan = backup_native_steps(found, display) + common.stack_backup_steps(stacks, display)
+    print(f"# fedora-fips backup plan — suite {manifest.suite} — one AES-256/CMS archive "
+          "encrypted to the recipient cert; the private key stays OFFLINE (docs/fedora-fips.md#backup)")
+    common.render_teardown_plan(plan)
+    print("\n" + backup_mod.dry_run_note(out, NAME, resource, ts))
+    if dry_run:
+        return
+    if not any(s.command for s in plan):
+        P.log("nothing found on this host to back up")
+        return
+    if not recipient_cert:
+        P.die("backup needs --recipient <cert.pem> — the X.509 cert to encrypt to (SecCert can "
+              "mint one: it's a normal server/leaf cert; keep its private key offline)")
+    if not Path(recipient_cert).exists():
+        P.die(f"recipient cert not found: {recipient_cert}")
+    _require_root_linux("backup")
+    tmp = Path(tempfile.mkdtemp(prefix="secdeploy-backup-"))
+    try:
+        staging = tmp / "staging"
+        (staging / "native").mkdir(parents=True)
+        real = backup_native_steps(found, staging) + common.stack_backup_steps(stacks, staging)
+        common.execute_capture_plan(real)
+        archive, json_path, txt_path = backup_mod.stage_to_encrypted_archive(
+            staging, out, NAME, resource, suite={"version": manifest.suite},
+            components=components, recipient_cert=recipient_cert, ts=ts, now=now)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)  # plaintext staging never lingers
+    P.log(f"encrypted backup → {archive}")
+    P.log(f"manifest → {json_path} (+ {txt_path.name})")
+    P.warn("store the archive like a secret, and keep the recipient PRIVATE KEY offline — it is "
+           "the only thing that can decrypt this. There is no recovery without it.")
+
+
+def restore(
+    manifest: Manifest, work: Path, root: Path, archive: str, *, key: str | None,
+    recipient_cert: str | None = None, resource: str | None = None,
+    dry_run: bool = False, assume_yes: bool = False, out: Path | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Decrypt + verify ``archive`` and OVERWRITE this host's suite state with it (SecCert CA
+    first), then restart. Confirm-gated — it is destructive. ``out``/``now`` unused (kept for
+    calling-convention parity with :func:`backup`)."""
+    del root, out, now
+    archive_path = Path(archive)
+    stacks = common.stack_checkouts(manifest, work)
+    manifest_json: Path | None = None
+    if archive_path.name.endswith(".tar.cms"):
+        manifest_json = archive_path.with_name(archive_path.name[: -len(".tar.cms")] + ".manifest.json")
+    print(f"# fedora-fips restore plan — suite {manifest.suite} — decrypt {archive_path.name}, "
+          "verify its manifest sha256, then OVERWRITE this host's state (docs/fedora-fips.md#backup)")
+    intent = [
+        common.Step("services: systemctl stop secsuite.target (release DB/file handles)", None, "services"),
+        common.Step(f"decrypt + verify {archive_path.name} against its manifest sha256 (needs --key)",
+                    None, "decrypt"),
+        common.Step("native: restore SecCert CA FIRST, then /etc/secsuite, then remaining state",
+                    None, "data"),
+        common.Step("stacks: bootstrap/<name>.sh restore each (Authentik/Mattermost/LibreChat DBs "
+                    f"+ uploads + .env){' — ' + ', '.join(n for n, _ in stacks) if stacks else ''}",
+                    None, "stacks"),
+        common.Step("services: systemctl start secsuite.target", None, "services"),
+        common.Step("verify: run each component's audit-chain verifier (see the note printed after)",
+                    None, "verify"),
+    ]
+    common.render_teardown_plan(intent)
+    if dry_run:
+        print("\n[dry-run] archive contents are only visible after decrypt (needs --key); the "
+              "above is the fixed restore flow. Nothing was read or changed.")
+        return
+    if not archive_path.exists():
+        P.die(f"archive not found: {archive_path}")
+    if not key:
+        P.die("restore needs --key <recipient.key> — the OFFLINE private key for the recipient cert")
+    if not Path(key).exists():
+        P.die(f"recipient private key not found: {key}")
+    _require_root_linux("restore")
+    if manifest_json is not None and not manifest_json.exists():
+        P.warn(f"no {manifest_json.name} beside the archive — restoring WITHOUT the sha256 "
+               "integrity check (place the .manifest.json next to the .tar.cms to enable it)")
+        manifest_json = None
+    if not P.confirm(
+        "restore OVERWRITES this host's suite state — the Authentik/Mattermost/LibreChat "
+        "databases, the SecCert CA, and the audit logs — with the archive's contents. This "
+        "cannot be undone. Proceed?", assume_yes,
+    ):
+        P.warn("restore aborted — nothing changed")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="secdeploy-restore-"))
+    try:
+        unpacked = backup_mod.unpack_encrypted_archive(
+            archive_path, key, tmp, manifest_json=manifest_json, recipient_cert=recipient_cert)
+        native_dir = unpacked / "native"
+        native_files = sorted(p.name for p in native_dir.glob("*")) if native_dir.is_dir() else []
+        P.run(["systemctl", "stop", "secsuite.target"], check=False)  # best-effort — may not exist yet
+        plan = restore_native_steps(native_files, unpacked) + common.stack_restore_steps(stacks, unpacked)
+        common.render_teardown_plan(plan)
+        common.execute_capture_plan(plan)
+        P.run(["systemctl", "start", "secsuite.target"], check=False)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    P.log("fedora-fips restore complete — services restarted")
+    P.warn("verify the restored integrity chains before trusting the host: SecRouter's audit "
+           "chain (GET /audit/verify on the gateway), SecAgent's (`secagent audit verify`), and "
+           "SecCert's issuing log — all should report an unbroken chain.")

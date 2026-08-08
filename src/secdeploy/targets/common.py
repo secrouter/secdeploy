@@ -223,6 +223,68 @@ def execute_teardown_plan(
             P.warn(f"non-zero exit, continuing teardown: {desc}")
 
 
+# ── backup/restore scaffold — shared by targets/fedora_fips.py + targets/macos.py ─────────
+#
+# Reuses the `Step`/`render_teardown_plan` primitives above (a plan line is a plan line). Two
+# differences from teardown: (1) stacks are derived DYNAMICALLY from the Manifest's declared
+# `kind == "stack"` (so secassist is included), not the hardcoded teardown `STACK_NAMES`; and
+# (2) execution is FAIL-FAST (:func:`execute_capture_plan`) — a failed dump or a failed restore
+# must abort, never leave a partial archive or a half-restored host, unlike teardown's
+# tolerate-absence best-effort. Each target populates a throwaway staging dir via these steps,
+# then hands it to :func:`secdeploy.backup.stage_to_encrypted_archive`.
+def stack_checkouts(manifest: Manifest, work: Path) -> list[tuple[str, Path]]:
+    """Every ``kind == "stack"`` component with a checkout present, as ``(name, bootstrap.sh)``.
+
+    Derived from the Manifest's declared kinds — deliberately NOT the hardcoded teardown
+    ``STACK_NAMES`` (which predates secassist and omits it) — so a newly added stack is picked
+    up for backup automatically. Order follows the manifest's declaration order."""
+    out: list[tuple[str, Path]] = []
+    for name, c in manifest.components.items():
+        if c.kind != "stack":
+            continue
+        boot = work / name / "bootstrap" / f"{name}.sh"
+        if boot.exists():
+            out.append((name, boot))
+    return out
+
+
+def stack_backup_steps(stacks: list[tuple[str, Path]], staging: Path) -> list[Step]:
+    """One capture Step per stack: ``bash bootstrap/<name>.sh backup <staging>/stacks/<name>``
+    (the verb dumps that stack's DB + uploads + ``.env`` into the dir — see each bootstrap)."""
+    return [
+        Step(f"stack {name}: dump DB + uploads + .env via bootstrap/{name}.sh backup",
+             ["bash", str(boot), "backup", str(Path(staging) / "stacks" / name)], "stacks")
+        for name, boot in stacks
+    ]
+
+
+def stack_restore_steps(stacks: list[tuple[str, Path]], unpacked: Path) -> list[Step]:
+    """The inverse: ``bash bootstrap/<name>.sh restore <unpacked>/stacks/<name>`` per stack,
+    skipping any whose dir isn't in the archive (that stack wasn't captured / wasn't placed)."""
+    steps: list[Step] = []
+    for name, boot in stacks:
+        src = Path(unpacked) / "stacks" / name
+        if not src.exists():
+            continue
+        steps.append(Step(
+            f"stack {name}: load DB + uploads + .env via bootstrap/{name}.sh restore",
+            ["bash", str(boot), "restore", str(src)], "stacks"))
+    return steps
+
+
+def execute_capture_plan(steps: list[Step]) -> None:
+    """Run a backup CAPTURE or RESTORE plan **fail-fast** — the opposite of
+    :func:`execute_teardown_plan`'s tolerate-absence. A failed ``pg_dump``/``mongodump`` or a
+    failed load raises (``P.run(check=True)``) so the caller aborts and wipes staging rather
+    than writing a partial, un-restorable archive or leaving a host half-restored. Note-only
+    steps (``command is None``) are display-only, already shown by ``render_teardown_plan``."""
+    for desc, cmd, _category in steps:
+        if not cmd:
+            continue
+        P.log(desc)
+        P.run(cmd, check=True)
+
+
 def audit_drift_note(out_dir: Path, target: str) -> str | None:
     """Best-effort ONLY: if a prior deploy's audit artifact (:mod:`secdeploy.audit`) exists
     under ``out_dir``, return a short courtesy note naming what IT recorded, for a target's

@@ -560,6 +560,88 @@ domain, tearing this down strands it — that's an operator call teardown can't 
   `bootstrap/<name>.sh` left to invoke `down` with in that case, so it's left running. Bring
   it down by hand (`docker`/`podman compose down`) first if that's happened.
 
+## Backup and restore
+
+`secdeploy backup fedora-fips` captures **this host's entire suite state** — every native
+service's `/var/lib/secsuite/<svc>` (the SecCert **CA private key**, SecRouter's hash-chained
+audit/usage SQLite, SecAgent's `audit.jsonl`, the SecDNS zone), all of `/etc/secsuite/*.env`
+(the secrets that decrypt/authorize the rest — `SECCERT_CA_PASSPHRASE`, tokens), and each
+stack's database + uploads (Authentik, Mattermost, LibreChat) — into **one encrypted archive**.
+
+**Why one encrypted archive, all or nothing.** The state and its secrets are cryptographically
+coupled: LibreChat's `CREDS_KEY` (in its `.env`) decrypts secrets *inside* the Mongo dump,
+`SECCERT_CA_PASSPHRASE` decrypts the CA keys, SecSSO's `users.generated.yaml` holds cleartext
+initial passwords. A data-only backup is un-restorable, so it's data + secrets + certs together
+— or nothing — and it is always encrypted.
+
+### Encryption: public-key, to a recipient cert (private key offline)
+
+The archive is encrypted with **OpenSSL CMS** (RFC 5652 EnvelopedData) and **AES‑256** — FIPS
+approved, and on this host driven by OpenSSL's FIPS provider (unlike `age`/ChaCha20, which is
+not FIPS-approved). Encryption is **public-key**: you encrypt *to* an X.509 **recipient cert**;
+the matching **private key is held offline** and is only needed to *restore*. Nothing secret
+sits on the backup host — which is what makes an unattended backup safe.
+
+**SecCert can mint the recipient cert** — it's a normal leaf/server cert (RSA or EC). Or use
+any X.509 keypair, e.g.:
+
+```bash
+openssl req -x509 -newkey rsa:4096 -days 3650 -nodes \
+  -keyout backup-key.pem -out backup-cert.pem -subj "/CN=secsuite-backup"
+# → keep backup-key.pem OFFLINE (an HSM, an air-gapped USB); distribute only backup-cert.pem
+```
+
+### Taking a backup
+
+```bash
+# Preview — prints exactly what it would capture, reads/writes nothing:
+sudo uv run secdeploy backup fedora-fips --dry-run
+
+# Real backup — encrypts to the recipient cert (stacks must be up so their DBs can be dumped):
+sudo uv run secdeploy backup fedora-fips --recipient backup-cert.pem
+```
+
+This writes, under `out/backups/`:
+
+- `secsuite-fedora-fips-<resource>-<UTC>.tar.cms` — the AES‑256/CMS **encrypted** archive.
+- `…​.manifest.json` / `…​.manifest.txt` — a manifest recording **only** metadata: what was
+  captured (filenames), sizes, the plaintext **SHA‑256** (restore verifies it), the cipher, and
+  the recipient cert **fingerprint** (so you know which offline key opens it). **Never a secret
+  value.**
+
+Backup runs as root, is **read-only** (services are not stopped), and never leaves plaintext
+outside a temp staging dir that is wiped as soon as the archive is encrypted. Store the
+`.tar.cms` like a secret; keep the private key offline — it is the *only* thing that can
+decrypt it (there is no recovery without it).
+
+### Restoring
+
+```bash
+# Preview the fixed restore flow (contents are only visible after decrypt, so this shows the flow):
+sudo uv run secdeploy restore fedora-fips out/backups/secsuite-fedora-fips-core-<UTC>.tar.cms --dry-run
+
+# Real restore — needs the OFFLINE private key; OVERWRITES this host's state (asks first):
+sudo uv run secdeploy restore fedora-fips \
+  out/backups/secsuite-fedora-fips-core-<UTC>.tar.cms --key backup-key.pem
+```
+
+Restore decrypts, **verifies the plaintext SHA‑256** against the manifest (fail-closed if it
+doesn't match — the out-of-band integrity check that stands in for AEAD), stops
+`secsuite.target`, restores native state **SecCert-CA-first** then `/etc/secsuite` then the
+rest, restores each stack via its own `bootstrap/<name>.sh restore` (which reinitializes that
+stack's DB from a clean volume so the restored `.env` secret keys match the dump), and restarts.
+It is **destructive** — it overwrites the databases, the CA, and the audit logs — so it asks a
+confirmation first (`-y`/`--yes` for automation). Keep the `…​.manifest.json` next to the
+archive to enable the integrity check.
+
+**After a restore, verify the integrity chains** before trusting the host: SecRouter's audit
+chain (`GET /audit/verify` on the gateway), SecAgent's (`secagent audit verify`), and SecCert's
+issuing log — all should report an unbroken chain.
+
+> Scope: this is **on-demand**. A scheduled systemd-timer backup is a later maintenance item.
+> The stacks must be running to be dumped; a stopped stack fails the backup loudly rather than
+> writing a silently-incomplete archive.
+
 ## Hardening applied
 
 The units set `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,

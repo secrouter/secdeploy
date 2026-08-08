@@ -15,6 +15,13 @@ out/
 *.qcow2
 SHA256SUMS
 
+# Encrypted backups (default to out/backups/, but never commit one wherever it lands — it
+# holds the suite's data + secrets + CA keys) and the transient plaintext staging dir a
+# backup/restore creates (normally wiped in a finally:, ignored in case a run is killed).
+*.tar.cms
+.secdeploy-backup-*/
+.secdeploy-restore-*/
+
 # local env overrides
 *.env
 !*.env.example
