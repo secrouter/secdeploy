@@ -455,18 +455,30 @@ class Topology:
             env["SECROUTER_SCOPE"] = "openid secrouter"
         if component == "secchatng":
             # The native SecChat rebuild reads plain SECCHAT_* env. Its ONLY trust root for user
-            # tokens is SecSSO's per-provider issuer (JWKS discovered from it); the audience is its
-            # own OIDC client id. The assistant path routes model calls through SecRouter (governed
-            # + audited), never straight at SecLLM. DATABASE_URL is derived in compose from the
-            # auto-seeded PG_PASSWORD, so it isn't set here. (A full SSO login also needs a SecSSO
-            # client blueprint + the client-side auth-code flow — the deliberate cutover follow-up.)
+            # tokens is SecSSO's per-provider issuer (JWKS discovered from it); the audience AND
+            # client id are both its own OIDC client id (secchatng's backend runs the Authorization
+            # Code + PKCE dance itself, server-side — a BFF, see secsso/blueprints/secchatng.yaml).
+            # The assistant path routes model calls through SecRouter (governed + audited), never
+            # straight at SecLLM. DATABASE_URL is derived in compose from the auto-seeded
+            # PG_PASSWORD, so it isn't set here. SECCHAT_OIDC_CLIENT_SECRET is NOT set here either
+            # — like secassist's OPENID_CLIENT_SECRET, it's mirrored from SecSSO's generated .env
+            # by wiring.sync_secchatng_env (SecSSO's SECCHATNG_OIDC_CLIENT_SECRET), not derived
+            # from the topology.
             secsso_url = peer_urls.get("SECSSO")
             if secsso_url:
                 env["SECCHAT_OIDC_ISSUER"] = f"{secsso_url}/application/o/secchatng/"
                 env["SECCHAT_OIDC_AUDIENCE"] = "secchatng"
+                env["SECCHAT_OIDC_CLIENT_ID"] = "secchatng"
             secrouter_url = peer_urls.get("SECROUTER")
             if secrouter_url:
                 env["SECROUTER_URL"] = secrouter_url
+            # Own fronted external URL — same peer_urls-by-self-key source secassist's env_for
+            # branch uses for DOMAIN_CLIENT/DOMAIN_SERVER above. Used to build the OIDC redirect
+            # URI (<SECCHAT_PUBLIC_URL>/auth/callback) and to decide the session cookie's Secure
+            # flag (see secchat's src/config.ts).
+            self_url = peer_urls.get("SECCHATNG")
+            if self_url:
+                env["SECCHAT_PUBLIC_URL"] = self_url
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────

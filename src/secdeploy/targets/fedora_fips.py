@@ -630,6 +630,19 @@ def deploy(
         if sa_env:
             P.log(f"secassist: synced OIDC secrets + topology env → work/secassist/.env "
                   f"({len(sa_env)} keys)")
+    # Native SecChat (secchatng) turnkey env — mirror SecSSO's generated OIDC login-client secret
+    # and write the topology OIDC/gateway env into work/secchatng/.env BEFORE deploy_stacks seeds
+    # it (same early-seed trick as the secassist mirror above). EXPERIMENTAL: only placed when the
+    # operator passed `--with secchatng`, so this is a no-op on every other deploy.
+    if not dry_run and topology is not None and placed and "secchatng" in placed \
+            and "secchatng" not in (without or []) and "secsso" in placed \
+            and "secsso" not in (without or []):
+        common.ensure_stack_secrets(work, ["secsso", "secchatng"])
+        sc_env = wiring.sync_secchatng_env(
+            work / "secsso" / ".env", work / "secchatng" / ".env", topology, without)
+        if sc_env:
+            P.log(f"secchatng: synced OIDC secret + topology env → work/secchatng/.env "
+                  f"({len(sc_env)} keys)")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

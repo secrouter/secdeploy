@@ -909,11 +909,28 @@ def deploy(
             and "secassist" not in (without or []) and "secsso" in placed \
             and "secsso" not in (without or []):
         common.ensure_stack_secrets(work, ["secsso", "secassist"])
-        written = wiring.sync_secassist_env(
+        # NB: a distinct name — NOT `written` — so this doesn't clobber the addressing dict from
+        # write_addressing() above, which the deploy-audit call below still needs as `addressing=`.
+        written_secassist = wiring.sync_secassist_env(
             work / "secsso" / ".env", work / "secassist" / ".env", topology, without)
-        if written:
+        if written_secassist:
             P.log(f"secassist: synced OIDC secrets + topology env → work/secassist/.env "
-                  f"({len(written)} keys)")
+                  f"({len(written_secassist)} keys)")
+
+    # Native SecChat (secchatng, EXPERIMENTAL — only placed when the operator passed
+    # `--with secchatng`) turnkey env: mirror SecSSO's generated OIDC login-client secret and
+    # write the topology-derived OIDC/gateway env into work/secchatng/.env BEFORE the stacks
+    # bring-up seeds it — same early-seed trick as the secassist mirror above (secsso deploys
+    # last in the sorted stack order, too late otherwise). Needs SecSSO in the topology.
+    if not dry_run and topology is not None and placed and "secchatng" in placed \
+            and "secchatng" not in (without or []) and "secsso" in placed \
+            and "secsso" not in (without or []):
+        common.ensure_stack_secrets(work, ["secsso", "secchatng"])
+        written_secchatng = wiring.sync_secchatng_env(
+            work / "secsso" / ".env", work / "secchatng" / ".env", topology, without)
+        if written_secchatng:
+            P.log(f"secchatng: synced OIDC secret + topology env → work/secchatng/.env "
+                  f"({len(written_secchatng)} keys)")
 
     # Declared end-user accounts → SecSSO. Render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) BEFORE the stacks bring-up so

@@ -285,6 +285,18 @@ turnkey — no manual reconciliation: it mirrors SecSSO's two generated OIDC sec
 (see `wiring.sync_secassist_env`), leaving the per-instance secrets for the stack's own seed.
 An external IdP (no SecSSO) means you supply those two secrets yourself, as before.
 
+**Native SecChat (`secchatng`, experimental — opt in with `--with secchatng`).** Same turnkey
+shape as SecAssist above, one client instead of two: when secchatng and SecSSO are both in the
+topology, the deploy mirrors SecSSO's generated `SECCHATNG_OIDC_CLIENT_SECRET` into
+`work/secchatng/.env`'s `SECCHAT_OIDC_CLIENT_SECRET` and writes the topology-derived
+`SECCHAT_OIDC_ISSUER` / `_AUDIENCE` / `_CLIENT_ID` / `SECCHAT_PUBLIC_URL` / `SECROUTER_URL`
+there too (see `wiring.sync_secchatng_env`). secchatng's backend runs the OIDC Authorization
+Code + PKCE exchange itself (a BFF — the browser only ever gets an httpOnly session cookie), so
+unlike SecAssist's auth proxy there's no second, client_credentials service secret to mirror,
+and no `svc-secchatng` entry in the OIDC config fragment above. `SECCHAT_SESSION_SECRET` (the
+session-cookie signing key) is untouched by this sync — it's seeded blank-to-random the same
+way as every other stack's per-instance secrets.
+
 ## Onboarding users (`[[users]]`)
 
 Declare accounts once in `secsite.toml` and the deploy creates them in SecSSO with a random
