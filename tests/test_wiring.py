@@ -827,6 +827,38 @@ def test_sync_secchatng_env_mirrors_secret_and_writes_topology(tmp_path):
     assert vals["SECCHAT_SESSION_SECRET"] == "keep-me"
 
 
+def test_sync_secsso_secchatng_redirect_points_at_the_topology_callback(tmp_path):
+    # SecSSO's blueprint must register secchatng's redirect_uri for wherever secchatng ACTUALLY
+    # lives in this topology — not the sec.internal .env.example default. Overwrites both keys in
+    # secsso's .env from secchatng's own topology URL (the same one env_for gives SECCHAT_PUBLIC_URL,
+    # so the two sides agree by construction), and leaves everything else alone.
+    topo = _topo_with_secchatng(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text(
+        "SECCHATNG_REDIRECT_URI=https://secchatng.sec.internal/auth/callback\n"  # .env.example default
+        "SECCHATNG_LAUNCH_URL=https://secchatng.sec.internal\n"
+        "AUTHENTIK_SECRET_KEY=keep-me\n"
+    )
+    written = wiring.sync_secsso_secchatng_redirect(secsso_env, topo)
+    assert written == ["SECCHATNG_LAUNCH_URL", "SECCHATNG_REDIRECT_URI"]
+    vals = _env_dict(secsso_env)
+    assert vals["SECCHATNG_REDIRECT_URI"] == "http://secchatng.sec.internal:47010/auth/callback"
+    assert vals["SECCHATNG_LAUNCH_URL"] == "http://secchatng.sec.internal:47010"
+    # exactly secchatng's SECCHAT_PUBLIC_URL + /auth/callback — the SecChat side builds the identical
+    # callback, so redirect_uri matches by construction (this is the whole point)
+    assert f'{vals["SECCHATNG_LAUNCH_URL"]}/auth/callback' == vals["SECCHATNG_REDIRECT_URI"]
+    assert vals["AUTHENTIK_SECRET_KEY"] == "keep-me"  # untouched
+
+
+def test_sync_secsso_secchatng_redirect_noops_when_not_placed_or_env_missing(tmp_path):
+    p = tmp_path / "topology.toml"; p.write_text(GPU_SPLIT)
+    topo = Topology.load(p, _manifest())  # NOT .include(secchatng) → experimental, not in the topology
+    secsso_env = tmp_path / "secsso.env"; secsso_env.write_text("X=1\n")
+    assert wiring.sync_secsso_secchatng_redirect(secsso_env, topo) is None  # nothing to point at
+    topo2 = _topo_with_secchatng(tmp_path)
+    assert wiring.sync_secsso_secchatng_redirect(tmp_path / "nope.env", topo2) is None  # no secsso .env
+
+
 def test_sync_secchatng_env_refreshes_managed_keys_on_rerun_and_keeps_operator_extra(tmp_path):
     # A redeploy must REFRESH every managed key (not just fill it once) while an operator-added
     # key outside the managed set survives untouched across both runs.

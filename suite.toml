@@ -30,7 +30,9 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 
 [components.secsso]
 repo = "secrouter/secsso"
-ref = "v1.1.0"
+# rearchitecture branch (not the v1.1.0 tag) so the secchatng OIDC blueprint + the redirect-env
+# passthrough travel with this transitional deploy. Repin to a secsso release tag at cutover.
+ref = "rearchitecture"
 kind = "stack"
 tier = "identity"
 port = 9000

@@ -822,6 +822,35 @@ def sync_secchatng_env(
     return sorted(to_write)
 
 
+def sync_secsso_secchatng_redirect(
+    secsso_env_path: str | Path, topology: Topology,
+    without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Point SecSSO's ``secchatng`` OIDC client at wherever secchatng is actually fronted in THIS
+    topology, by writing ``SECCHATNG_REDIRECT_URI`` + ``SECCHATNG_LAUNCH_URL`` into secsso's ``.env``
+    BEFORE Authentik boots (the counterpart to :func:`sync_secchatng_env`, which wires the secchatng
+    side). The ``secchatng.yaml`` blueprint reads both via ``!Env``; without this they fall back to
+    the ``sec.internal`` default and login fails with ``redirect_uri`` mismatch on any topology whose
+    secchatng URL differs (a different domain, or plain http in a proxy-less eval).
+
+    Uses secchatng's own (fronted) URL from :meth:`Topology.urls` — the same value
+    ``env_for("secchatng")`` derives ``SECCHAT_PUBLIC_URL`` from — so the two sides agree by
+    construction: SecChat advertises ``<url>`` as its public URL and builds its callback as
+    ``<url>/auth/callback``, and SecSSO registers exactly that. Returns the keys written, or ``None``
+    if secsso's ``.env`` is missing or secchatng isn't placed in this topology (nothing to point at).
+    """
+    secsso_env_path = Path(secsso_env_path)
+    if not secsso_env_path.exists():
+        return None
+    base = topology.urls(without, scheme).get("SECCHATNG")
+    if not base:
+        return None
+    base = base.rstrip("/")
+    to_write = {"SECCHATNG_REDIRECT_URI": f"{base}/auth/callback", "SECCHATNG_LAUNCH_URL": base}
+    _set_env_keys(secsso_env_path, to_write)
+    return sorted(to_write)
+
+
 def _read_generated_user_passwords(path: Path) -> dict[str, str]:
     """Extract ``{username: password}`` from an existing generated users blueprint. Line-based on
     the file's own fixed shape (username in identifiers, password in attrs) — no YAML dep."""
