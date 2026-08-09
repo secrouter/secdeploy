@@ -638,6 +638,10 @@ def deploy(
             and "secchatng" not in (without or []) and "secsso" in placed \
             and "secsso" not in (without or []):
         common.ensure_stack_secrets(work, ["secsso", "secchatng"])
+        sc_redir = wiring.sync_secsso_secchatng_redirect(work / "secsso" / ".env", topology, without)
+        if sc_redir:
+            P.log("secsso: pointed the secchatng OIDC client at its topology callback "
+                  "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
         sc_env = wiring.sync_secchatng_env(
             work / "secsso" / ".env", work / "secchatng" / ".env", topology, without)
         if sc_env:
