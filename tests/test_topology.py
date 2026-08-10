@@ -199,6 +199,24 @@ def test_env_for_secchat_wires_sso_and_secrouter():
     assert "SECCHAT_OIDC_ISSUER" not in topo.env_for("secrouter")  # block is secchat-specific
 
 
+def test_env_for_secrecorder_wires_sso_and_summarize():
+    # SecRecorder's two optional, off-by-default features read plain SECRECORDER_* env: SSO auth
+    # trusts SecSSO's per-provider issuer (its client id/audience are the brand-new client
+    # "secrecorder" — no retained-name subtlety like secchat), and summarization POSTs to an
+    # OpenAI-compatible endpoint that defaults THROUGH SecRouter (governed), never SecLLM directly.
+    m = _manifest()
+    topo = Topology.single_host(m, "macos", address="127.0.0.1")
+    env = topo.env_for("secrecorder")
+    assert env["SECRECORDER_OIDC_ISSUER"].endswith("/application/o/secrecorder/")
+    assert env["SECRECORDER_OIDC_AUDIENCE"] == "secrecorder"
+    assert env["SECRECORDER_OIDC_CLIENT_ID"] == "secrecorder"
+    assert env["SECRECORDER_SUMMARIZE_ENDPOINT"].endswith("/v1")  # SecRouter-governed default
+    assert env["SECRECORDER_PUBLIC_URL"]  # own external URL, for the OIDC redirect + cookie flag
+    # the client secret is never topology-derived — sync_secrecorder_env mirrors it from SecSSO
+    assert "SECRECORDER_OIDC_CLIENT_SECRET" not in env
+    assert "SECRECORDER_OIDC_ISSUER" not in topo.env_for("secrouter")  # block is secrecorder-specific
+
+
 # ── fronting axis: secproxy (edge tier) fronts the 5 HTTP services on :443 ──────────────
 def test_proxy_address_none_when_edge_unplaced(tmp_path):
     # GPU_SPLIT has no [groups.edge] at all — the common case today, and every fixture that

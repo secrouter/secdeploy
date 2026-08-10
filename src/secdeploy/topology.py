@@ -447,6 +447,34 @@ class Topology:
             self_url = peer_urls.get("SECCHAT")
             if self_url:
                 env["SECCHAT_PUBLIC_URL"] = self_url
+        if component == "secrecorder":
+            # SecRecorder's TWO optional, off-by-default features read plain SECRECORDER_* env:
+            #   (1) SSO auth — its trust root for user tokens is SecSSO's per-provider issuer (JWKS
+            #       discovered from it); the audience AND client id are both its OIDC client id
+            #       `secrecorder` (a brand-new confidential login client — its browser-login BFF runs
+            #       the Authorization Code + PKCE dance itself, server-side; see
+            #       secsso/blueprints/secrecorder.yaml). Unlike secchat there's no retained-name
+            #       subtlety: id/audience are plainly "secrecorder".
+            #   (2) Summarization — POSTs transcripts to an OpenAI-compatible chat endpoint, governed
+            #       by default THROUGH SecRouter (X-Sec-Acting-User), so SECRECORDER_SUMMARIZE_ENDPOINT
+            #       defaults to SecRouter's /v1 (the same governed path secchat's assistant uses).
+            # SECRECORDER_OIDC_CLIENT_SECRET is NOT set here — it's mirrored from SecSSO's generated
+            # .env by wiring.sync_secrecorder_env (SecSSO's SECRECORDER_OIDC_CLIENT_SECRET), not
+            # topology-derived; SECRECORDER_SESSION_SECRET (the session-cookie signing key) is a
+            # local operator/seed value, not shared with any peer, so it isn't set here either.
+            secsso_url = peer_urls.get("SECSSO")
+            if secsso_url:
+                env["SECRECORDER_OIDC_ISSUER"] = f"{secsso_url}/application/o/secrecorder/"
+                env["SECRECORDER_OIDC_AUDIENCE"] = "secrecorder"
+                env["SECRECORDER_OIDC_CLIENT_ID"] = "secrecorder"
+            secrouter_url = peer_urls.get("SECROUTER")
+            if secrouter_url:
+                env["SECRECORDER_SUMMARIZE_ENDPOINT"] = f"{secrouter_url}/v1"
+            # Own fronted external URL — the peer_urls-by-self-key source. Builds the OIDC redirect
+            # URI (<SECRECORDER_PUBLIC_URL>/auth/callback) and the session cookie's Secure flag.
+            self_url = peer_urls.get("SECRECORDER")
+            if self_url:
+                env["SECRECORDER_PUBLIC_URL"] = self_url
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────

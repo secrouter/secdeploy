@@ -262,6 +262,42 @@ session-cookie signing key) is untouched by this sync — it's seeded blank-to-r
 as every other stack's per-instance secrets. An external IdP (no SecSSO) means you supply the
 OIDC values yourself, as before.
 
+### SecRecorder turnkey SSO + summarization
+
+**SecRecorder** (`secrecorder`, transcription) gained two optional, off-by-default features: SSO
+auth (it validates SecSSO OIDC bearer JWTs and runs a browser-login BFF) and summarization (it
+POSTs transcripts to an OpenAI-compatible endpoint). Both stay off until their env is set, and
+when SecSSO + SecRouter are in the topology the deploy wires them turnkey — but via a different
+mechanism than SecChat, because **SecRecorder is a native systemd service, not a stack**. There's
+no `deploy_stacks` seed of its own; instead the topology-derived env lands in
+`out/addressing/env/secrecorder.env` (from `write_addressing`, like every placed component) and
+`deploy` installs it to `/etc/secsuite/secrecorder-addressing.env` — a path **distinct** from the
+operator-owned `/etc/secsuite/secrecorder.env`, layered via a **second `EnvironmentFile=`** in
+`secrecorder.service`, exactly the `secrouter-addressing.env` pattern above:
+
+```ini
+EnvironmentFile=/etc/secsuite/secrecorder.env
+EnvironmentFile=-/etc/secsuite/secrecorder-addressing.env
+```
+
+That generated file carries the topology-derived `SECRECORDER_OIDC_ISSUER` / `_AUDIENCE` /
+`_CLIENT_ID` (all the brand-new client `secrecorder` — no retained-name subtlety), the fronted
+`SECRECORDER_PUBLIC_URL` (which builds the OIDC redirect `…/auth/callback` and the cookie Secure
+flag), and `SECRECORDER_SUMMARIZE_ENDPOINT` = SecRouter's `/v1` (the **governed** default — summary
+calls go through SecRouter with `X-Sec-Acting-User`, never straight at SecLLM). When SecSSO is
+co-placed the deploy also mirrors its generated `SECRECORDER_OIDC_CLIENT_SECRET` into that same
+file (SecRecorder's BFF runs the Authorization Code + PKCE exchange server-side, so there's no
+second service secret to mirror), and writes `SECRECORDER_REDIRECT_URI` / `SECRECORDER_LAUNCH_URL`
+into `work/secsso/.env` so the `secrecorder.yaml` blueprint registers the right callback (see
+`wiring.sync_secrecorder_env` / `sync_secsso_secrecorder_redirect`).
+
+Two values stay operator-set in `/etc/secsuite/secrecorder.env` (never in the per-deploy
+addressing file): `SECRECORDER_SESSION_SECRET` — the session-cookie signing key, a local unshared
+value that must stay **stable** across redeploys (generate with `openssl rand -base64 36`) — and
+the summarize knobs `SECRECORDER_SUMMARIZE_ENABLED` / `_MODEL` / `_API_KEY` / `_PROMPT`, which turn
+summarization on and choose the model + key. An external IdP (no SecSSO) means you supply the OIDC
+values in `secrecorder.env` yourself; the client id/audience are `secrecorder`.
+
 ## Onboarding users (`[[users]]`)
 
 Declare accounts once in `secsite.toml` and the deploy creates them in SecSSO with a random

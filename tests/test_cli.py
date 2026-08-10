@@ -637,6 +637,33 @@ def test_deploy_fedora_dry_run_secllm_only_resource_no_secrouter_addressing_env_
     assert "secrouter-addressing.env" not in out
 
 
+# ── secrecorder-addressing.env: SecRecorder is a NATIVE service (not a stack), so its turnkey SSO
+#    OIDC + summarize env reaches the unit via a second EnvironmentFile=, the same layering pattern
+#    as secrouter-addressing.env above ─────────────────────────────────────────────────────
+def test_deploy_fedora_dry_run_collab_topology_shows_secrecorder_addressing_env_install(tmp_path, capsys):
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MULTI_INFERENCE)  # 'core' hosts the collab tier (secrecorder)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--topology", str(tp), "--resource", "core"]) == 0
+    out = capsys.readouterr().out
+    assert "install generated secrecorder addressing env" in out
+    # both the source (staged addressing env) and the destination (installed, DISTINCT from
+    # /etc/secsuite/secrecorder.env) appear in the printed command
+    assert "addressing/env/secrecorder.env" in out
+    assert "/etc/secsuite/secrecorder-addressing.env" in out
+
+
+def test_deploy_fedora_dry_run_secllm_only_resource_no_secrecorder_addressing_env_install(tmp_path, capsys):
+    # topology IS active, but SecRecorder isn't placed on THIS resource (gpu1 hosts only secllm)
+    # — the addressing-env install is gated on "secrecorder in services", like the secrouter one.
+    tp = tmp_path / "topology.toml"
+    tp.write_text(MULTI_INFERENCE)
+    assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
+                 "--with-inference", "--topology", str(tp), "--resource", "gpu1"]) == 0
+    out = capsys.readouterr().out
+    assert "secrecorder-addressing.env" not in out
+
+
 # ── --with-agent: SecAgent installed as an on-demand pi harness (no chat bridge) ─────────
 def test_deploy_fedora_with_agent_dry_run_shows_the_whole_turnkey(tmp_path, capsys):
     tp = tmp_path / "topology.toml"

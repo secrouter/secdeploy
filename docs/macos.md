@@ -205,6 +205,24 @@ cp deploy/macos/secrets.env.example deploy/macos/secrets.env
 and fold `HF_TOKEN` into SecRecorder's launchd environment; `--hf-token TOKEN` overrides it for a
 one-off run. `secrets.env` is gitignored (`*.env`) — never commit a real token.
 
+### SecRecorder SSO + summarization
+
+SecRecorder has two optional, off-by-default features — SSO auth (SecSSO OIDC bearer JWTs + a
+browser-login BFF) and summarization (transcripts POSTed to an OpenAI-compatible endpoint). With a
+`topology.toml` that places SecSSO + SecRouter, `deploy macos` wires them turnkey. The
+topology-derived env — `SECRECORDER_OIDC_ISSUER` / `_AUDIENCE` / `_CLIENT_ID` (the brand-new client
+`secrecorder`), the fronted `SECRECORDER_PUBLIC_URL`, and `SECRECORDER_SUMMARIZE_ENDPOINT` =
+SecRouter's `/v1` (the **governed** default, `X-Sec-Acting-User`) — is generated into
+`out/addressing/env/secrecorder.env` and **layered into SecRecorder's launchd environment**, the
+same idea as fedora-fips's second `EnvironmentFile=` (see
+[fedora-fips.md](fedora-fips.md#secrecorder-turnkey-sso--summarization)). When SecSSO is co-placed
+the deploy also mirrors its generated `SECRECORDER_OIDC_CLIENT_SECRET` into that file and points the
+`secrecorder.yaml` blueprint's redirect at this topology's callback (`SECRECORDER_REDIRECT_URI` /
+`SECRECORDER_LAUNCH_URL` in `work/secsso/.env`). `SECRECORDER_SESSION_SECRET` (the cookie-signing
+key, stable across redeploys) and the summarize knobs (`_ENABLED` / `_MODEL` / `_API_KEY` /
+`_PROMPT`) stay operator-set. A single-host eval (no topology) leaves both features off — reach
+SecRecorder at `localhost:47003` with no login, as before.
+
 > `secdeploy configure`'s optional secret-seeding step can write `HF_TOKEN` into
 > `deploy/macos/secrets.env` for you (`0600`, masked input) instead of the manual `cp` + edit
 > above — see [secsite.md § Seeding operator secrets](secsite.md#seeding-operator-secrets-optional).

@@ -921,6 +921,31 @@ def deploy(
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(written_secchat)} keys)")
 
+    # SecRecorder (a NATIVE service, not a stack) turnkey SSO. Same early-seed + SecSSO-co-placement
+    # requirement as the SecChat block above, but adapted to a native service: there's no stack .env
+    # to seed — SecRecorder's topology-derived OIDC + summarize env already landed in
+    # out/addressing/env/secrecorder.env via write_addressing(), and the launchd service below layers
+    # that file in (see _parse_env_file). So here we only (a) point SecSSO's SecRecorder OIDC client
+    # at this topology's callback, and (b) mirror SecSSO's generated login-client secret INTO that
+    # same generated env file, before the service is installed. SSO stays off entirely when SecSSO
+    # isn't co-placed (an external IdP means the operator supplies these). Gated on out is not None —
+    # that env file only exists when write_addressing ran.
+    if not dry_run and topology is not None and out is not None and placed \
+            and "secrecorder" in placed and "secrecorder" not in (without or []) \
+            and "secsso" in placed and "secsso" not in (without or []):
+        common.ensure_stack_secrets(work, ["secsso"])
+        rec_redir = wiring.sync_secsso_secrecorder_redirect(
+            work / "secsso" / ".env", topology, without)
+        if rec_redir:
+            P.log("secsso: pointed the SecRecorder OIDC client at its topology callback "
+                  "(SECRECORDER_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+        rec_env = wiring.sync_secrecorder_env(
+            work / "secsso" / ".env", base_out / "addressing" / "env" / "secrecorder.env",
+            topology, without)
+        if rec_env:
+            P.log(f"secrecorder: synced OIDC secret + topology env → "
+                  f"out/addressing/env/secrecorder.env ({len(rec_env)} keys)")
+
     # Declared end-user accounts → SecSSO. Render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) BEFORE the stacks bring-up so
     # Authentik applies it on secsso's first boot. Print new credentials once, for distribution.
@@ -1041,10 +1066,17 @@ def deploy(
         if not dry_run and native_services and not _ensure_native_venv(root, "secrecorder"):
             P.warn(f"secrecorder: no project venv — run `secdeploy build macos`, then start it: {fallback}")
         else:
+            # Topology peer-wiring (optional SSO OIDC + the SecRouter-governed summarize endpoint)
+            # plus any SecSSO-mirrored login secret — the launchd equivalent of the second
+            # EnvironmentFile= fedora-fips layers on (see _parse_env_file). write_addressing()
+            # generated env/secrecorder.env from this topology, and the early-seed block above folded
+            # in SecSSO's mirrored client secret when co-placed; empty/harmless with no topology or
+            # SSO off, and never overriding the operational WHISPER_*/model knobs (disjoint keys).
+            addressing_env = _parse_env_file(base_out / "addressing" / "env" / "secrecorder.env")
             secrecorder = launchd.LaunchdService(
                 name="secrecorder", program_args=rec_args, log_dir=log_dir,
-                env={**_base_env(home), "WHISPER_PREWARM": "1", "WHISPER_PREWARM_DIARIZER": "1",
-                     **model_env},
+                env={**_base_env(home), **addressing_env,
+                     "WHISPER_PREWARM": "1", "WHISPER_PREWARM_DIARIZER": "1", **model_env},
                 working_dir=str(root / "work" / "secrecorder"), user=user,
             )
             _install_or_note(secrecorder, staging_dir, native_services=native_services,

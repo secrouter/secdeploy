@@ -116,6 +116,18 @@ on a single resource). That service-to-service wiring is generated, so it is cor
 two components share a host or sit on opposite ends of the enclave. The per-component inbound
 port comes from the `port` field in `suite.toml`.
 
+A few components get **extra derived env** beyond the generic peer URLs. When SecSSO is placed,
+the native **SecChat** gets its OIDC issuer/audience/client-id + public URL, and **SecRecorder**
+gets the same OIDC block (its brand-new client `secrecorder`) plus `SECRECORDER_SUMMARIZE_ENDPOINT`
+pointed at SecRouter's `/v1` — so SecRecorder's optional SSO and summarization are wired turnkey and
+**governed by default** (summary calls carry `X-Sec-Acting-User` through SecRouter). Both features
+stay off until that env is set; the login-client secret is mirrored from SecSSO's generated `.env`
+and the SecSSO redirect is pointed at each app's topology URL. SecChat is a stack (its `.env` is
+seeded directly); SecRecorder is a native service, so its env is layered onto the running unit the
+same way SecRouter's pool wiring is — see
+[macos.md](macos.md#secrecorder-sso--summarization) /
+[fedora-fips.md](fedora-fips.md#secrecorder-turnkey-sso--summarization).
+
 ### Multi-instance inference (N SecLLM backends)
 
 SecLLM is stateless, so it's the one tier that may be placed on **several** resources at once —
