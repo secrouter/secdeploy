@@ -946,6 +946,25 @@ def deploy(
             P.log(f"secrecorder: synced OIDC secret + topology env → "
                   f"out/addressing/env/secrecorder.env ({len(rec_env)} keys)")
 
+    # SecLLM admin SSO — the SecRecorder block's counterpart for SecLLM's admin plane only
+    # (inference keeps its shared token). Point SecSSO's SecLLM OIDC client at this topology's
+    # callback, and mirror SecSSO's generated admin-login secret into SecLLM's generated env.
+    if not dry_run and topology is not None and out is not None and placed \
+            and "secllm" in placed and "secllm" not in (without or []) \
+            and "secsso" in placed and "secsso" not in (without or []):
+        common.ensure_stack_secrets(work, ["secsso"])
+        llm_redir = wiring.sync_secsso_secllm_redirect(
+            work / "secsso" / ".env", topology, without)
+        if llm_redir:
+            P.log("secsso: pointed the SecLLM admin OIDC client at its topology callback "
+                  "(SECLLM_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+        llm_env = wiring.sync_secllm_env(
+            work / "secsso" / ".env", base_out / "addressing" / "env" / "secllm.env",
+            topology, without)
+        if llm_env:
+            P.log(f"secllm: synced admin OIDC secret + topology env → "
+                  f"out/addressing/env/secllm.env ({len(llm_env)} keys)")
+
     # Declared end-user accounts → SecSSO. Render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) BEFORE the stacks bring-up so
     # Authentik applies it on secsso's first boot. Print new credentials once, for distribution.
