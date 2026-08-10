@@ -63,6 +63,13 @@ SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_E
 # secrouter.env via a SECOND EnvironmentFile= in secrouter.service (see that unit + deploy()
 # below), a DISTINCT path from ETC/secrouter.env so it never clobbers the operator's config.
 SECROUTER_ADDRESSING_ENV = ETC / "secrouter-addressing.env"
+# SecRecorder's generated peer-wiring env (optional SSO OIDC + the SecRouter-governed summarize
+# endpoint, plus any SecSSO-mirrored login secret) — layered onto the operator's own
+# secrecorder.env via a SECOND EnvironmentFile= in secrecorder.service, the same distinct-path
+# pattern as SECROUTER_ADDRESSING_ENV above (SecRecorder is a native service, not a stack, so its
+# turnkey wiring reaches the unit this way rather than through deploy_stacks). Off unless SecSSO
+# co-placed; when it is, the file also carries SECRECORDER_OIDC_CLIENT_SECRET mirrored from SecSSO.
+SECRECORDER_ADDRESSING_ENV = ETC / "secrecorder-addressing.env"
 # Where secproxy reads its generated nginx config — installed from addr_dir/secproxy.nginx.conf
 # (wiring.write_addressing's "nginx_conf" output). No secret in it (unlike SecLLM's admin token),
 # so — like the secdns zone — it's refreshed unconditionally on every deploy, never test -f
@@ -310,6 +317,23 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              str(SECROUTER_ADDRESSING_ENV)],
             f"install generated secrouter addressing env → {SECROUTER_ADDRESSING_ENV} "
             "(pool/token/egress-file — layered onto secrouter.env via systemd EnvironmentFile=)",
+        ))
+    # secrecorder — install its generated peer-wiring env (optional SSO OIDC + the SecRouter-governed
+    # summarize endpoint, + any SecSSO-mirrored login secret) to a DISTINCT path, layered onto the
+    # operator's own secrecorder.env via a second EnvironmentFile= in secrecorder.service — the same
+    # pattern as the secrouter addressing env above (SecRecorder is a native service, not a stack, so
+    # this is how its turnkey wiring reaches the unit rather than through deploy_stacks). Refreshed
+    # unconditionally: it's fully topology-derived, and the SecSSO secret it may also carry is
+    # stable/idempotent once generated. write_addressing() always writes env/secrecorder.env whenever
+    # secrecorder is placed here, so the source exists under this same condition. The optional
+    # (leading '-') EnvironmentFile= keeps a no-SSO deploy (file with only peer URLs, or absent)
+    # unaffected. deploy() runs the secret-mirror BEFORE these steps, so the file is complete here.
+    if "secrecorder" in services and addr_dir is not None:
+        steps.append((
+            ["install", "-m", "640", str(addr_dir / "env" / "secrecorder.env"),
+             str(SECRECORDER_ADDRESSING_ENV)],
+            f"install generated secrecorder addressing env → {SECRECORDER_ADDRESSING_ENV} "
+            "(SSO OIDC + summarize endpoint — layered onto secrecorder.env via systemd EnvironmentFile=)",
         ))
     # secagent (--with-agent) — Option A: secagent is INSTALLED as an on-demand pi harness (MR
     # review / code analysis / testgen / docs — driven by CLI / CI / MCP), NOT run as a standing
@@ -582,6 +606,28 @@ def deploy(
         if secagent_enabled and written.get("oidc"):
             P.log(f"SecRouter OIDC config fragment written → {written['oidc']} "
                   "(merge into security.oidc — see docs/fedora-fips.md)")
+        # SecRecorder (a NATIVE service, not a stack) turnkey SSO — mirror SecSSO's generated OIDC
+        # login-client secret into the just-written env/secrecorder.env, and point SecSSO's
+        # SecRecorder redirect at this topology's callback. This must run HERE, before the install
+        # steps below run (one of them copies env/secrecorder.env → the addressing EnvironmentFile),
+        # so the mirrored secret travels with the topology OIDC + summarize env write_addressing
+        # already put there — UNLIKE the SecChat block further down, whose stack .env is consumed
+        # only later by deploy_stacks (so it can seed after the steps). Both also land before secsso
+        # boots (deploy_stacks), so the redirect_uri is registered on its first apply. Needs SecSSO
+        # co-placed; ensure_stack_secrets seeds SecSSO's blank SECRECORDER_OIDC_CLIENT_SECRET first.
+        if (placed and "secrecorder" in placed and "secrecorder" not in without
+                and "secsso" in placed and "secsso" not in without):
+            common.ensure_stack_secrets(work, ["secsso"])
+            rec_redir = wiring.sync_secsso_secrecorder_redirect(
+                work / "secsso" / ".env", topology, without)
+            if rec_redir:
+                P.log("secsso: pointed the SecRecorder OIDC client at its topology callback "
+                      "(SECRECORDER_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+            rec_env = wiring.sync_secrecorder_env(
+                work / "secsso" / ".env", addr_dir / "env" / "secrecorder.env", topology, without)
+            if rec_env:
+                P.log(f"secrecorder: synced OIDC secret + topology env → "
+                      f"{addr_dir / 'env' / 'secrecorder.env'} ({len(rec_env)} keys)")
         P.log(f"addressing artifacts written → {addr_dir}")
     for cmd, desc in steps:
         P.log(desc)

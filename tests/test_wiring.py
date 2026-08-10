@@ -828,6 +828,136 @@ def test_sync_secchat_env_refreshes_managed_keys_on_rerun_and_keeps_operator_ext
     assert vals2["OPERATOR_EXTRA"] == "do-not-touch"  # untouched across both runs
 
 
+# ── env_for secrecorder branch + sync_secrecorder_env / sync_secsso_secrecorder_redirect: turnkey
+#    SecRecorder SSO + summarization. SecRecorder is a NATIVE service (not a stack like secchat), so
+#    its managed env is the topology-generated addressing env (env/secrecorder.env) the targets layer
+#    onto the running service — launchd env on macOS, a second EnvironmentFile= on fedora-fips. Its
+#    OIDC client id is a brand-new "secrecorder" (no retained-name subtlety like secchatng). ──
+def test_env_for_secrecorder_branch_full(tmp_path):
+    # GPU_SPLIT (no secproxy/edge) → plain ported http URLs, including secrecorder's OWN url
+    # (SECRECORDER_PUBLIC_URL) — the same peer_urls-by-self-key source every other peer URL uses.
+    topo = _topo(tmp_path)
+    env = topo.env_for("secrecorder")
+    assert env["SECRECORDER_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secrecorder/"
+    assert env["SECRECORDER_OIDC_AUDIENCE"] == "secrecorder"
+    assert env["SECRECORDER_OIDC_CLIENT_ID"] == "secrecorder"
+    assert env["SECRECORDER_SUMMARIZE_ENDPOINT"] == "http://secrouter.sec.internal:47002/v1"
+    assert env["SECRECORDER_PUBLIC_URL"] == "http://secrecorder.sec.internal:47003"
+    # the client secret is never topology-derived — sync_secrecorder_env mirrors it from SecSSO
+    assert "SECRECORDER_OIDC_CLIENT_SECRET" not in env
+
+
+def test_sync_secrecorder_env_mirrors_secret_and_writes_topology(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECRECORDER_OIDC_CLIENT_SECRET=login-xyz\n")
+    # As env/secrecorder.env looks right after write_addressing wrote the topology env; a stale
+    # placeholder issuer to prove the refresh; a local session secret + operator knob to preserve.
+    secrecorder_env = tmp_path / "secrecorder.env"
+    secrecorder_env.write_text(
+        "SECRECORDER_OIDC_ISSUER=https://stale.example/wrong\n"
+        "SECRECORDER_SESSION_SECRET=keep-me\n"
+        "SECRECORDER_SUMMARIZE_ENABLED=true\n"
+    )
+    written = wiring.sync_secrecorder_env(secsso_env, secrecorder_env, topo)
+    assert written is not None and "SECRECORDER_OIDC_CLIENT_SECRET" in written
+    assert written == sorted(wiring._SECRECORDER_MANAGED_KEYS)
+    vals = _env_dict(secrecorder_env)
+    # the mirrored secret is the whole reason this exists (never topology-derived)
+    assert vals["SECRECORDER_OIDC_CLIENT_SECRET"] == "login-xyz"
+    # topology env written (stale placeholder corrected to the real issuer + the governed endpoint)
+    assert vals["SECRECORDER_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secrecorder/"
+    assert vals["SECRECORDER_OIDC_AUDIENCE"] == "secrecorder"
+    assert vals["SECRECORDER_OIDC_CLIENT_ID"] == "secrecorder"
+    assert vals["SECRECORDER_PUBLIC_URL"] == "http://secrecorder.sec.internal:47003"
+    assert vals["SECRECORDER_SUMMARIZE_ENDPOINT"] == "http://secrouter.sec.internal:47002/v1"
+    # non-managed keys survive untouched: the local session secret + the operator-set summarize knob
+    assert vals["SECRECORDER_SESSION_SECRET"] == "keep-me"
+    assert vals["SECRECORDER_SUMMARIZE_ENABLED"] == "true"
+
+
+def test_sync_secrecorder_env_noop_without_secsso_secret(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("PG_PASS=x\n")  # no SECRECORDER_OIDC_CLIENT_SECRET provisioned yet
+    secrecorder_env = tmp_path / "secrecorder.env"
+    secrecorder_env.write_text("SECRECORDER_OIDC_ISSUER=x\n")
+    assert wiring.sync_secrecorder_env(secsso_env, secrecorder_env, topo) is None
+
+
+def test_sync_secrecorder_env_noop_when_files_missing(tmp_path):
+    topo = _topo(tmp_path)
+    assert wiring.sync_secrecorder_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
+
+
+def test_sync_secsso_secrecorder_redirect_points_at_the_topology_callback(tmp_path):
+    # SecSSO's blueprint must register SecRecorder's redirect_uri for wherever SecRecorder ACTUALLY
+    # lives in this topology — not the sec.internal .env.example default. Overwrites both keys in
+    # secsso's .env from SecRecorder's own topology URL (the same one env_for gives
+    # SECRECORDER_PUBLIC_URL, so the two sides agree by construction), leaving everything else alone.
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text(
+        "SECRECORDER_REDIRECT_URI=https://secrecorder.sec.internal/auth/callback\n"  # .env.example default
+        "SECRECORDER_LAUNCH_URL=https://secrecorder.sec.internal\n"
+        "AUTHENTIK_SECRET_KEY=keep-me\n"
+    )
+    written = wiring.sync_secsso_secrecorder_redirect(secsso_env, topo)
+    assert written == ["SECRECORDER_LAUNCH_URL", "SECRECORDER_REDIRECT_URI"]
+    vals = _env_dict(secsso_env)
+    assert vals["SECRECORDER_REDIRECT_URI"] == "http://secrecorder.sec.internal:47003/auth/callback"
+    assert vals["SECRECORDER_LAUNCH_URL"] == "http://secrecorder.sec.internal:47003"
+    # exactly SecRecorder's SECRECORDER_PUBLIC_URL + /auth/callback — the SecRecorder side builds the
+    # identical callback, so redirect_uri matches by construction (this is the whole point)
+    assert f'{vals["SECRECORDER_LAUNCH_URL"]}/auth/callback' == vals["SECRECORDER_REDIRECT_URI"]
+    assert vals["AUTHENTIK_SECRET_KEY"] == "keep-me"  # untouched
+
+
+def test_sync_secsso_secrecorder_redirect_noops_when_absent_or_env_missing(tmp_path):
+    # A manifest with no secrecorder at all → nothing to point the SSO redirect at.
+    crafted = (
+        'suite = "1"\n'
+        '[components.secrouter]\nrepo = "o/secrouter"\nref = "v1"\ntier = "gateway"\nport = 47002\n'
+        '[targets.fedora-fips]\nkind = "systemd-native"\n'
+    )
+    mpath = tmp_path / "suite.toml"; mpath.write_text(crafted)
+    tp = tmp_path / "topology.toml"
+    tp.write_text('domain = "sec.internal"\n[resources.core]\ntarget = "fedora-fips"\n'
+                  'address = "10.0.0.5"\n[groups.gateway]\nresource = "core"\n')
+    topo = Topology.load(tp, Manifest.load(mpath))
+    secsso_env = tmp_path / "secsso.env"; secsso_env.write_text("X=1\n")
+    assert wiring.sync_secsso_secrecorder_redirect(secsso_env, topo) is None  # nothing to point at
+    topo2 = _topo(tmp_path)
+    assert wiring.sync_secsso_secrecorder_redirect(tmp_path / "nope.env", topo2) is None  # no secsso .env
+
+
+def test_sync_secrecorder_env_refreshes_managed_keys_on_rerun_and_keeps_operator_extra(tmp_path):
+    # A redeploy must REFRESH every managed key (not just fill it once) while an operator-added key
+    # outside the managed set — e.g. the local session secret — survives untouched across both runs.
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECRECORDER_OIDC_CLIENT_SECRET=first-secret\n")
+    secrecorder_env = tmp_path / "secrecorder.env"
+    secrecorder_env.write_text(
+        "SECRECORDER_OIDC_ISSUER=https://stale.example/wrong\n"
+        "SECRECORDER_SESSION_SECRET=do-not-touch\n"
+    )
+    first = wiring.sync_secrecorder_env(secsso_env, secrecorder_env, topo)
+    assert first is not None
+    vals1 = _env_dict(secrecorder_env)
+    assert vals1["SECRECORDER_OIDC_CLIENT_SECRET"] == "first-secret"
+    assert vals1["SECRECORDER_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secrecorder/"
+    # SecSSO regenerates its secret (a fresh secsso deploy) between the two syncs — the re-run must
+    # pick up the NEW value, not leave the stale mirrored one in place.
+    secsso_env.write_text("SECRECORDER_OIDC_CLIENT_SECRET=rotated-secret\n")
+    second = wiring.sync_secrecorder_env(secsso_env, secrecorder_env, topo)
+    assert second == first  # same key set both times
+    vals2 = _env_dict(secrecorder_env)
+    assert vals2["SECRECORDER_OIDC_CLIENT_SECRET"] == "rotated-secret"
+    assert vals2["SECRECORDER_OIDC_ISSUER"] == vals1["SECRECORDER_OIDC_ISSUER"]  # refreshed, still correct
+    assert vals2["SECRECORDER_SESSION_SECRET"] == "do-not-touch"  # untouched across both runs
+
+
 def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):
     assert wiring.sync_secagent_service_secret(
         tmp_path / "nope.env", tmp_path / "also-nope.env",

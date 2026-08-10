@@ -11,6 +11,13 @@ User=secsuite-secrecorder
 Group=secsuite-secrecorder
 WorkingDirectory=/opt/secsuite/secrecorder
 EnvironmentFile=/etc/secsuite/secrecorder.env
+# secdeploy-generated topology wiring (optional SSO OIDC issuer/client/public-URL + the
+# SecRouter-governed summarize endpoint, and — when SecSSO is co-placed — the mirrored login-client
+# secret) — present only when a topology.toml placed SecRecorder here; the leading '-' makes it
+# optional so single-host / no-topology / SSO-off deploys (no such file) are unaffected. systemd
+# applies multiple EnvironmentFile= directives in listed order with later files overriding
+# same-named keys, so this — being second — is authoritative over secrecorder.env for any shared key.
+EnvironmentFile=-/etc/secsuite/secrecorder-addressing.env
 # The component ships run.sh as its entrypoint (selects the faster-whisper backend on Linux).
 ExecStart=/opt/secsuite/secrecorder/run.sh
 Restart=on-failure

@@ -766,6 +766,90 @@ def sync_secsso_secchat_redirect(
     return sorted(to_write)
 
 
+# The MANAGED keys secdeploy owns in SecRecorder's generated addressing env — the mirrored login
+# secret from SecSSO plus the topology-derived OIDC + summarize wiring (env_for("secrecorder")).
+# Everything else stays untouched: SECRECORDER_SESSION_SECRET (the session-cookie signing key —
+# a local, unshared value) is an operator/seed step, and the operator-set summarize knobs
+# (SECRECORDER_SUMMARIZE_ENABLED/_MODEL/_API_KEY/_PROMPT) are never forced here.
+_SECRECORDER_MANAGED_KEYS = frozenset({
+    "SECRECORDER_OIDC_CLIENT_SECRET", "SECRECORDER_OIDC_ISSUER", "SECRECORDER_OIDC_AUDIENCE",
+    "SECRECORDER_OIDC_CLIENT_ID", "SECRECORDER_PUBLIC_URL", "SECRECORDER_SUMMARIZE_ENDPOINT",
+})
+
+
+def sync_secrecorder_env(
+    secsso_env_path: str | Path, secrecorder_env_path: str | Path,
+    topology: Topology, without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Make SecRecorder's optional SSO turnkey: mirror the OIDC login-client secret SecSSO generated
+    and (re)write the topology-derived OIDC + summarize env into SecRecorder's env file.
+
+    The exact counterpart of :func:`sync_secchat_env`, adapted for a NATIVE service rather than a
+    stack. SecRecorder isn't a compose ``stack`` (no ``deploy_stacks``/``ensure_stack_secrets`` seed
+    of its own), so ``secrecorder_env_path`` is the topology-generated addressing env that
+    :func:`write_addressing` already writes (``out/addressing/env/secrecorder.env``) and that the
+    targets layer onto the running service — launchd's ``env`` on macOS, a second ``EnvironmentFile=``
+    on fedora-fips (see ``targets/``). This **overwrites** the fixed set of MANAGED keys
+    (:data:`_SECRECORDER_MANAGED_KEYS`): the topology values from ``env_for("secrecorder")`` (issuer,
+    audience, client id, SecRecorder's own public URL, the SecRouter-governed summarize endpoint) —
+    identical to what ``write_addressing`` put there, refreshed idempotently — plus the one value that
+    is NOT topology-derived: ``SECRECORDER_OIDC_CLIENT_SECRET`` ← SecSSO's own
+    ``SECRECORDER_OIDC_CLIENT_SECRET`` (SecRecorder's confidential login client; its BFF runs the
+    Authorization Code + PKCE dance server-side, so there's no second service secret to mirror).
+    ``SECRECORDER_SESSION_SECRET`` (the session-cookie signing key) is deliberately NOT managed here —
+    it's a local, unshared value the operator sets (or a native seed fills) and must stay stable
+    across redeploys, so it can't live in this per-deploy-regenerated file.
+
+    Returns the sorted list of keys written, or ``None`` if either file is missing or SecSSO hasn't
+    generated the secret yet (secsso stack never seeded). Called only where SecSSO is co-placed; an
+    external IdP means the operator supplies these directly.
+    """
+    secsso_env_path, secrecorder_env_path = Path(secsso_env_path), Path(secrecorder_env_path)
+    if not secsso_env_path.exists() or not secrecorder_env_path.exists():
+        return None
+    secsso = _read_env_values(secsso_env_path)
+    client_secret = secsso.get("SECRECORDER_OIDC_CLIENT_SECRET", "")
+    if not client_secret:
+        return None
+    managed = dict(topology.env_for("secrecorder", without, scheme))
+    managed["SECRECORDER_OIDC_CLIENT_SECRET"] = client_secret
+    to_write = {k: v for k, v in managed.items() if k in _SECRECORDER_MANAGED_KEYS}
+    _set_env_keys(secrecorder_env_path, to_write)
+    return sorted(to_write)
+
+
+def sync_secsso_secrecorder_redirect(
+    secsso_env_path: str | Path, topology: Topology,
+    without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Point SecSSO's SecRecorder OIDC client (client id ``secrecorder``) at wherever SecRecorder is
+    actually fronted in THIS topology, by writing ``SECRECORDER_REDIRECT_URI`` +
+    ``SECRECORDER_LAUNCH_URL`` into secsso's ``.env`` BEFORE Authentik boots (the counterpart to
+    :func:`sync_secrecorder_env`, which wires the SecRecorder side). The ``secrecorder.yaml`` blueprint
+    reads both via ``!Env``; without this they fall back to the ``sec.internal`` default and login
+    fails with ``redirect_uri`` mismatch on any topology whose SecRecorder URL differs (a different
+    domain, or plain http in a proxy-less eval).
+
+    Uses SecRecorder's own (fronted) URL from :meth:`Topology.urls` — the same value
+    ``env_for("secrecorder")`` derives ``SECRECORDER_PUBLIC_URL`` from — so the two sides agree by
+    construction: SecRecorder advertises ``<url>`` as its public URL and builds its callback as
+    ``<url>/auth/callback``, and SecSSO registers exactly that. Returns the keys written, or ``None``
+    if secsso's ``.env`` is missing or SecRecorder isn't placed in this topology (nothing to point at).
+    """
+    secsso_env_path = Path(secsso_env_path)
+    if not secsso_env_path.exists():
+        return None
+    base = topology.urls(without, scheme).get("SECRECORDER")
+    if not base:
+        return None
+    base = base.rstrip("/")
+    to_write = {
+        "SECRECORDER_REDIRECT_URI": f"{base}/auth/callback", "SECRECORDER_LAUNCH_URL": base,
+    }
+    _set_env_keys(secsso_env_path, to_write)
+    return sorted(to_write)
+
+
 def _read_generated_user_passwords(path: Path) -> dict[str, str]:
     """Extract ``{username: password}`` from an existing generated users blueprint. Line-based on
     the file's own fixed shape (username in identifiers, password in attrs) — no YAML dep."""
