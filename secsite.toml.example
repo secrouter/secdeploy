@@ -12,8 +12,8 @@
 # OVERRIDE whatever this file sets, for one-off runs (e.g. a single dry-run with an extra
 # --without you don't want to keep).
 #
-# NO SECRETS live here. The Hugging Face token, the SecCert CA passphrase, SecAgent's client
-# secret and Mattermost bot token stay in the *.env files (deploy/macos/secrets.env,
+# NO SECRETS live here. The Hugging Face token, the SecCert CA passphrase, and SecAgent's client
+# secret stay in the *.env files (deploy/macos/secrets.env,
 # /etc/secsuite/*.env on fedora-fips) — see `secdeploy configure` and docs/*.md.
 #
 # If secsite.toml (and topology.toml) are BOTH absent, SecDeploy runs in single-host mode:
@@ -60,7 +60,7 @@ capabilities = ["fips"]     # gpu | fips | arch tags
 # inference on the GPU box, TLS on the Mac), which is why they live on the resource instead of
 # in the suite-wide [deploy] table above. Uncomment only what you need to change.
 # with_inference = false      # stand up SecLLM here (fedora-fips only; see 'gpu' below)
-# with_agent = false          # stand up SecAgent's Mattermost chat-ops bridge here (fedora-fips only)
+# with_agent = false          # install SecAgent here as an on-demand pi harness (CLI / CI / MCP)
 # configure_resolver = false  # point THIS host's resolver at secdns (multi-host — docs/topology.md)
 # tls = false                 # macOS only: issue SecRecorder a SecCert cert via certbot
 # configure_hosts = false     # macOS only: map host.docker.internal to 127.0.0.1 in /etc/hosts

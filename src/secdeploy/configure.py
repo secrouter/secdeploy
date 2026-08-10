@@ -12,8 +12,8 @@ that resource (what's placed there / its target) — see :func:`_ask_deploy_opti
 Optionally (asked once, after ``secsite.toml`` is written) also seeds secrets into the
 gitignored ``*.env`` files: SecCert's admin token/CA passphrase are **auto-generated** by
 default (self-contained internal secrets — a machine should mint them, not the operator);
-external tokens a machine can't mint (SecAgent's Mattermost bot token, SecRecorder's Hugging
-Face token) and the shared SecAgent↔SecSSO client secret are asked; SecRouter's
+the external token a machine can't mint (SecRecorder's Hugging Face token) and the shared
+SecAgent↔SecSSO client secret are asked; SecRouter's
 ``FREEROUTER_CONFIG`` is a path, not a secret. Secrets NEVER go in ``secsite.toml``: see
 :func:`_maybe_seed_secrets`.
 
@@ -153,7 +153,8 @@ def _ask_deploy_options(
             opts.autostart_models = [m.strip() for m in raw.split(",") if m.strip()]
     if "collab" in tiers:
         opts.with_agent = _ask_yn(
-            input_fn, f"  [{r.name}] install + start SecAgent's Mattermost chat bridge here now?",
+            input_fn, f"  [{r.name}] install SecAgent here as an on-demand pi harness "
+            "(MR review / analysis / testgen — CLI / CI / MCP)?",
             False,
         )
     if secdns_deployed:
@@ -363,14 +364,14 @@ def _maybe_seed_secrets(
 
     # Auto-generate the machine-generatable INTERNAL secrets (SecCert's CA passphrase + admin
     # token — self-contained to SecCert, no cross-component matching) by default, so the operator
-    # never has to invent one. EXTERNAL tokens a machine can't mint (a Hugging Face token, a
-    # Mattermost bot token) and the shared SecAgent↔SecSSO client secret are always asked. The
-    # suite's other internal secrets are already auto-generated elsewhere: the SecLLM/SecRouter
-    # shared tokens + the SecAgent webhook secret in wiring.py, and every stack's Postgres
-    # password / Authentik secret key in targets/common.deploy_stacks.
+    # never has to invent one. The EXTERNAL token a machine can't mint (a Hugging Face token) and
+    # the shared SecAgent↔SecSSO client secret are always asked. The suite's other internal
+    # secrets are already auto-generated elsewhere: the SecLLM/SecRouter shared tokens in
+    # wiring.py, and every stack's Postgres password / Authentik secret key in
+    # targets/common.deploy_stacks.
     autogen = _ask_yn(
         input_fn, "\nAuto-generate strong random values for the internal secrets (SecCert CA "
-        "passphrase + admin token)? (external tokens — Hugging Face, Mattermost — are still "
+        "passphrase + admin token)? (the external Hugging Face token is still "
         "asked)", True,
     )
 
@@ -397,12 +398,10 @@ def _maybe_seed_secrets(
     if groups.get("collab"):
         collab_resource = groups["collab"][0]
         if site.deploy_for(collab_resource).with_agent:
-            out("\nSecAgent (Mattermost chat-ops bridge):")
+            out("\nSecAgent (on-demand pi harness):")
             items.append(("secagent", collab_resource, {
                 "SECAGENT_CLIENT_SECRET": getpass_fn(
                     "  SECAGENT_CLIENT_SECRET — SecSSO service-account secret (blank = skip): "),
-                "SECAGENT_MATTERMOST__BOT_TOKEN": getpass_fn(
-                    "  SECAGENT_MATTERMOST__BOT_TOKEN (blank = skip): "),
             }))
         out("\nSecRecorder (transcription):")
         items.append(("secrecorder", collab_resource, {

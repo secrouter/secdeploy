@@ -1,9 +1,10 @@
 """Encrypted backup archives — the crypto + manifest primitives for `secdeploy backup`.
 
-The suite's state (Authentik/Mattermost Postgres, LibreChat Mongo, SecRouter's hash-chained
-SQLite, SecAgent's audit log, and — crown jewels — SecCert's CA private keys) is coupled to its
-secrets: LibreChat's ``CREDS_KEY`` decrypts data *inside* the Mongo dump, ``SECCERT_CA_PASSPHRASE``
-decrypts the CA keys. So a backup is data + secrets in ONE archive, and it MUST be encrypted.
+The suite's state (Authentik + SecChat Postgres, SecRouter's hash-chained SQLite, SecAgent's
+audit log, and — crown jewels — SecCert's CA private keys) is coupled to its secrets:
+``SECCERT_CA_PASSPHRASE`` decrypts the CA keys, and each stack's ``.env`` holds the DB
+credentials its dump is restored with. So a backup is data + secrets in ONE archive, and it
+MUST be encrypted.
 
 Encryption is **public-key**: the plaintext ``.tar`` is encrypted to an X.509 **recipient cert**
 via OpenSSL CMS (RFC 5652 EnvelopedData) with **AES-256-CBC** content encryption. The recipient's

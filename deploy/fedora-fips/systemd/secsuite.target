@@ -1,13 +1,12 @@
 [Unit]
-Description=SecRouter secure-AI suite (secdns + SecCert + SecLLM + SecRouter + SecAgent + SecRecorder + secproxy)
+Description=SecRouter secure-AI suite (secdns + SecCert + SecLLM + SecRouter + SecRecorder + secproxy)
 Documentation=https://github.com/secrouter/secdeploy
 # secdns (internal DNS), SecCert (CA), and SecLLM (inference backend) come up first;
-# SecAgent, SecRecorder, and secproxy are optional. Any unit not installed on this host is
-# simply skipped (Wants= is a weak dependency) — e.g. secllm.service is only installed with
-# --with-inference, secagent.service only with --with-agent, and secproxy.service only when a
-# topology places the edge tier here. (secagent.service was previously missing from this
-# line despite being installed by _deploy_steps() — added here alongside secproxy.service.)
-Wants=secdns.service seccert.service secllm.service secrouter.service secagent.service secrecorder.service secproxy.service
+# SecRecorder and secproxy are optional. Any unit not installed on this host is simply skipped
+# (Wants= is a weak dependency) — e.g. secllm.service is only installed with --with-inference,
+# and secproxy.service only when a topology places the edge tier here. SecAgent is NOT a service:
+# --with-agent installs it as an on-demand pi harness (no systemd unit), so it isn't listed here.
+Wants=secdns.service seccert.service secllm.service secrouter.service secrecorder.service secproxy.service
 After=secdns.service seccert.service secllm.service
 
 [Install]

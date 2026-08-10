@@ -10,17 +10,17 @@ from secdeploy.manifest import Manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 ALL = {"seccert", "secsso", "secdns", "secllm", "secrouter", "secagent", "secchat", "secrecorder",
-       "secproxy", "secassist"}
-FRONTED = {"secsso", "secrouter", "secagent", "secchat", "secrecorder", "secassist", "secchatng"}
+       "secproxy"}
+FRONTED = {"secsso", "secrouter", "secchat", "secrecorder"}
 
 
 def test_load_shipped_manifest():
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.suite == "1.7.0"
-    assert ALL <= set(m.components)
+    assert m.suite == "2.0.0"
+    assert set(m.components) == ALL  # exactly these — the two retired chat components are gone
     assert m.components["secrecorder"].ref == "v0.8.2"
-    assert m.components["secagent"].ref == "v0.3.0"   # LeanCTX-bearing release
-    assert m.components["secassist"].ref == "v0.1.0"  # LibreChat chat UI
+    assert m.components["secagent"].ref == "main"           # bridge-free harness, pre-release ref
+    assert m.components["secchat"].ref == "rearchitecture"  # native SecChat rebuild
     assert set(m.targets) == {"macos", "fedora-fips"}
 
 
@@ -29,14 +29,14 @@ def test_kinds_and_optional_flags():
     assert m.components["secsso"].kind == "stack"
     assert m.components["secchat"].kind == "stack"
     assert m.components["secrouter"].kind == "service"
-    assert m.optionals() == ["seccert", "secsso", "secdns", "secassist", "secproxy"]
+    assert m.optionals() == ["seccert", "secsso", "secdns", "secproxy"]
     assert m.components["seccert"].optional and m.components["secsso"].optional
     assert m.components["secdns"].optional and m.components["secdns"].kind == "service"
     assert not m.components["secrouter"].optional
     assert m.components["secproxy"].optional and m.components["secproxy"].kind == "service"
-    # SecAssist (LibreChat) is an optional collab-tier stack, fronted at :443.
-    assert m.components["secassist"].optional and m.components["secassist"].kind == "stack"
-    assert m.components["secassist"].tier == "collab" and m.components["secassist"].port == 3080
+    # SecChat (the native rebuild) is a required collab-tier stack, fronted at :443.
+    assert not m.components["secchat"].optional
+    assert m.components["secchat"].tier == "collab" and m.components["secchat"].port == 47010
 
 
 def test_select_drops_optionals():
@@ -58,22 +58,32 @@ def test_select_rejects_unknown_component():
         m.select(["nope"])
 
 
-def test_experimental_off_by_default():
-    # secchatng (the native SecChat rebuild) ships experimental — present in the manifest, but
-    # NOT in the default selection, so it never joins the default suite unopted.
-    m = Manifest.load(ROOT / "suite.toml")
-    assert m.components["secchatng"].experimental is True
-    assert "secchatng" in m.experimentals()
-    assert "secchatng" in m.components  # registered in the manifest…
-    assert "secchatng" not in m.select()  # …but not in the default selection
-    assert m.components["secchat"].experimental is False  # incumbent Mattermost stays default-on
+# A crafted manifest with an experimental component — the shipped suite has none after the
+# SecChat cutover, but the --with/experimental machinery is generic and still needs coverage.
+_EXPERIMENTAL_MANIFEST = (
+    'suite = "1"\n'
+    '[components.secrouter]\nrepo = "o/secrouter"\nref = "v1"\ntier = "gateway"\nport = 47002\n'
+    '[components.labthing]\nrepo = "o/labthing"\nref = "v1"\ntier = "collab"\nexperimental = true\n'
+    '[targets.fedora-fips]\nkind = "systemd-native"\n'
+)
 
 
-def test_include_opts_experimental_in():
+def test_no_experimental_components_shipped_by_default():
+    # After the SecChat cutover no shipped component is experimental — the native SecChat is now
+    # the canonical, default-on `secchat` stack, not an opt-in rebuild.
     m = Manifest.load(ROOT / "suite.toml")
-    assert m.include(["secchatng"]) is m  # chainable
-    assert "secchatng" in m.select()
-    assert m.included == {"secchatng"}
+    assert m.experimentals() == []
+    assert "secchat" in m.select()
+    assert m.components["secchat"].experimental is False
+
+
+def test_include_opts_experimental_in(tmp_path):
+    p = tmp_path / "suite.toml"; p.write_text(_EXPERIMENTAL_MANIFEST)
+    m = Manifest.load(p)
+    assert "labthing" not in m.select()   # experimental → off by default
+    assert m.include(["labthing"]) is m   # chainable
+    assert "labthing" in m.select()
+    assert m.included == {"labthing"}
 
 
 def test_include_rejects_non_experimental():
@@ -89,12 +99,13 @@ def test_include_rejects_unknown():
 
 
 def test_experimental_survives_toml_roundtrip(tmp_path):
-    m = Manifest.load(ROOT / "suite.toml")
+    src = tmp_path / "src.toml"; src.write_text(_EXPERIMENTAL_MANIFEST)
+    m = Manifest.load(src)
     out = tmp_path / "suite.toml"
     out.write_text(m.to_toml())
     reloaded = Manifest.load(out)
-    assert reloaded.components["secchatng"].experimental is True
-    assert "secchatng" not in reloaded.select()  # still off by default after a round-trip
+    assert reloaded.components["labthing"].experimental is True
+    assert "labthing" not in reloaded.select()  # still off by default after a round-trip
 
 
 def test_tiers_and_ports():
@@ -114,10 +125,12 @@ def test_tiers_and_ports():
 
 
 # ── fronted axis: which components secproxy (nginx) puts behind :443 ────────────────────
-def test_fronted_flags_exactly_the_five():
+def test_fronted_flags_exactly_the_fronted_set():
     m = Manifest.load(ROOT / "suite.toml")
     assert {name for name, c in m.components.items() if c.fronted} == FRONTED
-    for name in ("secllm", "secdns", "secproxy"):
+    # never fronted: inference dials direct, secdns isn't HTTP, secproxy is the fronter itself,
+    # and secagent is an installed harness with no inbound listener at all.
+    for name in ("secllm", "secdns", "secproxy", "secagent"):
         assert not m.components[name].fronted
 
 

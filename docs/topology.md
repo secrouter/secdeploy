@@ -268,20 +268,19 @@ above.
   `inference` is placed — off by default, since it's a heavyweight GPU service; without it,
   SecDeploy still generates the DNS + `SECROUTER_SECLLM_ENDPOINTS` wiring for an
   externally-run SecLLM (see [Multi-instance inference](#multi-instance-inference-n-secllm-backends)).
-- **`deploy <target> --with-agent`** additionally stands up SecAgent's Mattermost chat-ops
-  bridge (`secagent chat serve`) on the resource where `collab` is placed — off by default,
-  since it needs two manually provisioned secrets first (a SecSSO service-account client
-  secret, a Mattermost bot token); without it, SecDeploy still generates SecAgent's
-  peer-wiring env (LLM traffic routed through SecRouter, SecSSO/Mattermost URLs) and the
+- **`deploy <target> --with-agent`** additionally installs SecAgent as an on-demand pi harness
+  (MR review / code analysis / testgen / docs — CLI / CI / MCP; no standing chat bridge) on the
+  resource where `collab` is placed — off by default; without it, SecDeploy still generates
+  SecAgent's peer-wiring env (LLM traffic routed through SecRouter, the SecSSO token URL) and the
   SecRouter OIDC config fragment SecSSO's `issuer_mode: global` requires. See
-  [SecAgent and Mattermost](fedora-fips.md#secagent-and-mattermost).
+  [SecAgent (the pi harness)](fedora-fips.md#secagent-the-pi-harness).
 - Every real `deploy` (not `--dry-run`) also writes a per-resource **audit artifact** to
   `out/audit/` — CMMC evidence of what was placed here and, notably, the SecLLM backend-pool
   hosts SecRouter is auto-authorized to egress to. See
   [Deployment audit artifacts](fedora-fips.md#deployment-audit-artifacts).
 
-> Note: `secdns`, the stack components, SecLLM (`--with-inference`), and SecAgent's chat-ops
-> service (`--with-agent`) only deploy when a topology is active. To stand up the *full* suite
+> Note: `secdns`, the stack components, SecLLM (`--with-inference`), and SecAgent's pi harness
+> (`--with-agent`) only deploy when a topology is active. To stand up the *full* suite
 > on a single machine, generate a single-host `topology.toml` (via `secdeploy configure`)
 > rather than running a bare `deploy` (which brings up the built-from-source core only).
 > Remaining polish is tracked in [roadmap.md](roadmap.md).

@@ -29,9 +29,9 @@ class Component:
     port: int = 0  # primary inbound port for peer addressing (0 = no inbound listener)
     optional: bool = False  # optional infra — droppable with `--without`
     # Experimental/transitional: NOT deployed by default — excluded from `select()` unless the
-    # operator opts in with `--with <name>`. Used to land a replacement component (e.g. the native
-    # SecChat rebuild alongside the incumbent Mattermost stack) so it can be deployed and evaluated
-    # without disturbing the default suite, ahead of a deliberate cutover.
+    # operator opts in with `--with <name>`. Used to land a replacement component alongside the one
+    # it will eventually supersede, so it can be deployed and evaluated without disturbing the
+    # default suite, ahead of a deliberate cutover.
     experimental: bool = False
     fronted: bool = False  # HTTP service secproxy (nginx) puts behind :443 — see topology.is_fronted
     runtime: str = ""

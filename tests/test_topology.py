@@ -83,7 +83,8 @@ resource = "core"
 resource = "gpu"
 """
 
-FRONTED = ("secsso", "secrouter", "secagent", "secchat", "secrecorder")
+# secagent is NOT fronted — it's an installed pi harness with no inbound port.
+FRONTED = ("secsso", "secrouter", "secchat", "secrecorder")
 
 
 def _manifest() -> Manifest:
@@ -101,14 +102,11 @@ def test_single_host_places_everything():
     m = _manifest()
     topo = Topology.single_host(m, "macos", address="127.0.0.1")
     placement = topo.placement()
-    # "everything" = the default selection: experimental components (secchatng) are off unless
-    # opted into, so they aren't placed until --with names them (asserted just below).
+    # "everything" = the default selection (every non-optional component, incl. native secchat)
     assert set(placement) == set(m.select())
     assert set(placement.values()) == {"local"}
     assert set(topo.components_on("local")) == set(m.select())
-    # opting the experimental component in places it too
-    m.include(["secchatng"])
-    assert "secchatng" in Topology.single_host(m, "macos", address="127.0.0.1").placement()
+    assert "secchat" in placement  # the native SecChat is default-on now, not opt-in
 
 
 def test_gpu_split_placement(tmp_path):
@@ -188,17 +186,17 @@ def test_env_for_wires_peers_not_self(tmp_path):
     assert "SECROUTER_URL" not in env
 
 
-def test_env_for_secchatng_wires_sso_and_secrouter():
-    # The experimental native SecChat reads plain SECCHAT_* env: its OIDC trust root is SecSSO's
-    # per-provider issuer, its audience is its own client id, and the assistant path dials
-    # SecRouter (governed), never SecLLM directly.
-    m = _manifest().include(["secchatng"])
+def test_env_for_secchat_wires_sso_and_secrouter():
+    # The native SecChat reads plain SECCHAT_* env: its OIDC trust root is SecSSO's per-provider
+    # issuer (its client id stays `secchatng`), its audience is that client id, and the assistant
+    # path dials SecRouter (governed), never SecLLM directly.
+    m = _manifest()
     topo = Topology.single_host(m, "macos", address="127.0.0.1")
-    env = topo.env_for("secchatng")
+    env = topo.env_for("secchat")
     assert env["SECCHAT_OIDC_ISSUER"].endswith("/application/o/secchatng/")
     assert env["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
     assert env["SECROUTER_URL"]  # the SecRouter peer URL, for the assistant path
-    assert "SECCHAT_OIDC_ISSUER" not in topo.env_for("secrouter")  # block is secchatng-specific
+    assert "SECCHAT_OIDC_ISSUER" not in topo.env_for("secrouter")  # block is secchat-specific
 
 
 # ── fronting axis: secproxy (edge tier) fronts the 5 HTTP services on :443 ──────────────
@@ -214,14 +212,14 @@ def test_proxy_address_resolves_the_edge_resource(tmp_path):
     assert topo._proxy_address() == "10.0.0.5"
 
 
-def test_is_fronted_true_for_the_five_when_secproxy_placed(tmp_path):
+def test_is_fronted_true_for_the_fronted_set_when_secproxy_placed(tmp_path):
     topo = _topo(tmp_path, EDGE_SPLIT)
     for name in FRONTED:
         assert topo.is_fronted(name)
     # never fronted, regardless of placement: the CA must stay a direct trust anchor (secproxy
-    # bootstraps its certs from it), inference must dial direct, secdns isn't HTTP, and secproxy
-    # doesn't front itself
-    for name in ("seccert", "secllm", "secdns", "secproxy"):
+    # bootstraps its certs from it), inference must dial direct, secdns isn't HTTP, secproxy
+    # doesn't front itself, and secagent is an installed harness with no inbound listener
+    for name in ("seccert", "secllm", "secdns", "secproxy", "secagent"):
         assert not topo.is_fronted(name)
 
 
@@ -249,9 +247,9 @@ def test_urls_fronted_components_drop_the_port(tmp_path):
     urls = topo.urls()
     assert urls["SECROUTER"] == "https://secrouter.sec.internal"
     assert urls["SECSSO"] == "https://secsso.sec.internal"
-    assert urls["SECAGENT"] == "https://secagent.sec.internal"
     assert urls["SECCHAT"] == "https://secchat.sec.internal"
     assert urls["SECRECORDER"] == "https://secrecorder.sec.internal"
+    assert "SECAGENT" not in urls  # no inbound port → not an addressable peer URL
     # never fronted — keep their explicit port (seccert = the CA, a direct trust anchor).
     # http, not https: none of these terminate TLS themselves — confirmed live (a direct
     # https:// curl to seccert/secllm fails outright; only plain http answers).
@@ -278,7 +276,7 @@ def test_env_for_secrouter_peers_are_bare_fronted_urls_but_secllm_pool_stays_dir
     env = topo.env_for("secrouter")
     # CA is direct, not fronted — and plain http, confirmed live it never terminates TLS itself
     assert env["SECCERT_URL"] == "http://seccert.sec.internal:47001"
-    assert env["SECAGENT_URL"] == "https://secagent.sec.internal"
+    assert "SECAGENT_URL" not in env  # secagent has no inbound port — not a peer URL
     # SECROUTER_SECLLM_ENDPOINTS (the backend pool) stays DIRECT + ported + plain-http no
     # matter what — confirmed live an https URL here FATALs SecRouter's turnkey routing
     assert env["SECROUTER_SECLLM_ENDPOINTS"] == "http://secllm.sec.internal:11400/v1"
@@ -299,7 +297,6 @@ def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
         ("secrouter.sec.internal", "A", "10.0.0.5"),
         ("secagent.sec.internal", "A", "10.0.0.5"),
         ("secchat.sec.internal", "A", "10.0.0.5"),
-        ("secassist.sec.internal", "A", "10.0.0.5"),
         ("secrecorder.sec.internal", "A", "10.0.0.5"),
     ]
     # http, not the originally-pinned https: none of these terminate TLS themselves when
@@ -307,15 +304,14 @@ def test_backward_compat_no_edge_group_zone_and_urls_unchanged(tmp_path):
     # uniformly here — every manifest port in this no-secproxy topology is a plain listener,
     # not a TLS one) — see Topology.urls()'s docstring. Updated deliberately, not a stale
     # snapshot: this pinned value predates that fix and was never actually live-verified.
+    # secagent has no inbound port now (an installed harness) → no peer URL entry.
     assert topo.urls() == {
         "SECCERT": "http://seccert.sec.internal:47001",
         "SECSSO": "http://secsso.sec.internal:9000",
         "SECDNS": "http://secdns.sec.internal:53",
         "SECLLM": "http://secllm.sec.internal:11400",
         "SECROUTER": "http://secrouter.sec.internal:47002",
-        "SECAGENT": "http://secagent.sec.internal:47007",
-        "SECCHAT": "http://secchat.sec.internal:8065",
-        "SECASSIST": "http://secassist.sec.internal:3080",
+        "SECCHAT": "http://secchat.sec.internal:47010",
         "SECRECORDER": "http://secrecorder.sec.internal:47003",
     }
 

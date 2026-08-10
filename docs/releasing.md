@@ -38,23 +38,21 @@ component is **in** the default selection and dropped with `--without`, an exper
 **out** of it and added with `--with`:
 
 ```toml
-[components.secchatng]
-repo = "secrouter/secchat"
+[components.newchat]
+repo = "secrouter/newchat"
 ref  = "rearchitecture"   # a branch/SHA is fine until a release tag is cut
 kind = "stack"
-experimental = true       # off by default — opt in with `--with secchatng`
+experimental = true       # off by default — opt in with `--with newchat`
 ```
 
 `--with <name>` (on `plan`/`fetch`/`build`/`bundle`/`deploy`) opts an experimental component into
 the selection for that run; it accepts only experimental names. This lets a replacement component
 ship and be evaluated **alongside** the incumbent it will eventually retire, without joining the
-default suite. Today `secchatng` (the native SecChat rebuild — Node/TS + Postgres, tamper-evident
-audit, owner-gated agents) ships this way next to the Mattermost `secchat` and the LibreChat
-`secassist`. Its bootstrap script is named for its component id (`bootstrap/secchatng.sh`), and
-its per-stack env (`SECCHAT_OIDC_ISSUER`/`_AUDIENCE`, `SECROUTER_URL`) is derived in
-`topology.env_for`. **Cutover** (making it the canonical `secchat`, retiring Mattermost + LibreChat,
-and removing the SecAgent→Mattermost bridge) is a later, deliberate manifest change — not something
-a `--with` run does.
+default suite — deriving its per-stack env in `topology.env_for` and running its own
+`bootstrap/<id>.sh` like any other stack. **Cutover** — making the replacement the canonical
+component and retiring what it supersedes — is a later, deliberate manifest change (drop the old
+component, drop the `experimental` flag, repoint the id), not something a `--with` run does. The
+current suite ships no experimental component: the native `secchat` completed exactly this path.
 
 ## Cutting a new suite version
 

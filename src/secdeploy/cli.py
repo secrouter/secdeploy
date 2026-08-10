@@ -104,7 +104,6 @@ def _expected_assets(root: Path, target: str) -> list[Path]:
             d / "systemd/seccert.service",
             d / "systemd/secllm.service",
             d / "systemd/secrouter.service",
-            d / "systemd/secagent.service",
             d / "systemd/secrecorder.service",
             d / "systemd/secproxy.service",
         ]
@@ -352,8 +351,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def _with_arg(sp):
         sp.add_argument("--with", dest="with_", default="",
-                        help="comma-separated experimental components to opt into (e.g. secchatng) "
-                             "— off by default")
+                        help="comma-separated experimental components to opt into (any manifest "
+                             "component flagged experimental = true) — off by default")
 
     def _topology_arg(sp):
         sp.add_argument("--topology", default="topology.toml",
@@ -470,16 +469,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.choices["deploy"].add_argument(
         "--with-agent", action="store_true", default=None, dest="with_agent",
-        help="also stand up SecAgent's Mattermost chat-ops bridge (`secagent chat serve`) on "
-             "the resource where the collab tier is placed here (default: off — the peer-wiring "
-             "env pointing SecAgent's LLM traffic at SecRouter is always generated; this "
-             "additionally installs pi + secagent and starts the secagent service). "
-             "fedora-fips installs a systemd service; macOS installs a launchd service (see "
-             "docs/macos.md). Overrides the resource's secsite.toml `with_agent` when given.",
+        help="also install SecAgent as an on-demand pi harness (MR review / code analysis / "
+             "testgen / docs — driven by CLI / CI / MCP; no standing chat bridge) on the resource "
+             "where the collab tier is placed here (default: off — the peer-wiring env pointing "
+             "SecAgent's LLM traffic at SecRouter is always generated; this additionally installs "
+             "pi + secagent and wires it up with `secagent init`). Overrides the resource's "
+             "secsite.toml `with_agent` when given.",
     )
     sub.choices["deploy"].add_argument(
         "--no-native-services", action="store_false", dest="native_services",
-        help="macOS: don't install the native services (SecDNS/SecLLM/SecAgent/SecRecorder/"
+        help="macOS: don't install the native services (SecDNS/SecLLM/SecRecorder/"
              "secproxy) as launchd daemons — print the run commands so you start them in the "
              "foreground yourself. Default is to install + start them. fedora-fips ignores this "
              "(always systemd-native).",

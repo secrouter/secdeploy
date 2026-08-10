@@ -110,7 +110,9 @@ resource = "core"
 resources = ["gpu1", "gpu2"]
 """
 
-FRONTED = ("secsso", "secrouter", "secagent", "secchat", "secassist", "secrecorder")
+# The fronted axis: secproxy puts these HTTP services behind :443. secagent is NOT here — it's
+# an installed pi harness with no inbound listener (no port), so it's never fronted.
+FRONTED = ("secsso", "secrouter", "secchat", "secrecorder")
 
 
 def _manifest() -> Manifest:
@@ -121,14 +123,6 @@ def _topo(tmp_path) -> Topology:
     p = tmp_path / "topology.toml"
     p.write_text(GPU_SPLIT)
     return Topology.load(p, _manifest())
-
-
-def _topo_with_secchatng(tmp_path) -> Topology:
-    # secchatng is EXPERIMENTAL (see suite.toml) — excluded from select() unless explicitly
-    # .include()d, mirroring the --with secchatng opt-in a real deploy needs (see cli.py).
-    p = tmp_path / "topology.toml"
-    p.write_text(GPU_SPLIT)
-    return Topology.load(p, _manifest().include(["secchatng"]))
 
 
 def _multi_topo(tmp_path) -> Topology:
@@ -224,11 +218,11 @@ def test_write_addressing(tmp_path):
     assert Path(env["secllm"]).exists()
 
 
-# ── nginx_conf_text: secproxy's reverse-proxy config (fronts the 5 HTTP services on :443) ──
+# ── nginx_conf_text: secproxy's reverse-proxy config (fronts the HTTP services on :443) ──
 CERT_DIR = "/etc/secsuite/secproxy"
 
 
-def test_nginx_conf_text_server_blocks_for_exactly_the_five(tmp_path):
+def test_nginx_conf_text_server_blocks_for_exactly_the_fronted_set(tmp_path):
     topo = _edge_topo(tmp_path)
     text = wiring.nginx_conf_text(topo, CERT_DIR)
     for name in FRONTED:
@@ -245,15 +239,14 @@ def test_nginx_conf_text_proxy_pass_targets_are_correct(tmp_path):
     text = wiring.nginx_conf_text(topo, CERT_DIR)
     assert "proxy_pass http://10.0.0.5:9000;" in text      # secsso
     assert "proxy_pass http://10.0.0.5:47002;" in text     # secrouter
-    assert "proxy_pass http://10.0.0.5:47007;" in text     # secagent
-    assert "proxy_pass http://10.0.0.5:8065;" in text      # secchat
+    assert "proxy_pass http://10.0.0.5:47010;" in text     # secchat (native)
     assert "proxy_pass http://10.0.0.5:47003;" in text     # secrecorder
 
 
 def test_nginx_conf_text_ssl_cert_paths_use_cert_dir(tmp_path):
     topo = _edge_topo(tmp_path)
     text = wiring.nginx_conf_text(topo, CERT_DIR)
-    # one SAN cert covers all five — every :443 block reads the SAME cert_dir
+    # one SAN cert covers them all — every :443 block reads the SAME cert_dir
     assert f"ssl_certificate {CERT_DIR}/fullchain.pem;" in text
     assert f"ssl_certificate_key {CERT_DIR}/privkey.pem;" in text
     # one per fronted server block, plus one for the bare-domain landing page
@@ -280,10 +273,9 @@ def test_nginx_conf_text_port_80_acme_webroot_and_redirect(tmp_path):
     topo = _edge_topo(tmp_path)
     text = wiring.nginx_conf_text(topo, CERT_DIR)
     assert "listen 80;" in text and "listen [::]:80;" in text
-    # the bare domain + all six fronted names share the one :80 server (ACME webroot + redirect)
+    # the bare domain + every fronted name share the one :80 server (ACME webroot + redirect)
     assert ("server_name sec.internal secsso.sec.internal secrouter.sec.internal "
-            "secagent.sec.internal secchat.sec.internal secassist.sec.internal "
-            "secrecorder.sec.internal;") in text
+            "secchat.sec.internal secrecorder.sec.internal;") in text
     assert "location /.well-known/acme-challenge/ {" in text
     assert "root /var/lib/secsuite/secproxy/acme;" in text
     assert "return 301 https://$host$request_uri;" in text
@@ -572,24 +564,16 @@ def test_write_addressing_secrouter_egress_path_override(tmp_path):
 
 # ── secrouter_oidc_config: security.oidc fragment for SecSSO issuer_mode: global ────────
 def test_secrouter_oidc_config_shape(tmp_path):
-    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier); secassist is in the suite
+    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier)
     oidc = wiring.secrouter_oidc_config(topo)
     assert oidc == {
         "issuer": "http://secsso.sec.internal:9000/",
         "audience": "secrouter",
         "jwksUri": "http://secsso.sec.internal:9000/application/o/secrouter/jwks/",
-        # SecAssist present → its svc account is trusted to skip MFA AND to delegate.
-        "serviceSubjects": ["svc-secagent", "svc-secassist"],
-        "delegatingSubjects": ["svc-secassist"],
+        # svc-secagent is SecAgent's non-interactive service account (client_credentials tokens
+        # can't carry an MFA assertion, so it's trusted to skip requireMfa).
+        "serviceSubjects": ["svc-secagent"],
     }
-
-
-def test_secrouter_oidc_config_without_secassist_has_no_delegation(tmp_path):
-    # Drop SecAssist → no delegatingSubjects, and svc-secassist is not a serviceSubject.
-    topo = _topo(tmp_path)
-    oidc = wiring.secrouter_oidc_config(topo, without=["secassist"])
-    assert oidc["serviceSubjects"] == ["svc-secagent"]
-    assert "delegatingSubjects" not in oidc
 
 
 def test_secrouter_oidc_config_empty_without_secsso(tmp_path):
@@ -676,20 +660,6 @@ def test_secagent_pi_models_json_against_real_shipped_example():
     assert "kimi" not in {k.lower() for k in result.get("providers", {})}
 
 
-# ── secagent_webhook_secret: cached-on-disk, redeploy-stable ─────────────────────────────
-def test_secagent_webhook_secret_persists_and_is_reused(tmp_path):
-    out = tmp_path / "out"
-    t1 = wiring.secagent_webhook_secret(out)
-    t2 = wiring.secagent_webhook_secret(out)
-    assert t1 == t2
-    assert (out / "secagent-webhook-secret").read_text().strip() == t1
-
-
-def test_secagent_webhook_secret_distinct_from_secllm_shared_token(tmp_path):
-    out = tmp_path / "out"
-    assert wiring.secagent_webhook_secret(out) != wiring.secllm_shared_token(out)
-
-
 # ── sync_secagent_service_secret: mirrors SecSSO's generated secret into secagent's env ──
 def test_sync_secagent_service_secret_fills_blank_value(tmp_path):
     secsso_env = tmp_path / "secsso.env"
@@ -721,18 +691,22 @@ def test_sync_secagent_service_secret_missing_secsso_secret_is_a_noop(tmp_path):
     assert "SECAGENT_CLIENT_SECRET=\n" in secrets_env.read_text()
 
 
-# ── env_for secassist branch + sync_secassist_env: turnkey SecAssist stack env ──
-def test_env_for_secassist_branch(tmp_path):
-    # GPU_SPLIT: secassist on 'core', no secproxy → plain ported http URLs (a fronted topology
-    # would front these on bare https:443 — same fronted logic every other peer URL follows).
+# ── env_for secchat branch + sync_secchat_env / sync_secsso_secchat_redirect: turnkey native
+#    SecChat stack env. secchat is the canonical chat component (a default-on stack) — the native
+#    rebuild that replaced BOTH prior chat components (team chat + governed AI chat) at cutover.
+#    Its OIDC client id stays `secchatng` (the retained Authentik client — users see "SecChat"). ──
+def test_env_for_secchat_branch_full(tmp_path):
+    # GPU_SPLIT (no secproxy/edge) → plain ported http URLs, including secchat's OWN url
+    # (SECCHAT_PUBLIC_URL) — the same peer_urls-by-self-key source every other peer URL uses.
     topo = _topo(tmp_path)
-    env = topo.env_for("secassist")
-    assert env["OPENID_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secassist/"
-    assert env["SECSSO_TOKEN_URL"] == "http://secsso.sec.internal:9000/application/o/token/"
-    assert env["SECROUTER_BASE_URL"] == "http://secrouter.sec.internal:47002"  # no /v1 — proxy adds it
-    assert env["DOMAIN_CLIENT"] == env["DOMAIN_SERVER"] == "http://secassist.sec.internal:3080"
-    assert env["SECASSIST_SVC_CLIENT_ID"] == "secassist-svc"
-    assert env["SECROUTER_SCOPE"] == "openid secrouter"
+    env = topo.env_for("secchat")
+    assert env["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
+    assert env["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
+    assert env["SECCHAT_OIDC_CLIENT_ID"] == "secchatng"
+    assert env["SECROUTER_URL"] == "http://secrouter.sec.internal:47002"
+    assert env["SECCHAT_PUBLIC_URL"] == "http://secchat.sec.internal:47010"
+    # the client secret is never topology-derived — sync_secchat_env mirrors it from SecSSO
+    assert "SECCHAT_OIDC_CLIENT_SECRET" not in env
 
 
 def _env_dict(path):
@@ -740,165 +714,118 @@ def _env_dict(path):
             for ln in path.read_text().splitlines() if "=" in ln and not ln.startswith("#")}
 
 
-def test_sync_secassist_env_mirrors_secrets_and_writes_topology(tmp_path):
+def test_sync_secchat_env_mirrors_secret_and_writes_topology(tmp_path):
     topo = _topo(tmp_path)
     secsso_env = tmp_path / "secsso.env"
-    secsso_env.write_text("SECASSIST_CLIENT_SECRET=login-abc\nSECASSIST_SVC_CLIENT_SECRET=svc-xyz\n")
-    # As the stack .env looks right after the generic seed randomized the blank mirror-targets;
-    # a topology key still at its .env.example placeholder; a per-instance secret to preserve.
-    secassist_env = tmp_path / "secassist.env"
-    secassist_env.write_text(
-        "OPENID_CLIENT_SECRET=RANDOMSEED\n"
-        "SECASSIST_SVC_CLIENT_SECRET=RANDOMSEED2\n"
-        "OPENID_ISSUER=https://secsso.sec.internal/application/o/secassist/\n"
-        "CREDS_KEY=keep-me\n"
-    )
-    written = wiring.sync_secassist_env(secsso_env, secassist_env, topo)
-    assert written is not None and "OPENID_CLIENT_SECRET" in written
-    vals = _env_dict(secassist_env)
-    # the mirrored secrets OVERWRITE the randomized seed — the whole reason this isn't blank-only
-    assert vals["OPENID_CLIENT_SECRET"] == "login-abc"
-    assert vals["SECASSIST_SVC_CLIENT_SECRET"] == "svc-xyz"
-    # topology env written (placeholder domain corrected to the real one + port)
-    assert vals["OPENID_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secassist/"
-    assert vals["SECROUTER_BASE_URL"] == "http://secrouter.sec.internal:47002"
-    # non-managed keys survive untouched
-    assert vals["CREDS_KEY"] == "keep-me"
-
-
-def test_sync_secassist_env_noop_without_secsso_secrets(tmp_path):
-    topo = _topo(tmp_path)
-    secsso_env = tmp_path / "secsso.env"
-    secsso_env.write_text("PG_PASS=x\n")  # no SECASSIST_* secrets provisioned yet
-    secassist_env = tmp_path / "secassist.env"
-    secassist_env.write_text("OPENID_CLIENT_SECRET=\n")
-    assert wiring.sync_secassist_env(secsso_env, secassist_env, topo) is None
-
-
-def test_sync_secassist_env_noop_when_files_missing(tmp_path):
-    topo = _topo(tmp_path)
-    assert wiring.sync_secassist_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
-
-
-# ── env_for secchatng branch + sync_secchatng_env: turnkey native-SecChat stack env ──
-# secchatng is EXPERIMENTAL (suite.toml) — every topology here goes through
-# _topo_with_secchatng(), which .include()s it, mirroring the --with secchatng opt-in a real
-# deploy needs before it's ever selected/placed at all.
-def test_env_for_secchatng_branch_full(tmp_path):
-    # Mirrors test_env_for_secassist_branch: GPU_SPLIT (no secproxy/edge) → plain ported http
-    # URLs, including secchatng's OWN url (SECCHAT_PUBLIC_URL) — the same peer_urls-by-self-key
-    # source secassist's DOMAIN_CLIENT/DOMAIN_SERVER use.
-    topo = _topo_with_secchatng(tmp_path)
-    env = topo.env_for("secchatng")
-    assert env["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
-    assert env["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
-    assert env["SECCHAT_OIDC_CLIENT_ID"] == "secchatng"
-    assert env["SECROUTER_URL"] == "http://secrouter.sec.internal:47002"
-    assert env["SECCHAT_PUBLIC_URL"] == "http://secchatng.sec.internal:47010"
-    # the client secret is never topology-derived — sync_secchatng_env mirrors it from SecSSO
-    assert "SECCHAT_OIDC_CLIENT_SECRET" not in env
-
-
-def test_sync_secchatng_env_mirrors_secret_and_writes_topology(tmp_path):
-    topo = _topo_with_secchatng(tmp_path)
-    secsso_env = tmp_path / "secsso.env"
+    # SecSSO keeps the retained secchatng-named client secret (its Authentik client id stays
+    # secchatng even though the app is now "SecChat").
     secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n")
     # As the stack .env looks right after the generic seed randomized the blank mirror-target; a
     # topology key still at its .env.example placeholder; a per-instance secret to preserve.
-    secchatng_env = tmp_path / "secchatng.env"
-    secchatng_env.write_text(
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text(
         "SECCHAT_OIDC_CLIENT_SECRET=RANDOMSEED\n"
         "SECCHAT_OIDC_ISSUER=https://secsso.sec.internal/application/o/secchatng/\n"
         "SECCHAT_SESSION_SECRET=keep-me\n"
     )
-    written = wiring.sync_secchatng_env(secsso_env, secchatng_env, topo)
+    written = wiring.sync_secchat_env(secsso_env, secchat_env, topo)
     assert written is not None and "SECCHAT_OIDC_CLIENT_SECRET" in written
-    assert written == sorted(wiring._SECCHATNG_MANAGED_KEYS)
-    vals = _env_dict(secchatng_env)
+    assert written == sorted(wiring._SECCHAT_MANAGED_KEYS)
+    vals = _env_dict(secchat_env)
     # the mirrored secret OVERWRITES the randomized seed — the whole reason this isn't blank-only
     assert vals["SECCHAT_OIDC_CLIENT_SECRET"] == "login-abc"
     # topology env written (placeholder domain corrected to the real one + port)
     assert vals["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
     assert vals["SECCHAT_OIDC_AUDIENCE"] == "secchatng"
     assert vals["SECCHAT_OIDC_CLIENT_ID"] == "secchatng"
-    assert vals["SECCHAT_PUBLIC_URL"] == "http://secchatng.sec.internal:47010"
+    assert vals["SECCHAT_PUBLIC_URL"] == "http://secchat.sec.internal:47010"
     assert vals["SECROUTER_URL"] == "http://secrouter.sec.internal:47002"
     # non-managed keys survive untouched
     assert vals["SECCHAT_SESSION_SECRET"] == "keep-me"
 
 
-def test_sync_secsso_secchatng_redirect_points_at_the_topology_callback(tmp_path):
-    # SecSSO's blueprint must register secchatng's redirect_uri for wherever secchatng ACTUALLY
-    # lives in this topology — not the sec.internal .env.example default. Overwrites both keys in
-    # secsso's .env from secchatng's own topology URL (the same one env_for gives SECCHAT_PUBLIC_URL,
-    # so the two sides agree by construction), and leaves everything else alone.
-    topo = _topo_with_secchatng(tmp_path)
+def test_sync_secchat_env_noop_without_secsso_secret(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("PG_PASS=x\n")  # no SECCHATNG_OIDC_CLIENT_SECRET provisioned yet
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_OIDC_CLIENT_SECRET=\n")
+    assert wiring.sync_secchat_env(secsso_env, secchat_env, topo) is None
+
+
+def test_sync_secchat_env_noop_when_files_missing(tmp_path):
+    topo = _topo(tmp_path)
+    assert wiring.sync_secchat_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
+
+
+def test_sync_secsso_secchat_redirect_points_at_the_topology_callback(tmp_path):
+    # SecSSO's blueprint must register SecChat's redirect_uri for wherever SecChat ACTUALLY lives
+    # in this topology — not the sec.internal .env.example default. Overwrites both keys in
+    # secsso's .env from SecChat's own topology URL (the same one env_for gives SECCHAT_PUBLIC_URL,
+    # so the two sides agree by construction), and leaves everything else alone. The SecSSO-side
+    # env var names stay SECCHATNG_* (the retained Authentik client).
+    topo = _topo(tmp_path)
     secsso_env = tmp_path / "secsso.env"
     secsso_env.write_text(
-        "SECCHATNG_REDIRECT_URI=https://secchatng.sec.internal/auth/callback\n"  # .env.example default
-        "SECCHATNG_LAUNCH_URL=https://secchatng.sec.internal\n"
+        "SECCHATNG_REDIRECT_URI=https://secchat.sec.internal/auth/callback\n"  # .env.example default
+        "SECCHATNG_LAUNCH_URL=https://secchat.sec.internal\n"
         "AUTHENTIK_SECRET_KEY=keep-me\n"
     )
-    written = wiring.sync_secsso_secchatng_redirect(secsso_env, topo)
+    written = wiring.sync_secsso_secchat_redirect(secsso_env, topo)
     assert written == ["SECCHATNG_LAUNCH_URL", "SECCHATNG_REDIRECT_URI"]
     vals = _env_dict(secsso_env)
-    assert vals["SECCHATNG_REDIRECT_URI"] == "http://secchatng.sec.internal:47010/auth/callback"
-    assert vals["SECCHATNG_LAUNCH_URL"] == "http://secchatng.sec.internal:47010"
-    # exactly secchatng's SECCHAT_PUBLIC_URL + /auth/callback — the SecChat side builds the identical
+    assert vals["SECCHATNG_REDIRECT_URI"] == "http://secchat.sec.internal:47010/auth/callback"
+    assert vals["SECCHATNG_LAUNCH_URL"] == "http://secchat.sec.internal:47010"
+    # exactly SecChat's SECCHAT_PUBLIC_URL + /auth/callback — the SecChat side builds the identical
     # callback, so redirect_uri matches by construction (this is the whole point)
     assert f'{vals["SECCHATNG_LAUNCH_URL"]}/auth/callback' == vals["SECCHATNG_REDIRECT_URI"]
     assert vals["AUTHENTIK_SECRET_KEY"] == "keep-me"  # untouched
 
 
-def test_sync_secsso_secchatng_redirect_noops_when_not_placed_or_env_missing(tmp_path):
-    p = tmp_path / "topology.toml"; p.write_text(GPU_SPLIT)
-    topo = Topology.load(p, _manifest())  # NOT .include(secchatng) → experimental, not in the topology
+def test_sync_secsso_secchat_redirect_noops_when_absent_or_env_missing(tmp_path):
+    # A manifest with no secchat at all → nothing to point the SSO redirect at.
+    crafted = (
+        'suite = "1"\n'
+        '[components.secrouter]\nrepo = "o/secrouter"\nref = "v1"\ntier = "gateway"\nport = 47002\n'
+        '[targets.fedora-fips]\nkind = "systemd-native"\n'
+    )
+    mpath = tmp_path / "suite.toml"; mpath.write_text(crafted)
+    tp = tmp_path / "topology.toml"
+    tp.write_text('domain = "sec.internal"\n[resources.core]\ntarget = "fedora-fips"\n'
+                  'address = "10.0.0.5"\n[groups.gateway]\nresource = "core"\n')
+    topo = Topology.load(tp, Manifest.load(mpath))
     secsso_env = tmp_path / "secsso.env"; secsso_env.write_text("X=1\n")
-    assert wiring.sync_secsso_secchatng_redirect(secsso_env, topo) is None  # nothing to point at
-    topo2 = _topo_with_secchatng(tmp_path)
-    assert wiring.sync_secsso_secchatng_redirect(tmp_path / "nope.env", topo2) is None  # no secsso .env
+    assert wiring.sync_secsso_secchat_redirect(secsso_env, topo) is None  # nothing to point at
+    topo2 = _topo(tmp_path)
+    assert wiring.sync_secsso_secchat_redirect(tmp_path / "nope.env", topo2) is None  # no secsso .env
 
 
-def test_sync_secchatng_env_refreshes_managed_keys_on_rerun_and_keeps_operator_extra(tmp_path):
+def test_sync_secchat_env_refreshes_managed_keys_on_rerun_and_keeps_operator_extra(tmp_path):
     # A redeploy must REFRESH every managed key (not just fill it once) while an operator-added
     # key outside the managed set survives untouched across both runs.
-    topo = _topo_with_secchatng(tmp_path)
+    topo = _topo(tmp_path)
     secsso_env = tmp_path / "secsso.env"
     secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=first-secret\n")
-    secchatng_env = tmp_path / "secchatng.env"
-    secchatng_env.write_text(
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text(
         "SECCHAT_OIDC_CLIENT_SECRET=\n"
         "SECCHAT_OIDC_ISSUER=https://stale.example/wrong\n"
         "OPERATOR_EXTRA=do-not-touch\n"
     )
-    first = wiring.sync_secchatng_env(secsso_env, secchatng_env, topo)
+    first = wiring.sync_secchat_env(secsso_env, secchat_env, topo)
     assert first is not None
-    vals1 = _env_dict(secchatng_env)
+    vals1 = _env_dict(secchat_env)
     assert vals1["SECCHAT_OIDC_CLIENT_SECRET"] == "first-secret"
     assert vals1["SECCHAT_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secchatng/"
     # SecSSO rotates/regenerates its secret (e.g. a fresh secsso deploy) between the two syncs —
     # the re-run must pick up the NEW value, not leave the stale mirrored one in place.
     secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=rotated-secret\n")
-    second = wiring.sync_secchatng_env(secsso_env, secchatng_env, topo)
+    second = wiring.sync_secchat_env(secsso_env, secchat_env, topo)
     assert second == first  # same key set both times
-    vals2 = _env_dict(secchatng_env)
+    vals2 = _env_dict(secchat_env)
     assert vals2["SECCHAT_OIDC_CLIENT_SECRET"] == "rotated-secret"
     assert vals2["SECCHAT_OIDC_ISSUER"] == vals1["SECCHAT_OIDC_ISSUER"]  # refreshed, still correct
     assert vals2["OPERATOR_EXTRA"] == "do-not-touch"  # untouched across both runs
-
-
-def test_sync_secchatng_env_noop_without_secsso_secret(tmp_path):
-    topo = _topo_with_secchatng(tmp_path)
-    secsso_env = tmp_path / "secsso.env"
-    secsso_env.write_text("PG_PASS=x\n")  # no SECCHATNG_OIDC_CLIENT_SECRET provisioned yet
-    secchatng_env = tmp_path / "secchatng.env"
-    secchatng_env.write_text("SECCHAT_OIDC_CLIENT_SECRET=\n")
-    assert wiring.sync_secchatng_env(secsso_env, secchatng_env, topo) is None
-
-
-def test_sync_secchatng_env_noop_when_files_missing(tmp_path):
-    topo = _topo_with_secchatng(tmp_path)
-    assert wiring.sync_secchatng_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
 
 
 def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):
@@ -916,48 +843,39 @@ def test_env_for_secagent_llm_points_at_secrouter(tmp_path):
     assert env["SECAGENT_LLM__MODEL"] == "auto"
 
 
-def test_env_for_secagent_secsso_and_mattermost(tmp_path):
+def test_env_for_secagent_secsso(tmp_path):
     topo = _topo(tmp_path)
     env = topo.env_for("secagent")
     assert env["SECAGENT_SECSSO__TOKEN_URL"] == \
         "http://secsso.sec.internal:9000/application/o/token/"
     assert env["SECAGENT_SECSSO__CLIENT_ID"] == "secagent"
-    assert env["SECAGENT_MATTERMOST__URL"] == "http://secchat.sec.internal:8065"
-    assert env["SECAGENT_MATTERMOST__TEAM"] == "secrouter"
     assert env["SECAGENT_AUDIT__ENABLED"] == "true"
-
-
-def test_env_for_secagent_webhook_secret_only_when_given(tmp_path):
-    topo = _topo(tmp_path)
-    assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET" not in topo.env_for("secagent")
-    env = topo.env_for("secagent", secagent_webhook_secret="whs-123")
-    assert env["SECAGENT_MATTERMOST__WEBHOOK_SECRET"] == "whs-123"
+    # secagent is an installed pi harness with no standing chat listener — no chat-bridge wiring
+    assert not any(k.startswith("SECAGENT_CHAT") or "__BOT_TOKEN" in k for k in env)
 
 
 def test_env_for_non_secagent_never_gets_secagent_only_keys(tmp_path):
     topo = _topo(tmp_path)
-    # NOTE: secrouter's env legitimately gets a generic "SECAGENT_URL" peer entry (secagent
-    # is just another addressable peer) — that's pre-existing, unrelated behavior. What must
-    # NOT leak onto a non-secagent component is the double-underscore-delimited, secagent
-    # pydantic-settings keys this feature adds.
-    env = topo.env_for("secrouter", secagent_webhook_secret="whs-123")
-    assert "SECAGENT_URL" in env  # sanity: the generic peer entry IS present
+    # secagent has no inbound port now (an installed harness, not a service), so it isn't even a
+    # peer URL — and the double-underscore secagent pydantic keys must never leak onto another
+    # component regardless.
+    env = topo.env_for("secrouter")
+    assert "SECAGENT_URL" not in env
     assert not any("__" in k and k.startswith("SECAGENT_") for k in env)
-    assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET" not in env
 
 
 # ── write_addressing: secagent env + secrouter-oidc.json integration ────────────────────
-def test_write_addressing_secagent_env_has_full_wiring(tmp_path):
-    topo = _topo(tmp_path)  # secagent + secrouter + secsso + secchat all on 'core'
+def test_write_addressing_secagent_env_has_llm_wiring(tmp_path):
+    topo = _topo(tmp_path)  # secagent + secrouter + secsso all on 'core'
     out = tmp_path / "out"
     written = wiring.write_addressing(topo, out, "core")
     text = Path(written["env"]["secagent"]).read_text()
     assert "SECAGENT_LLM__BASE_URL=http://secrouter.sec.internal:47002/v1" in text
-    assert "SECAGENT_MATTERMOST__WEBHOOK_SECRET=" in text
-    token_line = next(
-        ln for ln in text.splitlines() if ln.startswith("SECAGENT_MATTERMOST__WEBHOOK_SECRET=")
-    )
-    assert token_line.split("=", 1)[1] == wiring.secagent_webhook_secret(out)
+    assert "SECAGENT_LLM__API_KEY=!secagent token" in text
+    assert "SECAGENT_SECSSO__TOKEN_URL=http://secsso.sec.internal:9000/application/o/token/" in text
+    # no chat-bridge wiring, no webhook secret — secagent is an on-demand harness
+    assert "__WEBHOOK_SECRET=" not in text and "__BOT_TOKEN=" not in text
+    assert not (out / "secagent-webhook-secret").exists()
 
 
 def test_write_addressing_writes_secrouter_oidc_json(tmp_path):

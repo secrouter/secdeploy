@@ -353,7 +353,6 @@ class Topology:
     def env_for(
         self, component: str, without: list[str] | None = None, scheme: str = "https",
         *, secllm_token: str | None = None, secrouter_egress_file: str | None = None,
-        secagent_webhook_secret: str | None = None,
     ) -> dict[str, str]:
         """Environment for ``component``: its own identity plus every *other* peer's URL.
 
@@ -376,21 +375,16 @@ class Topology:
         topology-derived data, unlike everything else this method computes, and (like
         ``SECROUTER_SECLLM_ENDPOINTS``) only apply to ``component == "secrouter"``.
 
-        SecAgent gets its own dedicated block (``SECAGENT_LLM__*``/``SECAGENT_SECSSO__*``/
-        ``SECAGENT_MATTERMOST__*`` — secagent's pydantic-settings nested-env convention,
-        double-underscore-delimited, distinct from the generic ``<PEER>_URL`` keys above which
-        secagent's own config loader simply ignores): the LLM endpoint always points at
-        SecRouter (never directly at SecLLM, so chat-triggered inference stays governed/
-        audited), the SecSSO token endpoint and Mattermost URL are derived the same way as any
-        other peer URL, and a handful of suite-wide conventions are fixed (client_id
-        ``"secagent"``, team ``"secrouter"`` — matching secchat's own bootstrap script,
-        ``SECAGENT_LLM__API_KEY="!secagent token"`` — never a secret, a resolved-at-request-time
-        command, ``SECAGENT_LLM__MODEL="auto"`` — SecRouter's own catalog, NOT one of SecLLM's
-        model ids (a different namespace; confirmed live that SecRouter 502s a SecLLM-style id
-        like "balanced" as an unrecognized/misrouted provider), audit enabled).
-        ``secagent_webhook_secret``
-        (see ``wiring.secagent_webhook_secret``) is the one piece secagent needs that isn't
-        derivable from the topology, so — like ``secllm_token`` above — a caller supplies it.
+        SecAgent gets its own dedicated block (``SECAGENT_LLM__*``/``SECAGENT_SECSSO__*`` —
+        secagent's pydantic-settings nested-env convention, double-underscore-delimited, distinct
+        from the generic ``<PEER>_URL`` keys above which secagent's own config loader simply
+        ignores): the LLM endpoint always points at SecRouter (never directly at SecLLM, so
+        agent-triggered inference stays governed/audited), the SecSSO token endpoint is derived
+        the same way as any other peer URL, and a handful of suite-wide conventions are fixed
+        (client_id ``"secagent"``, ``SECAGENT_LLM__API_KEY="!secagent token"`` — never a secret, a
+        resolved-at-request-time command, ``SECAGENT_LLM__MODEL="auto"`` — SecRouter's own catalog,
+        NOT one of SecLLM's model ids (a different namespace; confirmed live that SecRouter 502s a
+        SecLLM-style id like "balanced" as an unrecognized/misrouted provider), audit enabled).
         """
         c = self.manifest.components[component]
         env: dict[str, str] = {"SEC_DOMAIN": self.domain, "SELF_FQDN": self.fqdn(component)}
@@ -416,11 +410,7 @@ class Topology:
             secsso_url = peer_urls.get("SECSSO")
             if secsso_url:
                 env["SECAGENT_SECSSO__TOKEN_URL"] = f"{secsso_url}/application/o/token/"
-            secchat_url = peer_urls.get("SECCHAT")
-            if secchat_url:
-                env["SECAGENT_MATTERMOST__URL"] = secchat_url
             env["SECAGENT_SECSSO__CLIENT_ID"] = "secagent"
-            env["SECAGENT_MATTERMOST__TEAM"] = "secrouter"
             env["SECAGENT_LLM__API_KEY"] = "!secagent token"
             # "auto" (SecRouter's own routing policy picks the backend) — NOT "balanced", a
             # SecLLM catalog id from a different namespace that doesn't exist in SecRouter's
@@ -431,39 +421,18 @@ class Topology:
             # in its real /v1/models).
             env["SECAGENT_LLM__MODEL"] = "auto"
             env["SECAGENT_AUDIT__ENABLED"] = "true"
-            if secagent_webhook_secret:
-                env["SECAGENT_MATTERMOST__WEBHOOK_SECRET"] = secagent_webhook_secret
-        if component == "secassist":
-            # SecAssist (LibreChat) reads plain env keys (its own + the auth proxy's), not a
-            # nested convention. The proxy dials SecRouter (SECROUTER_BASE_URL, no /v1 — the
-            # request path carries it) and fetches its service token from SecSSO; LibreChat
-            # discovers OIDC from this app's per-provider issuer and uses its own external URL
-            # (DOMAIN_*) for the OIDC callback/cookies. Two client secrets are NOT set here —
-            # they're mirrored from SecSSO's generated .env by wiring.sync_secassist_env.
-            secrouter_url = peer_urls.get("SECROUTER")
-            if secrouter_url:
-                env["SECROUTER_BASE_URL"] = secrouter_url
-            secsso_url = peer_urls.get("SECSSO")
-            if secsso_url:
-                env["OPENID_ISSUER"] = f"{secsso_url}/application/o/secassist/"
-                env["SECSSO_TOKEN_URL"] = f"{secsso_url}/application/o/token/"
-            self_url = peer_urls.get("SECASSIST")
-            if self_url:
-                env["DOMAIN_CLIENT"] = self_url
-                env["DOMAIN_SERVER"] = self_url
-            env["SECASSIST_SVC_CLIENT_ID"] = "secassist-svc"
-            env["SECROUTER_SCOPE"] = "openid secrouter"
-        if component == "secchatng":
-            # The native SecChat rebuild reads plain SECCHAT_* env. Its ONLY trust root for user
-            # tokens is SecSSO's per-provider issuer (JWKS discovered from it); the audience AND
-            # client id are both its own OIDC client id (secchatng's backend runs the Authorization
-            # Code + PKCE dance itself, server-side — a BFF, see secsso/blueprints/secchatng.yaml).
-            # The assistant path routes model calls through SecRouter (governed + audited), never
-            # straight at SecLLM. DATABASE_URL is derived in compose from the auto-seeded
-            # PG_PASSWORD, so it isn't set here. SECCHAT_OIDC_CLIENT_SECRET is NOT set here either
-            # — like secassist's OPENID_CLIENT_SECRET, it's mirrored from SecSSO's generated .env
-            # by wiring.sync_secchatng_env (SecSSO's SECCHATNG_OIDC_CLIENT_SECRET), not derived
-            # from the topology.
+        if component == "secchat":
+            # The native SecChat reads plain SECCHAT_* env. Its ONLY trust root for user tokens is
+            # SecSSO's per-provider issuer (JWKS discovered from it); the audience AND client id are
+            # both its OIDC client id, which stays `secchatng` — the retained Authentik client from
+            # the rebuild's transitional phase (re-provisioning it would rotate the secret for no
+            # user-visible gain; users only ever see "SecChat"). SecChat's backend runs the
+            # Authorization Code + PKCE dance itself, server-side — a BFF, see
+            # secsso/blueprints/secchatng.yaml. The assistant path routes model calls through
+            # SecRouter (governed + audited), never straight at SecLLM. DATABASE_URL is derived in
+            # compose from the auto-seeded PG_PASSWORD, so it isn't set here. SECCHAT_OIDC_CLIENT_
+            # SECRET is NOT set here either — it's mirrored from SecSSO's generated .env by
+            # wiring.sync_secchat_env (SecSSO's SECCHATNG_OIDC_CLIENT_SECRET), not topology-derived.
             secsso_url = peer_urls.get("SECSSO")
             if secsso_url:
                 env["SECCHAT_OIDC_ISSUER"] = f"{secsso_url}/application/o/secchatng/"
@@ -472,11 +441,10 @@ class Topology:
             secrouter_url = peer_urls.get("SECROUTER")
             if secrouter_url:
                 env["SECROUTER_URL"] = secrouter_url
-            # Own fronted external URL — same peer_urls-by-self-key source secassist's env_for
-            # branch uses for DOMAIN_CLIENT/DOMAIN_SERVER above. Used to build the OIDC redirect
-            # URI (<SECCHAT_PUBLIC_URL>/auth/callback) and to decide the session cookie's Secure
-            # flag (see secchat's src/config.ts).
-            self_url = peer_urls.get("SECCHATNG")
+            # Own fronted external URL — the peer_urls-by-self-key source. Used to build the OIDC
+            # redirect URI (<SECCHAT_PUBLIC_URL>/auth/callback) and to decide the session cookie's
+            # Secure flag (see secchat's src/config.ts).
+            self_url = peer_urls.get("SECCHAT")
             if self_url:
                 env["SECCHAT_PUBLIC_URL"] = self_url
         return env

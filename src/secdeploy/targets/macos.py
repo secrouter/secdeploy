@@ -49,9 +49,9 @@ PLAN = [
     "(--configure-resolver) Point /etc/resolver/<domain> at the now-running SecDNS (sudo)",
     "(--with-inference) Install SecLLM as a launchd daemon (SECLLM_BACKEND=mlx — Apple's "
     "mlx-lm, real local inference — falling back to mock if mlx-lm isn't installed)",
-    "(--with-agent) Install SecAgent's chat bridge as a launchd daemon (env layered from the "
-    "generated addressing env + deploy/macos/secrets.env), then run `secagent init` to wire "
-    "up pi + the secagent CLI for the deploying user (OAuth, not a stored secret)",
+    "(--with-agent) Install secagent as an on-demand pi harness (MR review / analysis / testgen "
+    "— CLI / CI / MCP, not a standing service), then run `secagent init` to wire up pi + the "
+    "secagent CLI for the deploying user (OAuth, not a stored secret)",
     "(--with-agent) Install the pinned LeanCTX binary + pi extension and wire pi for context "
     "compression (air-gapped: no update phone-home; best-effort — see secagent docs/leanctx.md)",
     "Install SecRecorder as a launchd daemon (native MLX/Metal; --tls issues a SecCert cert via "
@@ -506,10 +506,10 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     # the user-owned checkout. Respects --without; a component with no checkout/pyproject is
     # skipped (secllm/secagent aren't in every build).
     without = without or []
-    # secagent's `chat serve` (the Mattermost bridge deployed here) needs fastapi/uvicorn, which
-    # live behind the `review` extra (named for the UC100 review-webhook server that shares the
-    # same optional dependency — see secagent/chat/webhook.py's module docstring). Without it,
-    # secagent starts, imports the chat module, and crash-loops on ModuleNotFoundError.
+    # secagent's UC100 MR-review webhook server + its MCP servers need fastapi/uvicorn, which live
+    # behind the `review` extra. Install it even though secdeploy runs secagent as an on-demand
+    # harness (CLI / CI / MCP), not a standing service, so those modules import cleanly when invoked
+    # rather than crash-looping on ModuleNotFoundError.
     # secllm's `mlx` extra is Apple Silicon's real inference engine (mlx-lm) — vllm never
     # installs here (GPU/Linux only), so without this it's stuck on SECLLM_BACKEND=mock.
     extra_args = {"secagent": ["--extra", "review"], "secllm": ["--extra", "mlx"]}
@@ -525,7 +525,7 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     # pi (the agent runtime secagent's tools/skills plug into — see work/secagent/docs/pi.md) is
     # a global npm tool, not part of secagent's own checkout/venv. Optional: secagent's own
     # install.sh treats a missing npm the same way (installs everything else, warns, continues)
-    # since pi is only needed for interactive use, never for secagent's own chat/review services.
+    # since pi is only needed for interactive use, never for secagent's own review/MCP servers.
     if "secagent" not in without:
         if P.which("npm"):
             P.run(["npm", "install", "-g", "@earendil-works/pi-coding-agent"], check=False)
@@ -900,41 +900,26 @@ def deploy(
                        "deploy, or set it to match work/secsso/.env's "
                        "SECAGENT_SERVICE_CLIENT_SECRET yourself.")
 
-    # SecAssist (LibreChat stack) turnkey env: mirror SecSSO's two generated OIDC secrets and
-    # write the topology-derived OIDC/gateway env into work/secassist/.env BEFORE the stacks
-    # bring-up seeds it (same early-seed trick as the secagent mirror above — secsso deploys
+    # Native SecChat (a compose stack) turnkey env: mirror SecSSO's generated OIDC login-client
+    # secret and write the topology-derived OIDC/gateway env into work/secchat/.env BEFORE the
+    # stacks bring-up seeds it (same early-seed trick as the secagent mirror above — secsso deploys
     # last in the sorted stack order, too late otherwise). Needs SecSSO in the topology (an
     # external IdP means the operator supplies these). Single-host mode configures manually.
-    if not dry_run and topology is not None and placed and "secassist" in placed \
-            and "secassist" not in (without or []) and "secsso" in placed \
+    if not dry_run and topology is not None and placed and "secchat" in placed \
+            and "secchat" not in (without or []) and "secsso" in placed \
             and "secsso" not in (without or []):
-        common.ensure_stack_secrets(work, ["secsso", "secassist"])
+        common.ensure_stack_secrets(work, ["secsso", "secchat"])
+        redir = wiring.sync_secsso_secchat_redirect(work / "secsso" / ".env", topology, without)
+        if redir:
+            P.log("secsso: pointed the SecChat OIDC client at its topology callback "
+                  "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
         # NB: a distinct name — NOT `written` — so this doesn't clobber the addressing dict from
         # write_addressing() above, which the deploy-audit call below still needs as `addressing=`.
-        written_secassist = wiring.sync_secassist_env(
-            work / "secsso" / ".env", work / "secassist" / ".env", topology, without)
-        if written_secassist:
-            P.log(f"secassist: synced OIDC secrets + topology env → work/secassist/.env "
-                  f"({len(written_secassist)} keys)")
-
-    # Native SecChat (secchatng, EXPERIMENTAL — only placed when the operator passed
-    # `--with secchatng`) turnkey env: mirror SecSSO's generated OIDC login-client secret and
-    # write the topology-derived OIDC/gateway env into work/secchatng/.env BEFORE the stacks
-    # bring-up seeds it — same early-seed trick as the secassist mirror above (secsso deploys
-    # last in the sorted stack order, too late otherwise). Needs SecSSO in the topology.
-    if not dry_run and topology is not None and placed and "secchatng" in placed \
-            and "secchatng" not in (without or []) and "secsso" in placed \
-            and "secsso" not in (without or []):
-        common.ensure_stack_secrets(work, ["secsso", "secchatng"])
-        redir = wiring.sync_secsso_secchatng_redirect(work / "secsso" / ".env", topology, without)
-        if redir:
-            P.log(f"secsso: pointed the secchatng OIDC client at its topology callback "
-                  f"(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
-        written_secchatng = wiring.sync_secchatng_env(
-            work / "secsso" / ".env", work / "secchatng" / ".env", topology, without)
-        if written_secchatng:
-            P.log(f"secchatng: synced OIDC secret + topology env → work/secchatng/.env "
-                  f"({len(written_secchatng)} keys)")
+        written_secchat = wiring.sync_secchat_env(
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without)
+        if written_secchat:
+            P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
+                  f"({len(written_secchat)} keys)")
 
     # Declared end-user accounts → SecSSO. Render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) BEFORE the stacks bring-up so
@@ -951,45 +936,15 @@ def deploy(
         else:
             P.log(f"secsso: {len(users)} declared user(s) already provisioned (passwords unchanged)")
 
-    # secagent — opt-in chat bridge, now with REAL env layering: the generated addressing env
-    # (LLM/SecSSO/Mattermost wiring + webhook secret) + the SECAGENT_* operator secrets are folded
-    # into the launchd job's EnvironmentVariables — the macOS equivalent of fedora's two
-    # EnvironmentFile= layers, closing the old "source it yourself" eval gap. Runs as the user.
+    # secagent (opt-in, --with-agent): secagent is INSTALLED as an on-demand pi harness — MR review
+    # / code analysis / testgen / docs, driven by CLI / CI / MCP — NOT run as a standing service
+    # (the native SecChat's own runner daemon provides standing chat-ops now). So there's no launchd
+    # job here; the pi + secagent-CLI wiring for the deploying user happens in the `secagent init`
+    # block below. All we install at deploy time is the pi-side context-compression wiring.
     if with_agent and topology is not None and _here("secagent"):
         # LeanCTX (secagent v0.3.0 ships it on by default): install the pinned binary + pi
         # extension and wire pi for context compression on this box — air-gapped, best-effort.
         _wire_leanctx_for_pi(dry_run)
-        # Listen on secagent's MANIFEST port (fronted by secproxy at that port) — not the CLI's
-        # own 8070 default — so the secagent.<domain> reverse-proxy route actually reaches it
-        # (secproxy dials the topology port). Mirrors secllm using its manifest port above.
-        port = manifest.components["secagent"].port
-        agent_env = _parse_env_file(base_out / "addressing" / "env" / "secagent.env")
-        agent_secrets = {k: v for k, v in
-                         _parse_env_file(root / "deploy" / "macos" / "secrets.env").items()
-                         if k.startswith("SECAGENT_")}
-        fallback = (f"uv run --project work/secagent secagent chat serve --port {port} "
-                    "(source out/addressing/env/secagent.env first)")
-        if not dry_run and native_services and not _ensure_native_venv(root, "secagent"):
-            P.warn(f"secagent: no project venv — run `secdeploy build macos`, then start it: {fallback}")
-        else:
-            # secagent's SecSSO calls (secsso.py) go through httpx, which bundles its own CA
-            # list (certifi) rather than using the macOS System keychain — so --trust-ca
-            # trusting SecCert's root there does NOTHING for secagent/pi's own TLS validation
-            # (confirmed live: CERTIFICATE_VERIFY_FAILED even with the root already trusted
-            # system-wide). Point httpx at the same root directly instead.
-            root_pem = root / "out" / "seccert-root.pem"
-            tls_env = {"SSL_CERT_FILE": str(root_pem), "REQUESTS_CA_BUNDLE": str(root_pem)} \
-                if root_pem.exists() else {}
-            secagent = launchd.LaunchdService(
-                name="secagent",
-                program_args=[str(_venv_bin(root, "secagent", "secagent")), "chat", "serve",
-                              "--port", str(port)],
-                log_dir=log_dir,
-                env={**_base_env(home), **agent_env, **agent_secrets, **tls_env},
-                working_dir=str(root), user=user,
-            )
-            _install_or_note(secagent, staging_dir, native_services=native_services,
-                             dry_run=dry_run, fallback_note=fallback)
 
         # `secagent` onto PATH globally via `uv tool install` — mirrors secagent's own
         # install.sh (docs/installation.md), just pointed at the ALREADY-fetched local
@@ -1020,10 +975,11 @@ def deploy(
         # directly — WRONG here, where secproxy fronts everything on :443 with no port in the
         # FQDN (confirmed live: https://secrouter.sec.internal:47002/v1 doesn't even speak TLS,
         # only plain HTTP does). Pass the ALREADY-CORRECT fronted URLs explicitly instead of
-        # letting it re-derive its own — the exact same SECAGENT_LLM__BASE_URL/SECSSO_URL the
-        # chat bridge above just got wired with, so pi and the chat service agree on how this
-        # topology is actually reachable. Non-fatal: a developer who doesn't want pi shouldn't
+        # letting it re-derive its own — the same SECAGENT_LLM__BASE_URL/SECSSO_URL secdeploy
+        # generated into the addressing env from this topology, so pi dials the suite exactly the
+        # way it's actually reachable here. Non-fatal: a developer who doesn't want pi shouldn't
         # have their deploy fail over it.
+        agent_env = _parse_env_file(base_out / "addressing" / "env" / "secagent.env")
         secagent_bin = _venv_bin(root, "secagent", "secagent")
         secrouter_url = agent_env.get("SECAGENT_LLM__BASE_URL", "")
         secsso_url = agent_env.get("SECSSO_URL", "")
@@ -1159,16 +1115,14 @@ def deploy(
                     if manifest.components[n].kind == "stack" and n not in without) \
         if topology is not None else []
     if stacks and not dry_run:
-        # Both stacks run NATIVE arm64 on Apple Silicon now: SecChat builds a native Mattermost
-        # image from the official release binary on first bring-up (Mattermost's published image is
-        # amd64-only, but its release BINARY ships arm64 too — see secchat/Dockerfile), and SecSSO's
-        # Authentik/Postgres/Redis are multi-arch. So no QEMU/Rosetta emulation. The only cost is
-        # SecChat's first build (download + build, a few minutes, one-time + cached); the bring-up
-        # is detached, so a slow first run isn't a dead end.
-        P.warn("bringing up SecSSO/SecChat (native arm64 — no emulation): SecChat builds its "
-               "Mattermost image from the official binary on first run (a few minutes, one-time). "
-               "The bring-up is detached + safe to Ctrl-C; finish/redo bot+team setup any time "
-               "with `bash work/secchat/bootstrap/secchat.sh bot`.")
+        # SecChat is a Node/TS + Postgres compose stack; it builds its own small image from the
+        # repo on first bring-up (a couple of minutes, one-time + cached), and SecSSO's Authentik/
+        # Postgres/Redis are multi-arch. Both run NATIVE arm64 on Apple Silicon — no QEMU/Rosetta
+        # emulation. The bring-up is detached, so a slow first run isn't a dead end.
+        P.warn("bringing up SecSSO/SecChat (native arm64 — no emulation): SecChat builds its image "
+               "from the repo on first run (a couple of minutes, one-time). The bring-up is "
+               "detached + safe to Ctrl-C; reprint the SSO/gateway wiring or (re)start any time "
+               "with `bash work/secchat/bootstrap/secchat.sh up`.")
     if stacks:
         common.deploy_stacks(work, stacks, dry_run=dry_run)
 
@@ -1239,8 +1193,8 @@ def _secproxy_setup_actions(
         )
     if "secchat" in placed:
         actions.append(
-            "Finish SecChat's bot + team setup (safe to re-run): "
-            "<code>bash work/secchat/bootstrap/secchat.sh bot</code>."
+            "Reprint SecChat's SSO + gateway wiring, or (re)build/start it (safe to re-run): "
+            "<code>bash work/secchat/bootstrap/secchat.sh up</code>."
         )
     if "secagent" in placed and not (Path.home() / ".secagent" / "auth" / "user-token.json").exists():
         # `secagent init` (see the with_agent block above) already wrote ~/.pi/agent/models.json
@@ -1435,7 +1389,7 @@ def teardown_plan(found: MacosFound, purge: bool) -> list[common.Step]:
     steps.append(common.Step(
         "any native service started in the FOREGROUND (--no-native-services, or a manual run) has "
         "no launchd unit to target — Ctrl-C its terminal; `pgrep -fl 'secdns serve|secllm serve|"
-        "secagent chat|nginx'` to check before any pkill", None, "native_services",
+        "nginx'` to check before any pkill", None, "native_services",
     ))
 
     # 3. /etc/resolver/<domain> — only when unambiguous (an explicit --topology hint that
@@ -1485,7 +1439,7 @@ def teardown_plan(found: MacosFound, purge: bool) -> list[common.Step]:
     if purge and found.out_exists:
         steps.append(common.Step(
             f"IRREVERSIBLE — {found.root / 'out'} also caches seccert-root.pem and the "
-            "secllm-shared-token/secagent-webhook-secret used by any OTHER live deploy that "
+            "secllm-shared-token used by any OTHER live deploy that "
             "shares this --out — copy it aside first if one does",
             None, "artifacts",
         ))
@@ -1598,8 +1552,8 @@ def _secsuite_volumes() -> list[str]:
 
 def _macos_root_secret_paths(root: Path) -> list[str]:
     """``root``-relative paths of the cached secrets a deploy leaves on the host: any token/
-    secret/PEM file directly under ``out/`` (secllm-*-token, secagent-webhook-secret,
-    seccert-root.pem), ``out/addressing`` (generated egress creds), and
+    secret/PEM file directly under ``out/`` (secllm-*-token, seccert-root.pem),
+    ``out/addressing`` (generated egress creds), and
     ``deploy/macos/secrets.env`` (HF_TOKEN). Only the ones that exist — so the ``tar`` step's
     explicit path list never names a missing file."""
     rels: list[str] = []
@@ -1801,7 +1755,7 @@ def restore(
         manifest_json = None
     if not P.confirm(
         "restore OVERWRITES this host's suite state — the SecCert CA volume, the cached tokens, "
-        "and the Authentik/Mattermost/LibreChat databases — with the archive's contents. This "
+        "and the Authentik/SecChat databases — with the archive's contents. This "
         "cannot be undone. Proceed?", assume_yes,
     ):
         P.warn("restore aborted — nothing changed")
