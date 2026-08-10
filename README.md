@@ -16,13 +16,13 @@ stack up on each supported target — from a single command, air-gap friendly.
 | [SecLLM](https://github.com/secrouter/secllm) | Local inference (vLLM control plane) | service | GPU |
 | [SecRouter](https://github.com/secrouter/secrouter) | Governed AI gateway | service | |
 | [SecAgent](https://github.com/secrouter/secagent) | Agentic harness (pi) | service | |
-| [SecChat](https://github.com/secrouter/secchat) | Team chat + chat-ops (Mattermost) | stack | |
+| [SecChat](https://github.com/secrouter/secchat) | Native auditable team + agentic chat | stack | |
 | [SecRecorder](https://github.com/secrouter/secrecorder) | Transcription | service | |
 
 The compatible versions for a release live in [`suite.toml`](suite.toml) — the manifest.
 Deploying a suite version gives you *exactly* that combination on any target. **`service`**
-components build from pinned source; **`stack`** components are Compose deploys of upstream
-projects (Authentik, Mattermost).
+components build from pinned source; **`stack`** components are Compose deploys (SecSSO wraps
+upstream Authentik; SecChat is a native Node/TS + Postgres build).
 
 ### Optional infrastructure
 
@@ -59,7 +59,7 @@ secdeploy deploy fedora-fips --resource core # no flags needed — secsite.toml 
 `secsite.toml` carries placement (what `topology.toml` always carried) plus the deploy options
 that used to be CLI-flags-only (`--without`, `--with-inference`, `--with-agent`, macOS's
 `--tls`/`--trust-ca`/…), so a routine deploy needs no flags at all; the `configure` wizard also
-offers to seed operator secrets (SecCert's admin token, SecAgent's Mattermost bot token, …) into
+offers to seed operator secrets (SecCert's admin token, SecAgent's SecSSO client secret, …) into
 the gitignored `*.env` files. See [docs/secsite.md](docs/secsite.md) and
 [secsite.toml.example](secsite.toml.example) for the full picture, or
 [docs/topology.md](docs/topology.md) for the placement model alone (a bare `topology.toml` still

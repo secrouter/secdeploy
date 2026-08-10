@@ -18,7 +18,6 @@ This module is written to also be callable by an image builder (Proxmox qcow2/LX
 
 from __future__ import annotations
 
-import json
 import platform
 import shutil
 import tempfile
@@ -41,21 +40,22 @@ ETC = Path("/etc/secsuite")
 VAR = Path("/var/lib/secsuite")
 UNITS = Path("/etc/systemd/system")
 ANCHORS = Path("/etc/pki/ca-trust/source/anchors")
-# Native systemd services, in start order. secdns (internal DNS) comes up first when a
-# topology places it here; it is only deployed with a topology (it needs a generated zone).
-# secllm (local inference) likewise only stands up with a topology, and additionally needs
-# --with-inference (it's a heavyweight GPU service, so standing it up is opt-in — see deploy()).
-# secagent (chat-ops) follows the exact same split as secllm: standing up the SERVICE (this
-# tuple, the pi/systemd install steps below) needs --with-agent, but the generated wiring
-# itself (write_addressing's secagent branch, in wiring.py/topology.py) is placement-only,
-# unconditional on the flag — a redeploy that later turns --with-agent on picks up an env
-# that was already being generated (harmlessly unused) rather than appearing from nothing.
-# secproxy (the edge reverse proxy) follows the same topology-only rule as secdns — no
-# --with-* flag, since it's the suite's default front door once a topology exists (see
-# _include below). It's last in this tuple: nginx's SecCert-issued cert is minted at deploy time
-# and its Host-routed server blocks depend on secdns for name resolution, so it makes sense for
-# it to come up after its backends here — though the REAL start ordering is enforced by
-# secproxy.service's own After=, not by this tuple (which only orders the install loops below).
+# Native components installed here, in start order. Every one but secagent is a systemd service;
+# secagent is the exception — it is INSTALLED as an on-demand pi harness (MR review / code
+# analysis / testgen / docs, driven by CLI / CI / MCP), never run as a standing service, so it
+# gets no unit (the unit-install loop below skips it — see the secagent harness block in
+# _deploy_steps). secdns (internal DNS) comes up first when a topology places it here; it is only
+# deployed with a topology (it needs a generated zone). secllm (local inference) likewise only
+# stands up with a topology, and additionally needs --with-inference (it's a heavyweight GPU
+# service, so standing it up is opt-in — see deploy()). secagent likewise needs --with-agent —
+# UNLIKE secllm, its generated wiring is ALSO gated by the flag; a redeploy that later turns
+# --with-agent on installs the harness (pi + `secagent init`) rather than a running service.
+# secproxy (the edge reverse proxy) follows the same topology-only rule as secdns — no --with-*
+# flag, since it's the suite's default front door once a topology exists (see _include below).
+# It's last in this tuple: nginx's SecCert-issued cert is minted at deploy time and its
+# Host-routed server blocks depend on secdns for name resolution, so it makes sense for it to
+# come up after its backends here — though the REAL start ordering is enforced by secproxy.
+# service's own After=, not by this tuple (which only orders the install loops below).
 SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder", "secproxy")
 SECDNS_ZONE = VAR / "secdns" / "secdns.zone"  # where the secdns service reads its zone
 SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_EGRESS_FILE target
@@ -63,12 +63,6 @@ SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_E
 # secrouter.env via a SECOND EnvironmentFile= in secrouter.service (see that unit + deploy()
 # below), a DISTINCT path from ETC/secrouter.env so it never clobbers the operator's config.
 SECROUTER_ADDRESSING_ENV = ETC / "secrouter-addressing.env"
-# Same two-file layering for secagent (see secagent.service) — generated LLM/SecSSO/Mattermost
-# wiring + webhook secret, distinct from the operator-filled ETC/secagent.env.
-SECAGENT_ADDRESSING_ENV = ETC / "secagent-addressing.env"
-# pi's system-wide models.json for the secsuite-secagent service user (HOME=VAR/secagent, per
-# its useradd --home-dir below) — the SERVICE (api-key) auth mode; see wiring.secagent_pi_models_json.
-SECAGENT_PI_MODELS = VAR / "secagent" / ".pi" / "agent" / "models.json"
 # Where secproxy reads its generated nginx config — installed from addr_dir/secproxy.nginx.conf
 # (wiring.write_addressing's "nginx_conf" output). No secret in it (unlike SecLLM's admin token),
 # so — like the secdns zone — it's refreshed unconditionally on every deploy, never test -f
@@ -317,33 +311,32 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
             f"install generated secrouter addressing env → {SECROUTER_ADDRESSING_ENV} "
             "(pool/token/egress-file — layered onto secrouter.env via systemd EnvironmentFile=)",
         ))
-    # secagent (--with-agent) — pi (the agent runtime) is a global npm tool, not part of any
-    # pinned checkout; install it alongside secagent's own code. Then the generated addressing
-    # env (LLM/SecSSO/Mattermost wiring + webhook secret), layered onto secagent.env via a
-    # second EnvironmentFile= exactly like secrouter's above — always refreshed, fully derived.
-    # Finally pi's own models.json (service api-key auth — see wiring.secagent_pi_models_json),
-    # installed under the service user's HOME (VAR/secagent/.pi/agent), also always refreshed.
-    if "secagent" in services and addr_dir is not None:
+    # secagent (--with-agent) — Option A: secagent is INSTALLED as an on-demand pi harness (MR
+    # review / code analysis / testgen / docs — driven by CLI / CI / MCP), NOT run as a standing
+    # service, so there is no secagent.service unit (the unit-install loop below skips it). pi (the
+    # agent runtime) is a global npm tool, not part of any pinned checkout; install it alongside
+    # secagent's own code/venv (copied to OPT above). Then wire pi + the secagent CLI for the
+    # deploying user: `secagent init` writes ~/.pi/agent/models.json + ~/.secagent/config.yaml
+    # using `!secagent token --user` as the credential (never a stored secret), pointed at THIS
+    # topology's SecRouter/SecSSO (passed explicitly rather than letting it re-derive raw-port
+    # guesses that miss a fronted :443 topology). Non-fatal — a box without the built venv shouldn't
+    # fail the whole deploy; `secagent login` (device-code, approved in a browser) comes after.
+    if "secagent" in services and topology is not None:
         steps.append((
             ["npm", "install", "-g", "@earendil-works/pi-coding-agent"],
             "install pi (coding agent runtime) globally",
         ))
+        secagent_bin = OPT / "secagent" / ".venv" / "bin" / "secagent"
+        init = f"{secagent_bin} init --domain {topology.domain}"
+        urls = topology.urls(without)
+        if urls.get("SECROUTER"):
+            init += f" --secrouter-url {urls['SECROUTER']}/v1"
+        if urls.get("SECSSO"):
+            init += f" --secsso-url {urls['SECSSO']}"
         steps.append((
-            ["install", "-m", "640", str(addr_dir / "env" / "secagent.env"),
-             str(SECAGENT_ADDRESSING_ENV)],
-            f"install generated secagent addressing env → {SECAGENT_ADDRESSING_ENV} "
-            "(LLM/SecSSO/Mattermost wiring + webhook secret — layered via systemd EnvironmentFile=)",
-        ))
-        steps.append((
-            ["install", "-d", "-m", "750", "-o", "secsuite-secagent", "-g", "secsuite-secagent",
-             str(SECAGENT_PI_MODELS.parent)],
-            f"pi config dir {SECAGENT_PI_MODELS.parent}",
-        ))
-        steps.append((
-            ["bash", "-c", f"test -f {addr_dir}/secagent-pi-models.json && "
-             f"install -m 644 -o secsuite-secagent -g secsuite-secagent "
-             f"{addr_dir}/secagent-pi-models.json {SECAGENT_PI_MODELS} || true"],
-            f"install pi models.json (service api-key auth) → {SECAGENT_PI_MODELS}",
+            ["bash", "-c", f"{init} || echo 'secagent init did not complete — run it yourself "
+             "once the venv is built, then `secagent login`'"],
+            f"wire pi + the secagent CLI for the deploying user ({init}); then `secagent login`",
         ))
     # secproxy needs the nginx RUNTIME + certbot. Unlike every other entry in SERVICES, there is
     # no secproxy source checkout to build here — nginx is an upstream package (see secproxy's
@@ -394,8 +387,11 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
         ))
         if topology is not None:
             steps += _issue_secproxy_cert(topology, without)
-    # units — only the selected services, plus the suite target
+    # units — only the selected services, plus the suite target. secagent is skipped: it's an
+    # installed pi harness (see its block above), not a systemd service, so it ships no unit.
     for svc in services:
+        if svc == "secagent":
+            continue
         steps.append((["install", "-m", "644", str(unit_dir / f"{svc}.service"), f"{UNITS}/"],
                       f"install {svc}.service"))
     steps.append((["install", "-m", "644", str(unit_dir / "secsuite.target"), f"{UNITS}/"],
@@ -497,16 +493,6 @@ def deploy(
         "`nginx -s reload` — see docs/fedora-fips.md#secproxy-edge-reverse-proxy."
     )
 
-    # SecAgent's Mattermost bot token is minted on the SecChat host, not this one, and
-    # `mmctl token generate` produces a fresh, non-idempotent token with no machine-readable
-    # output contract secdeploy could safely parse across hosts — so this stays a printed
-    # operator step (mirrors targets/common.py's deploy_stacks .env-from-example pattern)
-    # rather than an automated cross-host fetch. Same note whether dry-run or real.
-    secagent_bot_note = (
-        "mint the SecAgent Mattermost bot token: on the SecChat host, run "
-        "`bash bootstrap/secchat.sh bot`, copy the printed token, and set it as "
-        f"SECAGENT_MATTERMOST__BOT_TOKEN in {ETC}/secagent.env"
-    )
     # SecRouter's OIDC config fragment (security.oidc.issuer/jwksUri/serviceSubjects) — not a
     # turnkey env var like SECROUTER_EGRESS_FILE (SecRouter's FREEROUTER_CONFIG is hand-authored
     # JSON), so write_addressing() writes it as a documented fragment for the operator to merge
@@ -543,8 +529,6 @@ def deploy(
             print(f"  · {desc}\n      {' '.join(cmd)}")
         if stacks:
             common.deploy_stacks(work, stacks, dry_run=True)
-        if secagent_enabled and "secchat" in stacks:
-            print(f"  · {secagent_bot_note}")
         if "secproxy" in services:
             print(f"  · {secproxy_cert_note}")
         if secagent_enabled and oidc_preview:
@@ -595,22 +579,6 @@ def deploy(
             (addr_dir / "secllm.env").write_text(
                 wiring.secllm_env_text(api_token=api_token, autostart=autostart_models)
             )
-        if secagent_enabled:
-            # pi's models.json (service api-key auth) — generated from secagent's OWN checked-
-            # out example (never hardcoded here, so secdeploy can't drift from secagent's
-            # actual model catalog), with the real SecRouter URL substituted and apiKey added.
-            models_example = work / "secagent" / "pi" / "models.secrouter.example.json"
-            secrouter_url = topology.urls(without).get("SECROUTER")
-            if models_example.exists() and secrouter_url:
-                example = json.loads(models_example.read_text())
-                models = wiring.secagent_pi_models_json(example, f"{secrouter_url}/v1")
-                (addr_dir / "secagent-pi-models.json").write_text(json.dumps(models, indent=2) + "\n")
-            elif not models_example.exists():
-                P.warn(f"{models_example} not found — pi models.json will not be generated "
-                       "(expected secagent's checkout to carry pi/models.secrouter.example.json)")
-            else:
-                P.warn("secagent: SecRouter has no addressable URL in this topology — "
-                       "skipping pi models.json generation")
         if secagent_enabled and written.get("oidc"):
             P.log(f"SecRouter OIDC config fragment written → {written['oidc']} "
                   "(merge into security.oidc — see docs/fedora-fips.md)")
@@ -618,34 +586,24 @@ def deploy(
     for cmd, desc in steps:
         P.log(desc)
         P.run(cmd)
-    # SecAssist (LibreChat stack) turnkey env — mirror SecSSO's two generated OIDC secrets and
-    # write the topology OIDC/gateway env into work/secassist/.env BEFORE deploy_stacks seeds it.
-    # (Fedora had no early-seed step; add one for secsso+secassist, matching the macOS mirror.)
-    if not dry_run and topology is not None and placed and "secassist" in placed \
-            and "secassist" not in (without or []) and "secsso" in placed \
+    # Native SecChat (a compose stack) turnkey env — mirror SecSSO's generated OIDC login-client
+    # secret and write the topology OIDC/gateway env into work/secchat/.env BEFORE deploy_stacks
+    # seeds it (same early-seed trick as the secagent service-secret mirror; secsso deploys last in
+    # the sorted stack order, too late otherwise). Needs SecSSO in the topology (an external IdP
+    # means the operator supplies these). The SSO client id stays `secchatng` (the retained
+    # Authentik client — users only ever see "SecChat"), so the SecSSO-side env var names do too.
+    if not dry_run and topology is not None and placed and "secchat" in placed \
+            and "secchat" not in (without or []) and "secsso" in placed \
             and "secsso" not in (without or []):
-        common.ensure_stack_secrets(work, ["secsso", "secassist"])
-        sa_env = wiring.sync_secassist_env(
-            work / "secsso" / ".env", work / "secassist" / ".env", topology, without)
-        if sa_env:
-            P.log(f"secassist: synced OIDC secrets + topology env → work/secassist/.env "
-                  f"({len(sa_env)} keys)")
-    # Native SecChat (secchatng) turnkey env — mirror SecSSO's generated OIDC login-client secret
-    # and write the topology OIDC/gateway env into work/secchatng/.env BEFORE deploy_stacks seeds
-    # it (same early-seed trick as the secassist mirror above). EXPERIMENTAL: only placed when the
-    # operator passed `--with secchatng`, so this is a no-op on every other deploy.
-    if not dry_run and topology is not None and placed and "secchatng" in placed \
-            and "secchatng" not in (without or []) and "secsso" in placed \
-            and "secsso" not in (without or []):
-        common.ensure_stack_secrets(work, ["secsso", "secchatng"])
-        sc_redir = wiring.sync_secsso_secchatng_redirect(work / "secsso" / ".env", topology, without)
+        common.ensure_stack_secrets(work, ["secsso", "secchat"])
+        sc_redir = wiring.sync_secsso_secchat_redirect(work / "secsso" / ".env", topology, without)
         if sc_redir:
-            P.log("secsso: pointed the secchatng OIDC client at its topology callback "
+            P.log("secsso: pointed the SecChat OIDC client at its topology callback "
                   "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
-        sc_env = wiring.sync_secchatng_env(
-            work / "secsso" / ".env", work / "secchatng" / ".env", topology, without)
+        sc_env = wiring.sync_secchat_env(
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without)
         if sc_env:
-            P.log(f"secchatng: synced OIDC secret + topology env → work/secchatng/.env "
+            P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(sc_env)} keys)")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
@@ -662,8 +620,6 @@ def deploy(
             P.log(f"secsso: {len(users)} declared user(s) already provisioned (passwords unchanged)")
     if stacks:
         common.deploy_stacks(work, stacks, dry_run=False)
-    if secagent_enabled and "secchat" in stacks:
-        P.warn(secagent_bot_note)
     if "secproxy" in services:
         P.warn(secproxy_cert_note)
     if out is not None:
@@ -844,8 +800,8 @@ def teardown_plan(found: FedoraFound, purge: bool) -> list[common.Step]:
     if found.etc_exists:
         steps.append(common.Step(
             f"WARNING: {ETC} holds operator-typed secrets with no backup elsewhere — "
-            "SECCERT_CA_PASSPHRASE, SECCERT_ADMIN_TOKEN, SECAGENT_CLIENT_SECRET, "
-            "SECAGENT_MATTERMOST__BOT_TOKEN in the *.env files — copy it aside first if "
+            "SECCERT_CA_PASSPHRASE, SECCERT_ADMIN_TOKEN, SECAGENT_CLIENT_SECRET "
+            "in the *.env files — copy it aside first if "
             "you'll need any of them again", None, "config",
         ))
         steps.append(common.Step(f"remove config dir {ETC}", ["rm", "-rf", str(ETC)], "config"))
@@ -985,7 +941,7 @@ def teardown(
 # The reverse of "deploy leaves state on the host": capture ALL of this host's suite state into
 # one FIPS-encrypted archive, and put it back. Native services (systemd) keep their state under
 # /var/lib/secsuite/<svc> and their secrets under /etc/secsuite/*.env — plain directory tarballs
-# here (each `tar -C <dir> .`); the stacks (Authentik/Mattermost/LibreChat) are dumped by their
+# here (each `tar -C <dir> .`); the stacks (Authentik/SecChat) are dumped by their
 # own bootstrap `backup`/`restore` verbs (see common.stack_*_steps). Everything lands in a
 # throwaway staging tree, which backup.stage_to_encrypted_archive tars + CMS-encrypts to the
 # recipient cert; the plaintext never touches out/. Restore is the mirror: decrypt + verify the
@@ -1149,7 +1105,7 @@ def restore(
                     None, "decrypt"),
         common.Step("native: restore SecCert CA FIRST, then /etc/secsuite, then remaining state",
                     None, "data"),
-        common.Step("stacks: bootstrap/<name>.sh restore each (Authentik/Mattermost/LibreChat DBs "
+        common.Step("stacks: bootstrap/<name>.sh restore each (Authentik/SecChat DBs "
                     f"+ uploads + .env){' — ' + ', '.join(n for n, _ in stacks) if stacks else ''}",
                     None, "stacks"),
         common.Step("services: systemctl start secsuite.target", None, "services"),
@@ -1173,7 +1129,7 @@ def restore(
                "integrity check (place the .manifest.json next to the .tar.cms to enable it)")
         manifest_json = None
     if not P.confirm(
-        "restore OVERWRITES this host's suite state — the Authentik/Mattermost/LibreChat "
+        "restore OVERWRITES this host's suite state — the Authentik/SecChat "
         "databases, the SecCert CA, and the audit logs — with the archive's contents. This "
         "cannot be undone. Proceed?", assume_yes,
     ):

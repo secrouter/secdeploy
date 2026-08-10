@@ -241,7 +241,7 @@ def test_secret_seeding_writes_fedora_env_files_never_in_secsite_toml(tmp_path):
         "y",                   # set up operator secrets now? yes
         "n",                   # auto-generate internal secrets? no — type them (below)
         "sup3r-ca-pass", "sup3r-admin-tok",    # SecCert
-        "sso-secret-xyz", "mm-bot-tok-abc",    # SecAgent
+        "sso-secret-xyz",                       # SecAgent (SECAGENT_CLIENT_SECRET)
         "hf_test_token",                        # SecRecorder
         "/etc/secsuite/secrouter.config.hardened.json",  # SecRouter FREEROUTER_CONFIG
     ]
@@ -253,7 +253,7 @@ def test_secret_seeding_writes_fedora_env_files_never_in_secsite_toml(tmp_path):
 
     site_text = dest.read_text()
     for secret in (
-        "sup3r-ca-pass", "sup3r-admin-tok", "sso-secret-xyz", "mm-bot-tok-abc", "hf_test_token",
+        "sup3r-ca-pass", "sup3r-admin-tok", "sso-secret-xyz", "hf_test_token",
     ):
         assert secret not in site_text  # NEVER in secsite.toml
 
@@ -268,7 +268,6 @@ def test_secret_seeding_writes_fedora_env_files_never_in_secsite_toml(tmp_path):
     assert "SECCERT_CA_PASSPHRASE=sup3r-ca-pass" in seccert_env.read_text()
     assert "SECCERT_ADMIN_TOKEN=sup3r-admin-tok" in seccert_env.read_text()
     assert "SECAGENT_CLIENT_SECRET=sso-secret-xyz" in secagent_env.read_text()
-    assert "SECAGENT_MATTERMOST__BOT_TOKEN=mm-bot-tok-abc" in secagent_env.read_text()
     assert "HF_TOKEN=hf_test_token" in secrecorder_env.read_text()
     assert "FREEROUTER_CONFIG=/etc/secsuite/secrouter.config.hardened.json" in secrouter_env.read_text()
     # a fedora-fips-only site must never touch macOS's shared secrets.env
@@ -288,7 +287,7 @@ def test_secret_seeding_macos_shares_one_secrets_env_file(tmp_path):
         "y",                         # set up operator secrets now? yes
         "n",                         # auto-generate internal secrets? no — type them (below)
         "ca-pass-mac", "admin-tok-mac",
-        "sso-secret-mac", "bot-tok-mac",
+        "sso-secret-mac",            # SecAgent (SECAGENT_CLIENT_SECRET)
         "hf-tok-mac",
         "",                          # FREEROUTER_CONFIG left blank -> skipped
     ]
@@ -305,7 +304,6 @@ def test_secret_seeding_macos_shares_one_secrets_env_file(tmp_path):
     assert "SECCERT_CA_PASSPHRASE=ca-pass-mac" in text
     assert "SECCERT_ADMIN_TOKEN=admin-tok-mac" in text
     assert "SECAGENT_CLIENT_SECRET=sso-secret-mac" in text
-    assert "SECAGENT_MATTERMOST__BOT_TOKEN=bot-tok-mac" in text
     assert "HF_TOKEN=hf-tok-mac" in text
     assert "FREEROUTER_CONFIG" not in text  # left blank -> never written at all
     assert "ca-pass-mac" not in dest.read_text()  # never in secsite.toml either
@@ -320,8 +318,8 @@ def _env_val(text: str, key: str) -> str:
 
 def test_secret_seeding_autogenerates_internal_seccert_secrets(tmp_path):
     """Auto-generation (the default) mints strong SecCert secrets without asking — the operator
-    never invents a CA passphrase — while external tokens (Hugging Face, Mattermost bot) and the
-    shared SecAgent client secret are still asked. See _maybe_seed_secrets."""
+    never invents a CA passphrase — while the external Hugging Face token and the shared SecAgent
+    client secret are still asked. See _maybe_seed_secrets."""
     root = tmp_path / "checkout"
     _stage_env_examples(root)
     dest = tmp_path / "secsite.toml"
@@ -332,9 +330,9 @@ def test_secret_seeding_autogenerates_internal_seccert_secrets(tmp_path):
         "", "y", "",           # with_inference, with_agent (-> True), configure_resolver
         "y",                   # set up operator secrets now? yes
         "y",                   # auto-generate internal secrets? yes (SecCert NOT asked below)
-        "sso-secret-auto", "mm-bot-auto",   # SecAgent — still asked (shared/external)
-        "hf-auto",                           # SecRecorder HF_TOKEN — still asked (external)
-        "",                                  # SecRouter FREEROUTER_CONFIG — blank
+        "sso-secret-auto",     # SecAgent SECAGENT_CLIENT_SECRET — still asked (shared)
+        "hf-auto",             # SecRecorder HF_TOKEN — still asked (external)
+        "",                    # SecRouter FREEROUTER_CONFIG — blank
     ]
     driver = _driver(answers)
     result = configure.run(
@@ -348,7 +346,7 @@ def test_secret_seeding_autogenerates_internal_seccert_secrets(tmp_path):
     # auto-generated: present, strong, distinct, and NOT any operator-typed answer
     assert len(passphrase) >= 32 and len(admin) >= 32
     assert passphrase != admin
-    for typed in ("sso-secret-auto", "mm-bot-auto", "hf-auto"):
+    for typed in ("sso-secret-auto", "hf-auto"):
         assert typed not in (passphrase, admin)
     # the still-asked external/shared answers landed where they belong
     assert "SECAGENT_CLIENT_SECRET=sso-secret-auto" in (

@@ -227,7 +227,8 @@ def execute_teardown_plan(
 #
 # Reuses the `Step`/`render_teardown_plan` primitives above (a plan line is a plan line). Two
 # differences from teardown: (1) stacks are derived DYNAMICALLY from the Manifest's declared
-# `kind == "stack"` (so secassist is included), not the hardcoded teardown `STACK_NAMES`; and
+# `kind == "stack"`, not the hardcoded teardown `STACK_NAMES`, so a stack added to a future
+# manifest is picked up for backup automatically; and
 # (2) execution is FAIL-FAST (:func:`execute_capture_plan`) — a failed dump or a failed restore
 # must abort, never leave a partial archive or a half-restored host, unlike teardown's
 # tolerate-absence best-effort. Each target populates a throwaway staging dir via these steps,
@@ -236,8 +237,8 @@ def stack_checkouts(manifest: Manifest, work: Path) -> list[tuple[str, Path]]:
     """Every ``kind == "stack"`` component with a checkout present, as ``(name, bootstrap.sh)``.
 
     Derived from the Manifest's declared kinds — deliberately NOT the hardcoded teardown
-    ``STACK_NAMES`` (which predates secassist and omits it) — so a newly added stack is picked
-    up for backup automatically. Order follows the manifest's declaration order."""
+    ``STACK_NAMES`` — so a stack added to a future manifest is picked up for backup
+    automatically. Order follows the manifest's declaration order."""
     out: list[tuple[str, Path]] = []
     for name, c in manifest.components.items():
         if c.kind != "stack":

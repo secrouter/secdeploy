@@ -41,17 +41,28 @@ def _recipient_keypair(tmp_path, name="bkp"):
     return cert, key
 
 
-# ── common: dynamic stack derivation (the secassist gotcha) ─────────────────────────────────
-def test_stack_checkouts_is_dynamic_and_includes_secassist(tmp_path):
+# ── common: dynamic stack derivation (from manifest kinds, not the hardcoded STACK_NAMES) ────
+def test_stack_checkouts_is_dynamic_from_manifest_kinds(tmp_path):
+    # stack_checkouts derives stacks from the Manifest's declared kind=="stack", NOT the hardcoded
+    # teardown STACK_NAMES — so a stack added to a future manifest is picked up automatically.
+    crafted = (
+        'suite = "1"\n'
+        '[components.secsso]\nrepo = "o/secsso"\nref = "v1"\nkind = "stack"\ntier = "identity"\n'
+        '[components.secchat]\nrepo = "o/secchat"\nref = "v1"\nkind = "stack"\ntier = "collab"\nport = 47010\n'
+        '[components.secextra]\nrepo = "o/secextra"\nref = "v1"\nkind = "stack"\ntier = "collab"\nport = 6000\n'
+        '[targets.fedora-fips]\nkind = "systemd-native"\n'
+    )
+    mpath = tmp_path / "suite.toml"; mpath.write_text(crafted)
+    m = Manifest.load(mpath)
     work = tmp_path / "work"
-    for name in ("secsso", "secchat", "secassist"):
+    for name in ("secsso", "secchat", "secextra"):
         b = work / name / "bootstrap" / f"{name}.sh"
         b.parent.mkdir(parents=True)
         b.write_text("#!/usr/bin/env bash\n")
-    names = [n for n, _ in common.stack_checkouts(MANIFEST, work)]
-    assert set(names) == {"secsso", "secchat", "secassist"}
-    # the whole point: this picks up secassist, which the hardcoded teardown list omits
-    assert "secassist" not in fedora_fips.STACK_NAMES
+    names = [n for n, _ in common.stack_checkouts(m, work)]
+    assert set(names) == {"secsso", "secchat", "secextra"}
+    # the whole point: secextra is a stack the hardcoded teardown list doesn't know about
+    assert "secextra" not in fedora_fips.STACK_NAMES
 
 
 def test_stack_checkouts_skips_absent_checkouts(tmp_path):
@@ -117,10 +128,10 @@ def test_fedora_restore_native_steps_order_seccert_etc_rest():
 
 
 def test_fedora_backup_components_meta_no_secret_values():
-    stacks = [("secsso", Path("b")), ("secassist", Path("b"))]
+    stacks = [("secsso", Path("b")), ("secchat", Path("b"))]
     meta = fedora_fips._backup_components_meta(_fedora_found(), stacks)
     names = [c["name"] for c in meta]
-    assert "config" in names and "seccert" in names and "secassist" in names
+    assert "config" in names and "seccert" in names and "secchat" in names
     blob = json.dumps(meta)
     assert "PASSPHRASE" not in blob and "PASSWORD" not in blob  # names only, never values
 
@@ -243,13 +254,13 @@ def test_cli_restore_dispatch_and_flags(monkeypatch):
     assert captured == {"archive": "/a.tar.cms", "key": "/k.pem", "dry_run": True}
 
 
-def test_cli_backup_dry_run_lists_stacks_incl_secassist(monkeypatch, capsys):
+def test_cli_backup_dry_run_lists_stacks(monkeypatch, capsys):
     monkeypatch.setattr(fedora_fips, "_discover", lambda work: _fedora_found())
     monkeypatch.setattr(common, "stack_checkouts",
-                        lambda m, w: [("secsso", Path("b")), ("secchat", Path("b")), ("secassist", Path("b"))])
+                        lambda m, w: [("secsso", Path("b")), ("secchat", Path("b"))])
     assert main(["--manifest", MANIFEST_PATH, "backup", "fedora-fips", "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "var-seccert.tar.gz" in out and "secassist" in out
+    assert "var-seccert.tar.gz" in out and "secchat" in out
 
 
 def test_cli_restore_dry_run_touches_nothing(monkeypatch, capsys):

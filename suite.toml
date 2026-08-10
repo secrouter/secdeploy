@@ -13,8 +13,8 @@
 #           set on secllm (inference must dial direct, never through the proxy), secdns (not
 #           HTTP), or secproxy itself.
 
-suite = "1.7.0"
-released = "2026-08-07"
+suite = "2.0.0"
+released = "2026-08-10"
 description = "SecRouter secure-AI suite"
 
 # ── Identity & trust (optional infra) ──
@@ -74,48 +74,32 @@ role = "governed AI gateway"
 # ── Agents & collaboration ──
 [components.secagent]
 repo = "secrouter/secagent"
-ref = "v0.3.0"
+# main until a bridge-free release tag is cut — the standing chat bridge was removed at the
+# SecChat cutover (secagent is now an installed on-demand pi harness, not a chat service). Repin
+# to a secagent release tag at the next suite release, alongside secchat/secsso.
+ref = "main"
 kind = "service"
 tier = "collab"
-port = 47007
-fronted = true
+# No standing inbound listener: secagent is INSTALLED as an on-demand pi harness (MR review, code
+# analysis, testgen, docs — driven by CLI / CI / MCP), not run as a persistent fronted service —
+# so no port and not fronted.
 runtime = "python>=3.11"
-role = "agentic harness (pi) — MR review, analysis, chat-ops"
+role = "pi agentic harness — MR review, code analysis, testgen, docs (CLI / CI / MCP)"
 
+# The native SecChat — purpose-built auditable team + agentic chat (Node/TS + Postgres,
+# tamper-evident hash chains, owner-gated agents). This is now the canonical chat component: the
+# native rebuild that replaced BOTH prior chat components (team chat and governed AI chat) in one
+# app. Its SSO client id in SecSSO stays `secchatng` (the retained Authentik client — users only
+# ever see "SecChat"). Ref tracks the rebuild branch until a release tag is cut — repin to a
+# secchat release tag at the next suite release, alongside secsso.
 [components.secchat]
-repo = "secrouter/secchat"
-ref = "v1.1.0"
-kind = "stack"
-tier = "collab"
-port = 8065
-fronted = true
-role = "team chat + chat-ops (Mattermost) — bridges to SecAgent"
-
-# The native SecChat rebuild (purpose-built auditable team + agentic chat: Node/TS + Postgres,
-# tamper-evident hash chains, owner-gated agents). Meant to replace BOTH the Mattermost `secchat`
-# above AND the LibreChat `secassist` below. EXPERIMENTAL: off by default — opt in with
-# `--with secchatng` to deploy it alongside for evaluation. Cutover (retire Mattermost/LibreChat,
-# rewire the SecAgent bridge) is a later, deliberate step. Ref tracks the rebuild branch until a
-# release tag is cut.
-[components.secchatng]
 repo = "secrouter/secchat"
 ref = "rearchitecture"
 kind = "stack"
 tier = "collab"
 port = 47010
-experimental = true
 fronted = true
-role = "native auditable team + agentic chat (SecChat rebuild) — transitional replacement for Mattermost + LibreChat"
-
-[components.secassist]
-repo = "secrouter/secassist"
-ref = "v0.1.0"
-kind = "stack"
-tier = "collab"
-port = 3080
-fronted = true
-optional = true
-role = "governed AI chat UI (LibreChat) — SSO login; per-user governance via SecRouter"
+role = "native auditable team + agentic chat — SSO login, tamper-evident audit, owner-gated agents"
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"

@@ -74,7 +74,7 @@ resource = "gpu"
 def test_verify_ok(capsys):
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
-    assert "suite 1.7.0" in out
+    assert "suite 2.0.0" in out
     assert "optional: seccert, secsso, secdns" in out
     assert "target assets present" in out
 
@@ -84,7 +84,7 @@ def test_plan_macos_lists_all(capsys):
     out = capsys.readouterr().out
     assert "compose" in out.lower()
     assert "seccert @ v1.0.0" in out
-    assert "secchat @ v1.1.0" in out   # native-Mattermost build (arm64 + amd64)
+    assert "secchat @ rearchitecture" in out   # the native SecChat rebuild
 
 
 def test_plan_without_drops_optionals(capsys):
@@ -96,26 +96,18 @@ def test_plan_without_drops_optionals(capsys):
     assert "secrouter @" in components
 
 
-def test_plan_opts_experimental_component_in(capsys):
-    # secchatng (the native SecChat rebuild) is experimental: absent from the default plan,
-    # present only when named via --with.
-    assert main(["--manifest", MANIFEST, "plan", "macos"]) == 0
-    assert "secchatng @" not in capsys.readouterr().out
-    assert main(["--manifest", MANIFEST, "plan", "macos", "--with", "secchatng"]) == 0
-    out = capsys.readouterr().out
-    assert "secchatng @ rearchitecture" in out
-
-
 def test_with_rejects_non_experimental():
     import pytest
     with pytest.raises(SystemExit):  # secrouter isn't experimental → --with it is an error
         main(["--manifest", MANIFEST, "plan", "macos", "--with", "secrouter"])
 
 
-def test_verify_lists_experimental(capsys):
+def test_verify_lists_experimental_line(capsys):
+    # No shipped component is experimental after the SecChat cutover — verify still prints the
+    # experimental line, now empty.
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
-    assert "secchatng" in out and "experimental" in out
+    assert "experimental (off by default; opt in with --with): (none)" in out
 
 
 def test_deploy_fedora_dry_run(capsys):
@@ -156,7 +148,7 @@ def test_bundle_per_resource(tmp_path):
     assert rc == 0
     import tarfile
 
-    tarball = out / "secsuite-1.7.0-macos-gpu.tar.gz"
+    tarball = out / "secsuite-2.0.0-macos-gpu.tar.gz"
     assert tarball.exists()
     names = tarfile.open(tarball).getnames()
     assert any(n.endswith("addressing/secdns.zone") for n in names)
@@ -242,7 +234,7 @@ def test_deploy_fedora_topology_stands_up_secproxy(tmp_path, capsys):
     # the certbot SAN-cert issuance from SecCert — one --cert-name, one -d per fronted FQDN
     assert "certbot certonly --standalone" in out
     assert "--cert-name secproxy" in out
-    for name in ("secsso", "secrouter", "secagent", "secchat", "secrecorder"):
+    for name in ("secsso", "secrouter", "secchat", "secrecorder"):
         assert f"-d {name}.sec.internal" in out
     assert "http://seccert.sec.internal:47001/acme/directory" in out
     # the cert install (0600 key, owned by the service user) + the generated nginx config install
@@ -322,9 +314,9 @@ resource = "mac"
 
 
 def test_deploy_macos_with_agent_dry_run_shows_secagent_init(tmp_path, monkeypatch, capsys):
-    """--with-agent's dry-run mentions BOTH the launchd chat-bridge daemon and the follow-up
-    `secagent init` call that wires up pi + the secagent CLI for the deploying user (see
-    targets/macos.py's deploy()) — distinct from the chat service itself, which never uses pi.
+    """--with-agent's dry-run mentions the `secagent init` call that wires up pi + the secagent
+    CLI for the deploying user (see targets/macos.py's deploy()). secagent is installed as an
+    on-demand pi harness, not a standing service, so there's no launchd daemon for it.
 
     monkeypatch.chdir(tmp_path) isolates this from any secsite.toml/topology.toml an operator
     happens to have sitting in the repo root (active_site prefers those over --topology — see
@@ -351,7 +343,7 @@ resource = "mac"
     assert main(["--manifest", MANIFEST, "deploy", "macos", "--dry-run", "--with-agent",
                  "--topology", str(tp), "--resource", "mac"]) == 0
     out = capsys.readouterr().out
-    assert "launchd internal.secsuite.secagent" in out
+    assert "internal.secsuite.secagent" not in out  # no launchd daemon for the harness
     assert "secagent init --domain sec.internal" in out
 
 
@@ -361,8 +353,8 @@ def test_deploy_macos_with_agent_secagent_init_uses_fronted_urls_not_raw_ports(
     """secagent init's OWN --domain-derived guess (secrouter.<domain>:47002, secsso.<domain>:9000)
     is wrong on a topology where secproxy fronts everything on :443 with no port in the FQDN —
     confirmed live against a real deploy (that URL doesn't even speak TLS). deploy() must pass
-    the already-correct fronted URLs (the same SECAGENT_LLM__BASE_URL/SECSSO_URL the chat bridge
-    itself is wired with) explicitly, once the addressing env exists to read them from."""
+    the already-correct fronted URLs (the SECAGENT_LLM__BASE_URL/SECSSO_URL secdeploy generated
+    into the addressing env) explicitly, once that env exists to read them from."""
     monkeypatch.chdir(tmp_path)
     topo = """
 domain = "sec.internal"
@@ -436,9 +428,10 @@ resource = "mac"
     out = capsys.readouterr().out
     # ordering: secdns unit appears before the resolver step (else .internal resolves to a dead :53)
     assert out.index("internal.secsuite.secdns") < out.index("configure-resolver")
-    # all five native services are launchd units
-    for name in ("secdns", "secllm", "secagent", "secrecorder", "secproxy"):
+    # every native service is a launchd unit (secagent is an installed pi harness, not a service)
+    for name in ("secdns", "secllm", "secrecorder", "secproxy"):
         assert f"internal.secsuite.{name}" in out
+    assert "internal.secsuite.secagent" not in out
     # SecDNS runs from an ABSOLUTE venv binary (launchd resolves relative paths unpredictably —
     # a relative out/ path was why the daemon installed but never served :53)
     secdns_line = next(ln for ln in out.splitlines() if "internal.secsuite.secdns (" in ln)
@@ -644,29 +637,24 @@ def test_deploy_fedora_dry_run_secllm_only_resource_no_secrouter_addressing_env_
     assert "secrouter-addressing.env" not in out
 
 
-# ── --with-agent: SecAgent + Mattermost chat-ops turnkey standup ────────────────────────
+# ── --with-agent: SecAgent installed as an on-demand pi harness (no chat bridge) ─────────
 def test_deploy_fedora_with_agent_dry_run_shows_the_whole_turnkey(tmp_path, capsys):
     tp = tmp_path / "topology.toml"
     tp.write_text(GPU_SPLIT)  # 'core' hosts identity (secsso) + gateway (secrouter) + collab (secagent, secchat)
     assert main(["--manifest", MANIFEST, "deploy", "fedora-fips", "--dry-run",
                  "--with-agent", "--topology", str(tp), "--resource", "core"]) == 0
     out = capsys.readouterr().out
-    # 1. the secagent unit
-    assert "install secagent.service" in out
-    # 2. pi install
+    # secagent is installed as a pi harness, NOT a systemd service — no unit is installed
+    assert "install secagent.service" not in out
+    # pi install
     assert "install pi (coding agent runtime) globally" in out
     assert "npm install -g @earendil-works/pi-coding-agent" in out
-    # 3. the generated addressing env
-    assert "install generated secagent addressing env" in out
-    assert "addressing/env/secagent.env" in out
-    assert "/etc/secsuite/secagent-addressing.env" in out
-    # pi's models.json install step
-    assert "install pi models.json" in out
-    assert "/var/lib/secsuite/secagent/.pi/agent/models.json" in out
-    # 4. the secchat.sh bot mint step
-    assert "bootstrap/secchat.sh bot" in out
-    assert "SECAGENT_MATTERMOST__BOT_TOKEN" in out
-    # 5. the secrouter oidc config
+    # the `secagent init` user-wiring (pointed at this topology's SecRouter/SecSSO) + login note
+    assert "secagent init --domain sec.internal" in out
+    assert "--secrouter-url http://secrouter.sec.internal:47002/v1" in out
+    assert "--secsso-url http://secsso.sec.internal:9000" in out
+    assert "secagent login" in out
+    # the secrouter oidc config fragment (svc-secagent)
     assert "SecRouter OIDC config fragment" in out
     assert "secrouter-oidc.json" in out
     assert "svc-secagent" in out
@@ -680,9 +668,7 @@ def test_deploy_fedora_plain_dry_run_shows_none_of_the_agent_turnkey(tmp_path, c
     out = capsys.readouterr().out
     assert "secagent.service" not in out
     assert "pi-coding-agent" not in out
-    assert "secagent-addressing.env" not in out
-    assert "secagent-pi-models" not in out
-    assert "secchat.sh bot" not in out
+    assert "secagent init" not in out
     assert "SecRouter OIDC config fragment" not in out
 
 
@@ -707,10 +693,12 @@ def test_deploy_fedora_with_agent_needs_secagent_placed_here(tmp_path, capsys):
     assert "secagent" not in out.lower()
 
 
-def test_deploy_fedora_with_agent_verify_lists_secagent_service(capsys):
+def test_deploy_fedora_verify_passes_without_secagent_service(capsys):
+    # secagent ships no systemd unit anymore (it's an installed harness), so it isn't an expected
+    # asset — verify still passes clean.
     assert main(["--manifest", MANIFEST, "verify"]) == 0
     out = capsys.readouterr().out
-    assert "target assets present" in out  # secagent.service ships, so verify still passes clean
+    assert "target assets present" in out
 
 
 # ── secproxy.service is a fedora-fips expected asset ────────────────────────────────────
@@ -954,7 +942,7 @@ def test_bundle_picks_up_explicit_site(tmp_path):
     rc = main(["--manifest", MANIFEST, "--work", str(work), "--out", str(out_dir),
                "bundle", "fedora-fips", "--site", str(tp), "--resource", "gpu1"])
     assert rc == 0
-    tarball = out_dir / "secsuite-1.7.0-fedora-fips-gpu1.tar.gz"
+    tarball = out_dir / "secsuite-2.0.0-fedora-fips-gpu1.tar.gz"
     assert tarball.exists()
     names = tarfile.open(tarball).getnames()
     assert any("/work/secllm" in n for n in names)

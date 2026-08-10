@@ -43,7 +43,7 @@ target = "fedora-fips"
 address = "10.0.0.5"
 capabilities = ["fips"]
 with_inference = false      # stand up SecLLM here (only meaningful where inference is placed)
-with_agent = false          # stand up SecAgent's Mattermost chat bridge here (collab tier)
+with_agent = false          # install SecAgent here as an on-demand pi harness (collab tier)
 configure_resolver = true   # point this host's resolver at SecDNS
 tls = false                 # macOS only
 configure_hosts = false     # macOS only
@@ -123,7 +123,7 @@ to skip any single value:
 | Component | Asked when | Values |
 |---|---|---|
 | SecCert | placed (identity tier) and not dropped via `without` | `SECCERT_CA_PASSPHRASE`, `SECCERT_ADMIN_TOKEN` |
-| SecAgent | placed (collab tier) **and** `with_agent` is on for that resource | `SECAGENT_CLIENT_SECRET`, `SECAGENT_MATTERMOST__BOT_TOKEN` |
+| SecAgent | placed (collab tier) **and** `with_agent` is on for that resource | `SECAGENT_CLIENT_SECRET` (SecSSO service-account secret) |
 | SecRecorder | placed (collab tier) | `HF_TOKEN` (optional — only needed for the gated diarizer model) |
 | SecRouter | placed (gateway tier) | `FREEROUTER_CONFIG` — a **path** to a hardened config, not a secret; asked as plain text, not masked |
 
@@ -142,8 +142,7 @@ to skip any single value:
   > (`SECCERT_ADMIN_TOKEN`, `SECAGENT_CLIENT_SECRET`, …) is written for safekeeping only —
   > `compose.yaml`'s own `SECCERT_ADMIN_TOKEN` substitution reads the **shell environment**, not
   > `secrets.env`, and macOS has no service-manager env-file layering (the same known eval
-  > limitation documented for [SecRouter's addressing env on macOS](macos.md) and
-  > [SecAgent's chat-ops bridge](macos.md#known-caveat-secagents-port)). Use `fedora-fips` for
+  > limitation documented for [SecRouter's addressing env on macOS](macos.md)). Use `fedora-fips` for
   > the automated `*.env` layering described in
   > [fedora-fips.md §4 Configure](fedora-fips.md#4-configure).
 

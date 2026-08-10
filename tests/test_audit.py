@@ -307,7 +307,7 @@ def test_write_deploy_audit_txt_shows_auth_enabled_not_secret(tmp_path):
     assert "value never recorded here" in txt
 
 
-# ── SecAgent chat-ops (--with-agent): audit reflects, never leaks ───────────────────────
+# ── SecAgent harness (--with-agent): audit reflects, never leaks ────────────────────────
 def test_write_deploy_audit_secagent_fields_true_when_enabled(tmp_path):
     m = _manifest()
     topo = _topo(tmp_path, GPU_SPLIT)
@@ -318,7 +318,7 @@ def test_write_deploy_audit_secagent_fields_true_when_enabled(tmp_path):
     )
     record = json.loads(json_path.read_text())
     auth = record["authorizations"]
-    assert auth["secagent_chat_enabled"] is True
+    assert auth["secagent_enabled"] is True
     assert auth["secagent_llm_at_secrouter"] is True
     assert auth["oidc_service_subject"] == "svc-secagent"
 
@@ -331,7 +331,7 @@ def test_write_deploy_audit_secagent_fields_false_by_default(tmp_path):
     )
     record = json.loads(json_path.read_text())
     auth = record["authorizations"]
-    assert auth["secagent_chat_enabled"] is False
+    assert auth["secagent_enabled"] is False
     assert auth["secagent_llm_at_secrouter"] is False
     assert auth["oidc_service_subject"] is None
 
@@ -340,12 +340,10 @@ def test_write_deploy_audit_never_records_secagent_secrets(tmp_path):
     m = _manifest()
     topo = _topo(tmp_path, GPU_SPLIT)
     out = tmp_path / "out"
-    # Generate the REAL secrets a deploy would produce alongside this audit call, exactly as
-    # a target does, and confirm none of them land in the artifact.
+    # Generate the REAL addressing a deploy would produce alongside this audit call, and confirm
+    # no secret lands in the artifact.
     addressing = wiring.write_addressing(topo, out / "addressing", "core")
-    webhook_secret = wiring.secagent_webhook_secret(out / "addressing")
     fake_client_secret = "sso-client-secret-should-never-appear"
-    fake_bot_token = "mm-bot-token-should-never-appear"
 
     json_path = audit.write_deploy_audit(
         m, topo, "core", out, target="fedora-fips",
@@ -354,11 +352,10 @@ def test_write_deploy_audit_never_records_secagent_secrets(tmp_path):
     )
     raw = json_path.read_text()
     txt_raw = json_path.with_suffix(".txt").read_text()
-    for secret in (webhook_secret, fake_client_secret, fake_bot_token):
-        assert secret not in raw
-        assert secret not in txt_raw
-    # write_deploy_audit's signature structurally cannot carry any of these — only the
-    # boolean secagent_enabled — so this isn't just "happened not to leak this time".
+    assert fake_client_secret not in raw
+    assert fake_client_secret not in txt_raw
+    # write_deploy_audit's signature structurally cannot carry a secret — only the boolean
+    # secagent_enabled — so this isn't just "happened not to leak this time".
     import inspect
     params = inspect.signature(audit.write_deploy_audit).parameters
     assert "secret" not in " ".join(params).lower()
@@ -374,7 +371,8 @@ def test_write_deploy_audit_txt_shows_secagent_fields(tmp_path):
         services=["secrouter", "secagent"], shas={}, secagent_enabled=True, now=FIXED_NOW,
     )
     txt = json_path.with_suffix(".txt").read_text()
-    assert "SecAgent chat-ops enabled:         yes" in txt
+    harness_line = next(ln for ln in txt.splitlines() if "SecAgent harness enabled:" in ln)
+    assert harness_line.strip().endswith("yes")
     assert "SecAgent LLM routed via SecRouter: yes" in txt
     assert "OIDC service subject declared:     svc-secagent" in txt
 
@@ -511,7 +509,7 @@ def test_fedora_deploy_real_run_2instance_writes_egress_and_shared_token(tmp_pat
     work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
     # 'core' hosts identity + gateway + collab: secdns, seccert, secrouter, secrecorder
     # (services) plus secsso, secchat (stacks) — require_checkouts needs a dir for each.
-    for name in ("secdns", "seccert", "secrouter", "secrecorder", "secsso", "secchat", "secassist"):
+    for name in ("secdns", "seccert", "secrouter", "secrecorder", "secsso", "secchat"):
         (work / name).mkdir(parents=True)
     root.mkdir()
 
@@ -594,11 +592,11 @@ def test_fedora_deploy_real_run_single_host_no_addressing_env_install(tmp_path, 
     )
 
 
-def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, monkeypatch):
-    """End-to-end: a real deploy() with --with-agent on the collab resource actually produces
-    the full SecAgent + Mattermost turnkey — the generated env, pi's models.json (from
-    secagent's OWN checked-out example), the install steps (pi, addressing env, models.json),
-    the SecRouter OIDC fragment — and the audit reflects it all without leaking any secret."""
+def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, monkeypatch):
+    """End-to-end: a real deploy() with --with-agent on the collab resource installs the SecAgent
+    pi harness — pi globally + the `secagent init` user-wiring (no standing service, no chat
+    bridge, no daemon models.json) — writes the generated LLM/SecSSO env + the SecRouter OIDC
+    fragment, and the audit reflects it all without leaking any secret."""
     from secdeploy import process as P
     from secdeploy.targets import fedora_fips
 
@@ -610,74 +608,42 @@ def test_fedora_deploy_real_run_with_agent_stands_up_secagent_turnkey(tmp_path, 
     m = _manifest()
     topo = _topo(tmp_path, GPU_SPLIT)  # 'core': identity (secsso) + gateway (secrouter) + collab (secagent, secchat)
     work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
-    for name in ("secdns", "seccert", "secrouter", "secagent", "secrecorder", "secsso", "secchat", "secassist"):
+    for name in ("secdns", "seccert", "secrouter", "secagent", "secrecorder", "secsso", "secchat"):
         (work / name).mkdir(parents=True)
     root.mkdir()
-    # A minimal but realistic pi/models.secrouter.example.json in the checkout — this is what
-    # secdeploy reads + transforms, never something it hardcodes itself.
-    pi_dir = work / "secagent" / "pi"
-    pi_dir.mkdir(parents=True)
-    (pi_dir / "models.secrouter.example.json").write_text(json.dumps({
-        "_comment": ["KIMI GUARD: registers ONLY the secrouter provider"],
-        "providers": {
-            "secrouter": {
-                "baseUrl": "https://secrouter.<domain>:47002/v1",
-                "models": [{"id": "gemma-3-12b-it", "name": "Gemma 3 12B (SecRouter)"}],
-            }
-        },
-    }))
 
     fedora_fips.deploy(m, work, root, dry_run=False, out=out, topology=topo, resource="core",
                        with_agent=True)
 
     addr_dir = out / "addressing"
 
-    # Generated addressing env: full LLM/SecSSO/Mattermost wiring + webhook secret.
-    secagent_env_path = addr_dir / "env" / "secagent.env"
-    secagent_env = secagent_env_path.read_text()
+    # Generated addressing env: LLM/SecSSO wiring, no chat-bridge keys, no webhook secret.
+    secagent_env = (addr_dir / "env" / "secagent.env").read_text()
     assert "SECAGENT_LLM__BASE_URL=http://secrouter.sec.internal:47002/v1" in secagent_env
     assert "SECAGENT_LLM__API_KEY=!secagent token" in secagent_env
     assert "SECAGENT_SECSSO__TOKEN_URL=http://secsso.sec.internal:9000/application/o/token/" \
         in secagent_env
-    assert "SECAGENT_MATTERMOST__URL=http://secchat.sec.internal:8065" in secagent_env
-    webhook_line = next(
-        ln for ln in secagent_env.splitlines()
-        if ln.startswith("SECAGENT_MATTERMOST__WEBHOOK_SECRET=")
-    )
-    webhook_secret = webhook_line.split("=", 1)[1]
-    assert webhook_secret == wiring.secagent_webhook_secret(addr_dir)
+    assert "__WEBHOOK_SECRET=" not in secagent_env and "__BOT_TOKEN=" not in secagent_env
+    assert not (addr_dir / "secagent-webhook-secret").exists()
+    # no daemon-only pi models.json is generated (secagent init writes the harness one live)
+    assert not (addr_dir / "secagent-pi-models.json").exists()
 
-    # pi's models.json: adapted from the REAL checked-out example.
-    pi_models_path = addr_dir / "secagent-pi-models.json"
-    pi_models = json.loads(pi_models_path.read_text())
-    assert pi_models["providers"]["secrouter"]["baseUrl"] == "http://secrouter.sec.internal:47002/v1"
-    assert pi_models["providers"]["secrouter"]["apiKey"] == "!secagent token"
-    assert pi_models["providers"]["secrouter"]["models"] == \
-        [{"id": "gemma-3-12b-it", "name": "Gemma 3 12B (SecRouter)"}]  # catalog passed through
-
-    # SecRouter's OIDC config fragment. SecAssist is in this topology, so svc-secassist is
-    # trusted to skip MFA AND to forward the acting end-user (delegatingSubjects).
-    oidc_path = addr_dir / "secrouter-oidc.json"
-    oidc = json.loads(oidc_path.read_text())
-    assert oidc["serviceSubjects"] == ["svc-secagent", "svc-secassist"]
-    assert oidc["delegatingSubjects"] == ["svc-secassist"]
+    # SecRouter's OIDC config fragment — only svc-secagent (SecAgent's non-interactive account).
+    oidc = json.loads((addr_dir / "secrouter-oidc.json").read_text())
+    assert oidc["serviceSubjects"] == ["svc-secagent"]
+    assert "delegatingSubjects" not in oidc
     assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
-    # The install steps actually ran (not just staging content generated).
-    def _ran(*, cmd0: str, last: str) -> bool:
-        return any(c[:1] == [cmd0] and c[-1:] == [last] for c in run_calls)
-
+    # The harness install steps actually ran: pi globally + `secagent init`, and NO secagent unit.
     assert any(c == ["npm", "install", "-g", "@earendil-works/pi-coding-agent"] for c in run_calls)
-    assert _ran(cmd0="install", last="/etc/secsuite/secagent-addressing.env")
-    assert any(c == ["install", "-m", "640", str(secagent_env_path),
-                     "/etc/secsuite/secagent-addressing.env"] for c in run_calls)
+    assert any(c[:2] == ["bash", "-c"] and "secagent init --domain sec.internal" in c[2]
+               for c in run_calls)
+    assert not any("secagent.service" in " ".join(c) for c in run_calls)
 
     # The audit: booleans + declared subject, never a secret.
     audit_json_path = out / "audit" / "deploy-fedora-fips-core.json"
     audit_record = json.loads(audit_json_path.read_text())
     auth = audit_record["authorizations"]
-    assert auth["secagent_chat_enabled"] is True
+    assert auth["secagent_enabled"] is True
     assert auth["secagent_llm_at_secrouter"] is True
     assert auth["oidc_service_subject"] == "svc-secagent"
-    raw_audit = audit_json_path.read_text() + audit_json_path.with_suffix(".txt").read_text()
-    assert webhook_secret not in raw_audit

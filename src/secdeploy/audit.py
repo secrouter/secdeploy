@@ -124,12 +124,12 @@ def _authorizations_record(
             "rules_file": egress_rules_file,
             "note": note,
         },
-        # SecAgent (chat-ops, --with-agent) — again booleans/a fixed identifier only; the
-        # Mattermost bot token / webhook secret / SecSSO client secret are NEVER recorded here.
-        "secagent_chat_enabled": bool(secagent_enabled),
+        # SecAgent (the on-demand pi harness, --with-agent) — again booleans/a fixed identifier
+        # only; the SecSSO client secret is NEVER recorded here.
+        "secagent_enabled": bool(secagent_enabled),
         # secagent's LLM traffic is wired to SecRouter (never directly to SecLLM) whenever
         # secagent is enabled at all — see Topology.env_for's secagent branch — so this is the
-        # same underlying fact as secagent_chat_enabled, named separately because it is a
+        # same underlying fact as secagent_enabled, named separately because it is a
         # distinct claim an auditor may want to check (governed/audited inference path).
         "secagent_llm_at_secrouter": bool(secagent_enabled),
         # The service-account subject the generated secrouter-oidc.json fragment declares
@@ -186,7 +186,7 @@ def _render_txt(record: dict[str, object]) -> str:
         lines.append(f"    rules file: {auth['egress']['rules_file']}")
     lines.append(f"    note: {auth['egress']['note']}")
     lines += [
-        f"  SecAgent chat-ops enabled:         {'yes' if auth['secagent_chat_enabled'] else 'no'}",
+        f"  SecAgent harness enabled:          {'yes' if auth['secagent_enabled'] else 'no'}",
         f"  SecAgent LLM routed via SecRouter: {'yes' if auth['secagent_llm_at_secrouter'] else 'no'}",
         f"  OIDC service subject declared:     {auth['oidc_service_subject'] or '(none)'}"
         "  (recommendation for security.oidc.serviceSubjects — see secrouter-oidc.json)",
@@ -235,11 +235,10 @@ def write_deploy_audit(
     :func:`secdeploy.wiring.secllm_shared_token`) is wired for this deploy. The token VALUE is
     never accepted by this function and never appears in the artifact.
 
-    ``secagent_enabled`` records (boolean only) whether this deploy stood up SecAgent's
-    Mattermost chat-ops service (``--with-agent``) — see ``secagent_chat_enabled``/
-    ``secagent_llm_at_secrouter``/``oidc_service_subject`` in the ``authorizations`` section.
-    Like ``secllm_auth_enabled``, no secret (the SecSSO client secret, Mattermost bot token, or
-    webhook secret) is ever accepted by this function or appears in the artifact.
+    ``secagent_enabled`` records (boolean only) whether this deploy installed SecAgent's on-demand
+    pi harness (``--with-agent``) — see ``secagent_enabled``/``secagent_llm_at_secrouter``/
+    ``oidc_service_subject`` in the ``authorizations`` section. Like ``secllm_auth_enabled``, no
+    secret (the SecSSO client secret) is ever accepted by this function or appears in the artifact.
 
     ``now`` is injectable (default :func:`datetime.now` in UTC) so callers get a deterministic,
     testable timestamp instead of wall-clock time.

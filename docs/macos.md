@@ -22,14 +22,13 @@ colima start                                # Docker daemon on Apple Silicon
 ```
 
 > **Deploying SecChat or SecSSO?** Both run **native arm64** on Apple Silicon — no
-> Rosetta/emulation. Mattermost's *published* image is amd64-only, but its release *binary* ships
-> arm64 too, so SecChat builds a native Mattermost image from the official binary (see
-> `secchat/Dockerfile`); SecSSO's Authentik/Postgres/Redis are multi-arch. Two practical notes:
-> give Colima headroom for the extra containers, and SecChat's **first** bring-up *builds*
-> Mattermost (a download + build — a few minutes, one-time, then cached):
+> Rosetta/emulation. SecChat is a Node/TS + Postgres app that builds its own small image from the
+> repo on first bring-up (see `secchat/Dockerfile`); SecSSO's Authentik/Postgres/Redis are
+> multi-arch. Two practical notes: give Colima headroom for the extra containers, and SecChat's
+> **first** bring-up *builds* its image (a couple of minutes, one-time, then cached):
 >
 > ```bash
-> colima start --cpu 4 --memory 8 --disk 60   # room for SecChat + SecSSO (Mattermost, Authentik, 2× Postgres, Redis)
+> colima start --cpu 4 --memory 8 --disk 60   # room for SecChat + SecSSO (Authentik, Postgres, Redis)
 > ```
 >
 > If you don't need chat/SSO for an eval, `deploy macos --without secsso,secchat` skips them.
@@ -94,13 +93,12 @@ these units (`launchctl bootout` + remove the plist) — see [Teardown](#teardow
 > on macOS it stays generated-but-unapplied. Use `fedora-fips` (or hand-edit `compose.yaml` to
 > mount the file yourself) for anything beyond a single-host eval.
 
-`deploy macos --with-agent` (with a `topology.toml` placing SecAgent here) installs SecAgent's
-`secagent chat serve` bridge as a launchd daemon **with its wiring layered in**: the generated
-addressing env (`out/addressing/env/secagent.env` — LLM/SecSSO/Mattermost wiring + webhook secret)
-and the `SECAGENT_*` operator secrets from `deploy/macos/secrets.env` are read and folded into the
-launchd job's `EnvironmentVariables` — the macOS equivalent of fedora-fips's two `EnvironmentFile=`
-layers, closing the old "source it yourself" gap. See
-[SecAgent and Mattermost](fedora-fips.md#secagent-and-mattermost) for the full turnkey standup.
+`deploy macos --with-agent` (with a `topology.toml` placing SecAgent here) installs SecAgent as an
+**on-demand pi harness** (MR review / code analysis / testgen / docs — CLI / CI / MCP), NOT a
+standing service: it puts `secagent` on PATH (`uv tool install`) and runs `secagent init` to wire up
+pi + the secagent CLI for the deploying user, pointed at this topology's SecRouter/SecSSO (`secagent
+login` afterwards authenticates you, device-code). See
+[SecAgent (the pi harness)](fedora-fips.md#secagent-the-pi-harness) for the full standup.
 
 `--with-agent` also installs **LeanCTX** (context compression — SecAgent v0.3.0 ships it on by
 default): the pinned `lean-ctx` binary + `pi-lean-ctx` extension are installed and wired into pi
@@ -110,22 +108,18 @@ update phone-home), best-effort (a missing `npm` just skips it — SecAgent degr
 compression daemon is a deferred follow-on (LeanCTX self-manages that, incl. an auto-updater to
 suppress). See SecAgent's `docs/leanctx.md` for the full security posture.
 
-### SecAssist + declared users
+### SecChat + declared users
 
-**SecAssist** (the LibreChat chat UI) deploys with the suite as a stack — no flag — and its
-env is fully turnkey: when SecSSO is also placed, the deploy mirrors SecSSO's two generated
-OIDC secrets and writes the topology issuer/SecRouter/domain env into `work/secassist/.env`
-(nothing to reconcile by hand). And a `[[users]]` list in your `secsite.toml` provisions those
-accounts in SecSSO with random, must-reset-on-first-login passwords (printed once at deploy).
-Both work identically on Fedora — see [fedora-fips.md](fedora-fips.md#onboarding-users-users)
-for the `[[users]]` shape and the security notes.
-
-The **native SecChat rebuild** (`secchatng`, experimental — opt in with `--with secchatng`) is
-just as turnkey, with one client instead of two: when secchatng and SecSSO are both placed, the
-deploy mirrors SecSSO's generated `SECCHATNG_OIDC_CLIENT_SECRET` and writes the topology
-issuer/audience/client-id/public-url/SecRouter env into `work/secchatng/.env`. See
-[fedora-fips.md](fedora-fips.md#secrouter-oidc-config-fragment) for the full
-`wiring.sync_secchatng_env` details — identical on both targets.
+The native **SecChat** (the canonical `secchat` stack) deploys with the suite — no flag — and its
+env is fully turnkey: when SecSSO is also placed, the deploy mirrors SecSSO's generated OIDC
+login-client secret and writes the topology issuer/audience/client-id/public-url/SecRouter env into
+`work/secchat/.env` (nothing to reconcile by hand; its SSO client id stays `secchatng`, the retained
+Authentik client — users only ever see "SecChat"). And a `[[users]]` list in your `secsite.toml`
+provisions those accounts in SecSSO with random, must-reset-on-first-login passwords (printed once at
+deploy). Both work identically on Fedora — see
+[fedora-fips.md](fedora-fips.md#onboarding-users-users) for the `[[users]]` shape and the security
+notes, and [Native SecChat turnkey env](fedora-fips.md#native-secchat-turnkey-env) for the
+`wiring.sync_secchat_env` details (identical on both targets).
 
 ### Internal DNS (`*.internal`) on macOS
 
@@ -299,14 +293,6 @@ serves that — enough to terminate TLS for a local eval (browsers warn on an un
 that's expected locally). You place nothing by hand. For a trusted cert, run where SecCert can
 validate the fronted names from inside its container — that's what `fedora-fips` provides.
 
-### SecAgent's port
-
-`suite.toml` gives secagent port `47007` — the port the generated nginx config's
-`secagent.<domain>` server block reverse-proxies to. The macOS launchd daemon starts
-`secagent chat serve` on **that manifest port** (not the CLI's own `8070` default), so the
-`secagent.<domain>` reverse-proxy route reaches it end-to-end — no manual `--port` override
-needed. (fedora-fips's systemd unit likewise runs it on the manifest port.)
-
 ## Verify
 
 ```bash
@@ -404,9 +390,9 @@ Without `--purge`, `docker compose down` keeps the `seccert-data` volume and `ou
 alone entirely. `--purge` changes the compose step to `down -v` (which **wipes
 `seccert-data` — the CA**), offers `docker rmi` for any built `secrouter/{seccert,secrouter}`
 image (compose down never removes images; they're rebuildable via `secdeploy build macos`),
-and offers to remove `out/` — which caches `out/seccert-root.pem` plus the SecLLM/SecAgent
-shared tokens (`secllm-shared-token`, `secagent-webhook-secret`) another *live* deploy
-sharing this same `--out` may still depend on.
+and offers to remove `out/` — which caches `out/seccert-root.pem` plus the SecLLM shared
+token (`secllm-shared-token`) another *live* deploy sharing this same `--out` may still
+depend on.
 
 `--purge` asks a **second, separate, extra-loud** confirmation before any of this, naming
 exactly what's lost: wiping `seccert-data` destroys the CA private key the same way
@@ -442,7 +428,7 @@ listed under "NOT removed" only, since other tools on this Mac may depend on the
 - the host-side cached secrets a deploy leaves under `out/` (`seccert-root.pem`, the
   SecLLM/SecAgent tokens), `deploy/macos/secrets.env` (your `HF_TOKEN`), and
   `~/.secagent` / `~/.config/secrouter`;
-- each stack's database + uploads + `.env` (SecSSO/SecChat/SecAssist), via their own
+- each stack's database + uploads + `.env` (SecSSO/SecChat), via their own
   `bootstrap/<name>.sh backup`.
 
 It's the same public-key flow as the [fedora-fips runbook](fedora-fips.md#backup-and-restore)

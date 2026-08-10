@@ -149,14 +149,13 @@ deploy; change `topology.toml` instead.
 > something this mechanism fixes — see [docs/macos.md](macos.md) and use `fedora-fips` for a
 > real multi-host deployment.
 
-## SecAgent and Mattermost
+## SecAgent (the pi harness)
 
-`deploy fedora-fips --with-agent` stands up **SecAgent's chat-ops bridge** — `secagent chat
-serve`, receiving Mattermost slash-commands/outgoing-webhooks and replying in-thread — on the
-resource where the `collab` tier is placed (default off, opt-in exactly like
-`--with-inference`/SecLLM: the peer-wiring env below is always generated once SecAgent is in
-the topology, but installing + starting the service is opt-in, since it needs two manually
-provisioned secrets first — see below).
+`deploy fedora-fips --with-agent` installs **SecAgent as an on-demand pi harness** — MR review,
+code analysis, testgen, docs, driven by CLI / CI / MCP — on the resource where the `collab` tier
+is placed (default off, opt-in exactly like `--with-inference`/SecLLM: the peer-wiring env below
+is always generated once SecAgent is in the topology, but installing the harness is opt-in).
+SecAgent is **not** run as a standing service — there is no chat bridge and no systemd unit.
 
 ```bash
 sudo uv run secdeploy deploy fedora-fips --with-agent --resource <collab-resource> --dry-run
@@ -167,18 +166,13 @@ What `--with-agent` adds, on top of the normal steps:
 
 1. Installs **pi** (`@earendil-works/pi-coding-agent`) globally via npm — the agent runtime
    `secagent`'s Skill/extension integrate with (see `secagent`'s own `docs/pi.md`) — alongside
-   SecAgent's own code.
-2. Installs `secagent.service` (`ExecStart=... secagent chat serve --port 8070`) and the
-   generated addressing env `/etc/secsuite/secagent-addressing.env`, layered onto the
-   operator-filled `/etc/secsuite/secagent.env` via a second `EnvironmentFile=` — the exact
-   same two-file pattern as [SecRouter's own addressing env](#getting-the-generated-wiring-into-the-running-service):
-   later file wins, `-`-prefixed so it's optional wherever SecAgent isn't placed/enabled.
-3. Installs pi's system-wide `models.json` (`/var/lib/secsuite/secagent/.pi/agent/models.json`)
-   — adapted from `secagent`'s own checked-out `pi/models.secrouter.example.json`, substituting
-   the real SecRouter URL and adding the SERVICE api-key auth mode (see below); never hardcodes
-   or curates the model catalog itself.
-4. Prints the SecSSO/Mattermost secret-provisioning steps and the SecRouter OIDC config
-   fragment (see below) — as guidance, not automated cross-host actions.
+   SecAgent's own code/venv.
+2. Runs `secagent init` to wire up pi + the `secagent` CLI for the deploying user, pointed at
+   this topology's SecRouter/SecSSO. It writes `~/.pi/agent/models.json` + `~/.secagent/config.yaml`
+   using `!secagent token --user` as the credential (never a stored secret). Run `secagent login`
+   afterwards to authenticate (device-code, approved in a browser).
+3. Prints the SecSSO secret-provisioning step and the SecRouter OIDC config fragment (see below)
+   — as guidance, not automated cross-host actions.
 
 ### The generated addressing env
 
@@ -187,68 +181,47 @@ What `--with-agent` adds, on top of the normal steps:
 
 | Key | Value |
 |---|---|
-| `SECAGENT_LLM__BASE_URL` | `https://secrouter.<domain>:47002/v1` — **always SecRouter**, never SecLLM directly, so chat-triggered inference stays governed/audited |
+| `SECAGENT_LLM__BASE_URL` | `https://secrouter.<domain>:47002/v1` — **always SecRouter**, never SecLLM directly, so agent-triggered inference stays governed/audited |
 | `SECAGENT_LLM__API_KEY` | `!secagent token` — not a secret; a command SecAgent re-runs at each request (see below) |
-| `SECAGENT_LLM__MODEL` | `balanced` |
+| `SECAGENT_LLM__MODEL` | `auto` — SecRouter's own routing policy picks the backend |
 | `SECAGENT_SECSSO__TOKEN_URL` | `https://secsso.<domain>:9000/application/o/token/` |
 | `SECAGENT_SECSSO__CLIENT_ID` | `secagent` |
-| `SECAGENT_MATTERMOST__URL` / `__TEAM` | `https://secchat.<domain>:8065` / `secrouter` |
-| `SECAGENT_MATTERMOST__WEBHOOK_SECRET` | generated once, cached, never rotated on redeploy (same spirit as the [shared SecLLM token](#shared-secrouter-and-secllm-inference-token)) |
 | `SECAGENT_AUDIT__ENABLED` | `true` |
 
 ### Two auth modes
 
-SecAgent's own service identity against SecSSO (`client_credentials`, headless — see
-`secagent`'s `src/secagent/secsso.py`) backs **two** distinct things on this host, both fed by
-the same `secagent token` command:
+SecAgent's service identity against SecSSO (`client_credentials`, headless — see `secagent`'s
+`src/secagent/secsso.py`) and a per-user login are both reached via the same `secagent token`
+command; they differ only in whose identity a request is attributed to:
 
-- **The service/bot** — `secagent chat serve`'s own LLM calls use
-  `SECAGENT_LLM__API_KEY="!secagent token"` directly (no `models.json` involved for the bot
-  itself). Run `secagent token` by hand to see the bearer token it fetches (cached at
+- **Service / CI / MCP (non-interactive)** — `SECAGENT_LLM__API_KEY="!secagent token"` fetches a
+  client_credentials bearer token as the `svc-secagent` service account. Provision
+  `SECAGENT_CLIENT_SECRET` in `/etc/secsuite/secagent.env` (see below) for this path. Run
+  `secagent token` by hand to see the bearer token it fetches (cached at
   `~/.secagent/auth/secsso-token.json`, 0600, refreshed near expiry).
-- **pi run standalone/unattended on this host** — the installed
-  `/var/lib/secsuite/secagent/.pi/agent/models.json` (step 3 above) gives any `pi` invocation
-  as the `secsuite-secagent` user the same service identity out of the box (`apiKey:
-  "!secagent token"`), for automation that doesn't have an interactive human to log in.
-- **A developer using pi interactively** (not this service — their own machine or an
-  interactive session on this host) instead does a **per-user OAuth device-code login**,
-  attributed to *them*, not the shared service identity: load
-  `pi/extensions/secrouter-auth.ts` from the `secagent` checkout, then `/login secrouter`. See
-  `secagent`'s `pi/models.secrouter.example.json` and `docs/pi.md` for the full walkthrough.
+- **A developer using pi interactively** does a **per-user OAuth device-code login**, attributed
+  to *them*, not the shared service identity — this is exactly what `secagent init` + `secagent
+  login` set up (`!secagent token --user`). See `secagent`'s `pi/models.secrouter.example.json`
+  and `docs/pi.md` for the full walkthrough.
 
-Both modes ultimately reach SecRouter as the same governed/audited gateway; they differ only in
-whose identity a request is attributed to.
+Both modes ultimately reach SecRouter as the same governed/audited gateway.
 
-### Provisioning the two secrets (manual — see below for why)
+### Provisioning the service secret (manual — see below for why)
 
-`/etc/secsuite/secagent.env` (seeded once from `secagent.env.example`, never overwritten) needs
-two values secdeploy cannot fetch automatically — both come from a **different** host than the
-one running `deploy --with-agent`, and neither source exposes a machine-readable, safely
-re-invocable way to hand the value across:
+For the non-interactive (service / CI) path, `/etc/secsuite/secagent.env` (seeded once from
+`secagent.env.example`, never overwritten) needs one value secdeploy cannot fetch automatically
+— it comes from the SecSSO host, which exposes no machine-readable, safely re-invocable way to
+hand it across:
 
 ```bash
 # On the SecSSO host — confirms the client secret SecSSO's own operator already set in ITS
 # .env (SecSSO provisions this value; secdeploy doesn't mint it):
 ./bootstrap/secsso.sh secagent-config
 # → paste the SAME value into SECAGENT_CLIENT_SECRET on the SecAgent host's secagent.env
-
-# On the SecChat host — MINTS a fresh Mattermost bot token and prints it ONCE:
-./bootstrap/secchat.sh bot
-# → paste it into SECAGENT_MATTERMOST__BOT_TOKEN on the SecAgent host's secagent.env
 ```
 
-`secchat.sh bot` has no "get or create" semantics — re-running it mints a brand-new token every
-time — so `deploy --with-agent` only ever *prints* this step (dry-run and real alike); it never
-invokes `secchat.sh bot` itself. `secdeploy status`/`deploy` don't verify these are filled in
-either — `secagent chat serve` itself refuses to start without a `mattermost.webhook_secret`
-(generated automatically, see above) and will fail its own SecSSO calls loudly if
-`SECAGENT_CLIENT_SECRET`/`SECAGENT_MATTERMOST__BOT_TOKEN` are still blank; check
-`journalctl -u secagent.service` after first start.
-
-The generated `SECAGENT_MATTERMOST__WEBHOOK_SECRET` (see the table above) also needs a matching
-half on the Mattermost side: create a slash-command or outgoing-webhook definition in
-Mattermost's own admin console with **that same value** as its token — secdeploy has no
-Mattermost API access to register it for you.
+Interactive `secagent login` needs no secret here at all — the device-code flow authenticates the
+developer directly.
 
 ### SecRouter OIDC config fragment
 
@@ -265,37 +238,29 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
   "issuer": "https://secsso.<domain>/",
   "audience": "secrouter",
   "jwksUri": "https://secsso.<domain>/application/o/secrouter/jwks/",
-  "serviceSubjects": ["svc-secagent", "svc-secassist"],
-  "delegatingSubjects": ["svc-secassist"]
+  "serviceSubjects": ["svc-secagent"]
 }
 ```
 
 These values match `secsso.sh`'s own `oidc-config`/`secagent-config` output exactly (both
 derive from the same SecSSO external URL), so the two never disagree.
 
-When **SecAssist** (the LibreChat chat UI) is in the topology, `svc-secassist` is added to
-`serviceSubjects` **and** to `delegatingSubjects`: its auth proxy calls SecRouter on each
-signed-in user's behalf, forwarding `x-sec-acting-user`, so SecRouter governs and audits chat
-per end-user rather than as one shared account (see SecRouter's
-`security.oidc.delegatingSubjects` and secassist/docs/governance.md).
+### Native SecChat turnkey env
 
-**Turnkey env.** When SecAssist and SecSSO are both in the topology, the deploy is fully
-turnkey — no manual reconciliation: it mirrors SecSSO's two generated OIDC secrets into
-`work/secassist/.env` and writes the topology-derived issuer / SecRouter URL / domain there
-(see `wiring.sync_secassist_env`), leaving the per-instance secrets for the stack's own seed.
-An external IdP (no SecSSO) means you supply those two secrets yourself, as before.
-
-**Native SecChat (`secchatng`, experimental — opt in with `--with secchatng`).** Same turnkey
-shape as SecAssist above, one client instead of two: when secchatng and SecSSO are both in the
-topology, the deploy mirrors SecSSO's generated `SECCHATNG_OIDC_CLIENT_SECRET` into
-`work/secchatng/.env`'s `SECCHAT_OIDC_CLIENT_SECRET` and writes the topology-derived
-`SECCHAT_OIDC_ISSUER` / `_AUDIENCE` / `_CLIENT_ID` / `SECCHAT_PUBLIC_URL` / `SECROUTER_URL`
-there too (see `wiring.sync_secchatng_env`). secchatng's backend runs the OIDC Authorization
-Code + PKCE exchange itself (a BFF — the browser only ever gets an httpOnly session cookie), so
-unlike SecAssist's auth proxy there's no second, client_credentials service secret to mirror,
-and no `svc-secchatng` entry in the OIDC config fragment above. `SECCHAT_SESSION_SECRET` (the
-session-cookie signing key) is untouched by this sync — it's seeded blank-to-random the same
-way as every other stack's per-instance secrets.
+The native **SecChat** (the canonical `secchat` stack — SSO login, tamper-evident audit,
+owner-gated agents) is fully turnkey when it and SecSSO are both in the topology — no manual
+reconciliation. The deploy mirrors SecSSO's generated `SECCHATNG_OIDC_CLIENT_SECRET` into
+`work/secchat/.env`'s `SECCHAT_OIDC_CLIENT_SECRET` and writes the topology-derived
+`SECCHAT_OIDC_ISSUER` / `_AUDIENCE` / `_CLIENT_ID` / `SECCHAT_PUBLIC_URL` / `SECROUTER_URL` there
+too (see `wiring.sync_secchat_env`). SecChat's backend runs the OIDC Authorization Code + PKCE
+exchange itself (a BFF — the browser only ever gets an httpOnly session cookie), so there's no
+second, client_credentials service secret to mirror, and no `svc-secchat` entry in the OIDC
+fragment above. Its SSO client id stays `secchatng` (the retained Authentik client — users only
+ever see "SecChat"), so the SecSSO-side env var names (`SECCHATNG_OIDC_CLIENT_SECRET`,
+`SECCHATNG_REDIRECT_URI`, `SECCHATNG_LAUNCH_URL`) keep that slug. `SECCHAT_SESSION_SECRET` (the
+session-cookie signing key) is untouched by this sync — it's seeded blank-to-random the same way
+as every other stack's per-instance secrets. An external IdP (no SecSSO) means you supply the
+OIDC values yourself, as before.
 
 ## Onboarding users (`[[users]]`)
 
@@ -452,7 +417,7 @@ Edit the env files the installer dropped (they don't overwrite existing ones):
 sudoedit /etc/secsuite/seccert.env      # set SECCERT_ADMIN_TOKEN, SECCERT_CA_PASSPHRASE, external URL
 sudoedit /etc/secsuite/secrouter.env    # point FREEROUTER_CONFIG at a hardened config
 sudoedit /etc/secsuite/secrecorder.env  # or: sudo systemctl mask secrecorder.service to skip it
-sudoedit /etc/secsuite/secagent.env     # --with-agent only: SECAGENT_CLIENT_SECRET + SECAGENT_MATTERMOST__BOT_TOKEN
+sudoedit /etc/secsuite/secagent.env     # --with-agent only: SECAGENT_CLIENT_SECRET (service/CI auth)
 sudo systemctl restart secsuite.target
 ```
 
@@ -462,8 +427,8 @@ in the SecRouter checkout.
 
 > **Filling these in *before* the first deploy.** `secdeploy configure`'s optional secret-
 > seeding step (asked right after it writes `secsite.toml`) can pre-fill these same values —
-> `SECCERT_ADMIN_TOKEN`/`SECCERT_CA_PASSPHRASE`, `SECAGENT_CLIENT_SECRET`/
-> `SECAGENT_MATTERMOST__BOT_TOKEN`, `HF_TOKEN`, `FREEROUTER_CONFIG` — into the checkout's own
+> `SECCERT_ADMIN_TOKEN`/`SECCERT_CA_PASSPHRASE`, `SECAGENT_CLIENT_SECRET`,
+> `HF_TOKEN`, `FREEROUTER_CONFIG` — into the checkout's own
 > `deploy/fedora-fips/<svc>.env` (gitignored, `0600`), which `deploy` then installs to
 > `/etc/secsuite/<svc>.env` on first run **in place of** the blank `.env.example` (the
 > `test -f … || install …` non-clobber guard still applies — an already-seeded target host is
@@ -519,8 +484,8 @@ bring down any SecSSO/SecChat stack via its own `bootstrap/<name>.sh down`.
 - Without `--dry-run`, the full plan is still printed first, then you're asked to confirm
   before anything runs; `-y`/`--yes` skips the prompt (for automation).
 - `/etc/secsuite` holds **operator-typed secrets with no backup anywhere else** —
-  `SECCERT_CA_PASSPHRASE`, `SECCERT_ADMIN_TOKEN`, `SECAGENT_CLIENT_SECRET`,
-  `SECAGENT_MATTERMOST__BOT_TOKEN` in the `*.env` files. Teardown prints this warning before
+  `SECCERT_CA_PASSPHRASE`, `SECCERT_ADMIN_TOKEN`, `SECAGENT_CLIENT_SECRET`
+  in the `*.env` files. Teardown prints this warning before
   removing the directory; copy it aside first if you'll need any of those values again.
 - Distro packages (`nodejs`/`npm`, `uv`, `nginx`, `certbot`, `podman`) and the global npm
   package `@earendil-works/pi-coding-agent` are **never removed** — they're listed under "NOT
@@ -578,10 +543,10 @@ domain, tearing this down strands it — that's an operator call teardown can't 
 service's `/var/lib/secsuite/<svc>` (the SecCert **CA private key**, SecRouter's hash-chained
 audit/usage SQLite, SecAgent's `audit.jsonl`, the SecDNS zone), all of `/etc/secsuite/*.env`
 (the secrets that decrypt/authorize the rest — `SECCERT_CA_PASSPHRASE`, tokens), and each
-stack's database + uploads (Authentik, Mattermost, LibreChat) — into **one encrypted archive**.
+stack's database + uploads (Authentik, SecChat) — into **one encrypted archive**.
 
 **Why one encrypted archive, all or nothing.** The state and its secrets are cryptographically
-coupled: LibreChat's `CREDS_KEY` (in its `.env`) decrypts secrets *inside* the Mongo dump,
+coupled: each stack's `.env` holds the DB credentials its dump is restored with,
 `SECCERT_CA_PASSPHRASE` decrypts the CA keys, SecSSO's `users.generated.yaml` holds cleartext
 initial passwords. A data-only backup is un-restorable, so it's data + secrets + certs together
 — or nothing — and it is always encrypted.
