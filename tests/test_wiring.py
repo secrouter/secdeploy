@@ -958,6 +958,72 @@ def test_sync_secrecorder_env_refreshes_managed_keys_on_rerun_and_keeps_operator
     assert vals2["SECRECORDER_SESSION_SECRET"] == "do-not-touch"  # untouched across both runs
 
 
+# ── env_for secllm branch + sync_secllm_env / sync_secsso_secllm_redirect: turnkey SecLLM ADMIN
+#    SSO (inference keeps its shared token). Like SecRecorder, SecLLM is a NATIVE service whose managed
+#    env is the topology-generated addressing env (env/secllm.env). It is NEVER fronted (inference must
+#    dial direct), so its own URL is the direct host:port, which also serves /admin. ──
+def test_env_for_secllm_admin_oidc_branch(tmp_path):
+    topo = _topo(tmp_path)
+    env = topo.env_for("secllm")
+    assert env["SECLLM_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secllm/"
+    assert env["SECLLM_OIDC_AUDIENCE"] == "secllm"
+    assert env["SECLLM_OIDC_CLIENT_ID"] == "secllm"
+    assert env["SECLLM_PUBLIC_URL"] == "http://secllm.sec.internal:11400"  # direct — never fronted
+    # inference identity is NOT here (the shared token path is separate); nor the client secret.
+    assert "SECLLM_OIDC_CLIENT_SECRET" not in env
+    assert "SECLLM_API_TOKEN" not in env and "SECROUTER_SECLLM_TOKEN" not in env
+
+
+def test_sync_secllm_env_mirrors_secret_and_writes_topology(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECLLM_OIDC_CLIENT_SECRET=admin-login-xyz\n")
+    secllm_env = tmp_path / "secllm.env"
+    secllm_env.write_text(
+        "SECLLM_OIDC_ISSUER=https://stale.example/wrong\n"
+        "SECLLM_SESSION_SECRET=keep-me\n"        # local session-cookie secret — must survive
+        "SECLLM_ADMIN_TOKEN=break-glass\n"       # the break-glass token — never managed here
+    )
+    written = wiring.sync_secllm_env(secsso_env, secllm_env, topo)
+    assert written is not None and written == sorted(wiring._SECLLM_MANAGED_KEYS)
+    vals = _env_dict(secllm_env)
+    assert vals["SECLLM_OIDC_CLIENT_SECRET"] == "admin-login-xyz"  # the mirrored secret
+    assert vals["SECLLM_OIDC_ISSUER"] == "http://secsso.sec.internal:9000/application/o/secllm/"  # refreshed
+    assert vals["SECLLM_OIDC_AUDIENCE"] == "secllm" and vals["SECLLM_OIDC_CLIENT_ID"] == "secllm"
+    assert vals["SECLLM_PUBLIC_URL"] == "http://secllm.sec.internal:11400"
+    # non-managed keys survive untouched: the local session secret + the break-glass admin token
+    assert vals["SECLLM_SESSION_SECRET"] == "keep-me"
+    assert vals["SECLLM_ADMIN_TOKEN"] == "break-glass"
+
+
+def test_sync_secllm_env_noop_without_secret_or_files(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"; secsso_env.write_text("PG_PASS=x\n")  # secret not provisioned yet
+    secllm_env = tmp_path / "secllm.env"; secllm_env.write_text("SECLLM_OIDC_ISSUER=x\n")
+    assert wiring.sync_secllm_env(secsso_env, secllm_env, topo) is None
+    assert wiring.sync_secllm_env(tmp_path / "nope-a", tmp_path / "nope-b", topo) is None
+
+
+def test_sync_secsso_secllm_redirect_points_at_admin_callback(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text(
+        "SECLLM_REDIRECT_URI=https://secllm.sec.internal/auth/callback\n"  # .env.example default
+        "SECLLM_LAUNCH_URL=https://secllm.sec.internal/admin\n"
+        "AUTHENTIK_SECRET_KEY=keep-me\n"
+    )
+    written = wiring.sync_secsso_secllm_redirect(secsso_env, topo)
+    assert written == ["SECLLM_LAUNCH_URL", "SECLLM_REDIRECT_URI"]
+    vals = _env_dict(secsso_env)
+    assert vals["SECLLM_REDIRECT_URI"] == "http://secllm.sec.internal:11400/auth/callback"
+    assert vals["SECLLM_LAUNCH_URL"] == "http://secllm.sec.internal:11400/admin"  # tile → console
+    # callback = SECLLM_PUBLIC_URL + /auth/callback, so redirect_uri matches the SecLLM side by construction
+    assert vals["SECLLM_REDIRECT_URI"].startswith("http://secllm.sec.internal:11400")
+    assert vals["AUTHENTIK_SECRET_KEY"] == "keep-me"  # untouched
+    # noop when secsso .env is missing
+    assert wiring.sync_secsso_secllm_redirect(tmp_path / "nope.env", topo) is None
+
+
 def test_sync_secagent_service_secret_missing_files_is_a_noop(tmp_path):
     assert wiring.sync_secagent_service_secret(
         tmp_path / "nope.env", tmp_path / "also-nope.env",

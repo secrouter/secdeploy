@@ -850,6 +850,80 @@ def sync_secsso_secrecorder_redirect(
     return sorted(to_write)
 
 
+# The MANAGED keys secdeploy owns in SecLLM's generated addressing env — the mirrored admin-login
+# secret from SecSSO plus the topology-derived admin OIDC wiring (env_for("secllm")). Everything else
+# stays untouched: SECLLM_SESSION_SECRET (the admin session-cookie signing key — a local, unshared
+# value) is an operator/seed step, and SECLLM_ADMIN_TOKEN / SECLLM_API_TOKEN (the break-glass admin
+# token and the SecRouter↔SecLLM inference token) are never forced here.
+_SECLLM_MANAGED_KEYS = frozenset({
+    "SECLLM_OIDC_CLIENT_SECRET", "SECLLM_OIDC_ISSUER", "SECLLM_OIDC_AUDIENCE",
+    "SECLLM_OIDC_CLIENT_ID", "SECLLM_PUBLIC_URL",
+})
+
+
+def sync_secllm_env(
+    secsso_env_path: str | Path, secllm_env_path: str | Path,
+    topology: Topology, without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Make SecLLM's optional ADMIN SSO turnkey: mirror the OIDC login-client secret SecSSO generated
+    and (re)write the topology-derived admin-OIDC env into SecLLM's env file. The exact counterpart of
+    :func:`sync_secrecorder_env`, for SecLLM's admin plane — inference (/v1) is untouched.
+
+    SecLLM isn't a compose ``stack`` (native service), so ``secllm_env_path`` is the topology-generated
+    addressing env :func:`write_addressing` writes (``out/addressing/env/secllm.env``), layered onto the
+    running service by the targets layer (launchd ``env`` on macOS, a second ``EnvironmentFile=`` on
+    fedora-fips). **Overwrites** the fixed MANAGED set (:data:`_SECLLM_MANAGED_KEYS`): the topology
+    values from ``env_for("secllm")`` (issuer, audience, client id, SecLLM's own public URL), refreshed
+    idempotently, plus the one non-topology value ``SECLLM_OIDC_CLIENT_SECRET`` ← SecSSO's own
+    ``SECLLM_OIDC_CLIENT_SECRET`` (SecLLM's confidential admin login client; its BFF runs the auth-code
+    + PKCE dance server-side). ``SECLLM_SESSION_SECRET`` is deliberately NOT managed here — a local,
+    unshared value that must stay stable across redeploys.
+
+    Returns the sorted keys written, or ``None`` if either file is missing or SecSSO hasn't generated
+    the secret yet. Called only where SecSSO is co-placed; an external IdP means the operator supplies
+    these directly.
+    """
+    secsso_env_path, secllm_env_path = Path(secsso_env_path), Path(secllm_env_path)
+    if not secsso_env_path.exists() or not secllm_env_path.exists():
+        return None
+    secsso = _read_env_values(secsso_env_path)
+    client_secret = secsso.get("SECLLM_OIDC_CLIENT_SECRET", "")
+    if not client_secret:
+        return None
+    managed = dict(topology.env_for("secllm", without, scheme))
+    managed["SECLLM_OIDC_CLIENT_SECRET"] = client_secret
+    to_write = {k: v for k, v in managed.items() if k in _SECLLM_MANAGED_KEYS}
+    _set_env_keys(secllm_env_path, to_write)
+    return sorted(to_write)
+
+
+def sync_secsso_secllm_redirect(
+    secsso_env_path: str | Path, topology: Topology,
+    without: list[str] | None = None, scheme: str = "https",
+) -> list[str] | None:
+    """Point SecSSO's SecLLM admin OIDC client (client id ``secllm``) at wherever SecLLM is actually
+    addressed in THIS topology, by writing ``SECLLM_REDIRECT_URI`` + ``SECLLM_LAUNCH_URL`` into secsso's
+    ``.env`` BEFORE Authentik boots (the counterpart to :func:`sync_secllm_env`). The ``secllm.yaml``
+    blueprint reads both via ``!Env``; without this they fall back to the ``sec.internal`` default and
+    admin login fails with a ``redirect_uri`` mismatch. The launch tile points at the ``/admin`` console.
+
+    Uses SecLLM's own URL from :meth:`Topology.urls` — the same value ``env_for("secllm")`` derives
+    ``SECLLM_PUBLIC_URL`` from (SecLLM is never fronted, so this is its direct host:port) — so the two
+    sides agree by construction. Returns the keys written, or ``None`` if secsso's ``.env`` is missing or
+    SecLLM isn't placed in this topology.
+    """
+    secsso_env_path = Path(secsso_env_path)
+    if not secsso_env_path.exists():
+        return None
+    base = topology.urls(without, scheme).get("SECLLM")
+    if not base:
+        return None
+    base = base.rstrip("/")
+    to_write = {"SECLLM_REDIRECT_URI": f"{base}/auth/callback", "SECLLM_LAUNCH_URL": f"{base}/admin"}
+    _set_env_keys(secsso_env_path, to_write)
+    return sorted(to_write)
+
+
 def _read_generated_user_passwords(path: Path) -> dict[str, str]:
     """Extract ``{username: password}`` from an existing generated users blueprint. Line-based on
     the file's own fixed shape (username in identifiers, password in attrs) — no YAML dep."""

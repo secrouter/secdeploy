@@ -628,6 +628,23 @@ def deploy(
             if rec_env:
                 P.log(f"secrecorder: synced OIDC secret + topology env → "
                       f"{addr_dir / 'env' / 'secrecorder.env'} ({len(rec_env)} keys)")
+        # SecLLM admin SSO — the SecRecorder block's counterpart for SecLLM's admin plane only
+        # (inference keeps its shared token). Same gating + ordering: land the redirect_uri in
+        # SecSSO's .env and the mirrored admin secret + topology OIDC env in secllm.env before secsso
+        # boots and before the addressing EnvironmentFile is copied in.
+        if (placed and "secllm" in placed and "secllm" not in without
+                and "secsso" in placed and "secsso" not in without):
+            common.ensure_stack_secrets(work, ["secsso"])
+            llm_redir = wiring.sync_secsso_secllm_redirect(
+                work / "secsso" / ".env", topology, without)
+            if llm_redir:
+                P.log("secsso: pointed the SecLLM admin OIDC client at its topology callback "
+                      "(SECLLM_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+            llm_env = wiring.sync_secllm_env(
+                work / "secsso" / ".env", addr_dir / "env" / "secllm.env", topology, without)
+            if llm_env:
+                P.log(f"secllm: synced admin OIDC secret + topology env → "
+                      f"{addr_dir / 'env' / 'secllm.env'} ({len(llm_env)} keys)")
         P.log(f"addressing artifacts written → {addr_dir}")
     for cmd, desc in steps:
         P.log(desc)

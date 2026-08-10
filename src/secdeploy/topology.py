@@ -475,6 +475,28 @@ class Topology:
             self_url = peer_urls.get("SECRECORDER")
             if self_url:
                 env["SECRECORDER_PUBLIC_URL"] = self_url
+        if component == "secllm":
+            # SecLLM's optional, off-by-default ADMIN SSO reads plain SECLLM_* env. Its trust root is
+            # SecSSO's per-provider issuer (JWKS discovered from it); audience AND client id are both
+            # its OIDC client id `secllm` (a brand-new confidential login client — its admin BFF runs
+            # the Authorization Code + PKCE dance itself, server-side; see secsso/blueprints/
+            # secllm.yaml). This gates the /admin console + control API ONLY — inference (/v1) keeps
+            # its own SECLLM_API_TOKEN and the SecRouter↔SecLLM shared token, so there is NO inference
+            # identity here. SECLLM_OIDC_CLIENT_SECRET is mirrored from SecSSO's generated .env by
+            # wiring.sync_secllm_env (not topology-derived); SECLLM_SESSION_SECRET (the session-cookie
+            # signing key) is a local operator/seed value, so neither is set here. Admin membership is
+            # gated by SECLLM_ADMIN_GROUP (default `secllm-admins`), which the blueprint provisions.
+            secsso_url = peer_urls.get("SECSSO")
+            if secsso_url:
+                env["SECLLM_OIDC_ISSUER"] = f"{secsso_url}/application/o/secllm/"
+                env["SECLLM_OIDC_AUDIENCE"] = "secllm"
+                env["SECLLM_OIDC_CLIENT_ID"] = "secllm"
+            # SecLLM is never fronted (inference dials direct), so its own URL is the direct
+            # host:port — which also serves /admin; the admin BFF builds its redirect as
+            # <SECLLM_PUBLIC_URL>/auth/callback and decides the session cookie's Secure flag from it.
+            self_url = peer_urls.get("SECLLM")
+            if self_url:
+                env["SECLLM_PUBLIC_URL"] = self_url
         return env
 
     # ── serialization ──────────────────────────────────────────────────────────────
