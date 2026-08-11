@@ -30,9 +30,9 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 
 [components.secsso]
 repo = "secrouter/secsso"
-# rearchitecture branch (not the v1.1.0 tag) so the secchatng OIDC blueprint + the redirect-env
-# passthrough travel with this transitional deploy. Repin to a secsso release tag at cutover.
-ref = "rearchitecture"
+# main — carries the secchatng OIDC blueprint + the redirect-env passthrough (promoted from the
+# rearchitecture rebuild branch). Repin to a secsso release tag at the next suite release.
+ref = "main"
 kind = "stack"
 tier = "identity"
 port = 9000
@@ -90,11 +90,11 @@ role = "pi agentic harness — MR review, code analysis, testgen, docs (CLI / CI
 # tamper-evident hash chains, owner-gated agents). This is now the canonical chat component: the
 # native rebuild that replaced BOTH prior chat components (team chat and governed AI chat) in one
 # app. Its SSO client id in SecSSO stays `secchatng` (the retained Authentik client — users only
-# ever see "SecChat"). Ref tracks the rebuild branch until a release tag is cut — repin to a
-# secchat release tag at the next suite release, alongside secsso.
+# ever see "SecChat"). Ref tracks `main` until a release tag is cut — repin to a secchat release
+# tag at the next suite release, alongside secsso.
 [components.secchat]
 repo = "secrouter/secchat"
-ref = "rearchitecture"
+ref = "main"
 kind = "stack"
 tier = "collab"
 port = 47010
