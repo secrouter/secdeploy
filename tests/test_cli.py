@@ -84,7 +84,7 @@ def test_plan_macos_lists_all(capsys):
     out = capsys.readouterr().out
     assert "compose" in out.lower()
     assert "seccert @ v1.0.0" in out
-    assert "secchat @ rearchitecture" in out   # the native SecChat rebuild
+    assert "secchat @ main" in out   # the native SecChat rebuild (promoted to canonical main)
 
 
 def test_plan_without_drops_optionals(capsys):

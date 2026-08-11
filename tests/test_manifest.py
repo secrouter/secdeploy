@@ -20,7 +20,7 @@ def test_load_shipped_manifest():
     assert set(m.components) == ALL  # exactly these — the two retired chat components are gone
     assert m.components["secrecorder"].ref == "v0.8.2"
     assert m.components["secagent"].ref == "main"           # bridge-free harness, pre-release ref
-    assert m.components["secchat"].ref == "rearchitecture"  # native SecChat rebuild
+    assert m.components["secchat"].ref == "main"  # native SecChat rebuild (promoted to canonical main)
     assert set(m.targets) == {"macos", "fedora-fips"}
 
 
