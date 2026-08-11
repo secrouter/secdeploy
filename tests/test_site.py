@@ -318,3 +318,64 @@ def test_users_round_trip(tmp_path):
     reloaded = _site(tmp_path, site.to_toml())
     assert [(u.username, u.email, u.name, u.groups) for u in reloaded.users] == \
            [(u.username, u.email, u.name, u.groups) for u in site.users]
+
+
+# ── Kubernetes agent pool ([secchat.pool]) ───────────────────────────────────────────
+SITE_POOL = BARE + """
+[secchat.pool]
+enabled = true
+image = "registry.internal/secchat-runnerd:1.0.0"
+namespace = "chat-pool"
+service_account = "secchat"
+service_account_namespace = "chat"
+git_host = "git.sec.internal"
+secchat_url = "http://secchat.chat.svc:47010"
+max_pods = 12
+ttl_seconds = 1800
+"""
+
+
+def test_secchat_pool_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.secchat_pool.enabled is False
+    assert site.secchat_pool.image == ""
+    assert site.secchat_pool.namespace == "secchat-pool"  # the default
+
+
+def test_secchat_pool_parses_all_fields(tmp_path):
+    pool = _site(tmp_path, SITE_POOL).secchat_pool
+    assert pool.enabled is True
+    assert pool.image == "registry.internal/secchat-runnerd:1.0.0"
+    assert pool.namespace == "chat-pool"
+    assert pool.service_account == "secchat"
+    assert pool.service_account_namespace == "chat"
+    assert pool.git_host == "git.sec.internal"
+    assert pool.secchat_url == "http://secchat.chat.svc:47010"
+    assert pool.max_pods == 12
+    assert pool.ttl_seconds == 1800
+
+
+def test_secchat_pool_enabled_without_image_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="image is required"):
+        _site(tmp_path, BARE + "\n[secchat.pool]\nenabled = true\n")
+
+
+def test_secchat_pool_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secchat.pool\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secchat.pool]\nimage = "x"\nbogus = 1\n')
+
+
+def test_secchat_section_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secchat\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secchat]\nnope = 1\n')
+
+
+def test_secchat_pool_round_trips_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_POOL)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.secchat_pool == site.secchat_pool
+
+
+def test_bare_config_emits_no_pool_section(tmp_path):
+    # A pool-less site never writes a [secchat.pool] block (keeps bare configs clean).
+    assert "[secchat.pool]" not in _site(tmp_path, BARE).to_toml()

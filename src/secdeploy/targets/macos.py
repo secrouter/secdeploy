@@ -714,6 +714,7 @@ def deploy(
     native_services: bool = True,
     autostart_models: list[str] | None = None,
     users=None,
+    secchat_pool=None,
 ) -> None:
     without = without or []
     users = users or []
@@ -916,10 +917,16 @@ def deploy(
         # NB: a distinct name — NOT `written` — so this doesn't clobber the addressing dict from
         # write_addressing() above, which the deploy-audit call below still needs as `addressing=`.
         written_secchat = wiring.sync_secchat_env(
-            work / "secsso" / ".env", work / "secchat" / ".env", topology, without)
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without, pool=secchat_pool)
         if written_secchat:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(written_secchat)} keys)")
+        # Optional Kubernetes agent pool: emit the cluster manifests for the operator to apply.
+        if secchat_pool is not None and secchat_pool.enabled:
+            pool_path = wiring.write_pool_manifests(secchat_pool, base_out / "addressing")
+            if pool_path:
+                P.log(f"secchat: wrote Kubernetes agent-pool manifests → {pool_path} "
+                      "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
 
     # SecRecorder (a NATIVE service, not a stack) turnkey SSO. Same early-seed + SecSSO-co-placement
     # requirement as the SecChat block above, but adapted to a native service: there's no stack .env
