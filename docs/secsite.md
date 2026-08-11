@@ -161,6 +161,37 @@ reaches the target host on first deploy instead of landing an empty template tha
 manual `sudoedit`. A checkout nobody has seeded falls back to the `.env.example` exactly as
 before.
 
+## Optional: the SecChat Kubernetes agent pool
+
+A `[secchat.pool]` table turns on SecChat's **Kubernetes agent pool** — coding agents whose launch
+environment is "pool" run in server-launched, ephemeral pods (the runnerd image) instead of the
+user's desktop. It is off unless you add the section, and needs a Kubernetes cluster (the enclave's
+own — SecDeploy generates the manifests; the operator applies them).
+
+```toml
+[secchat.pool]
+enabled = true
+image = "registry.internal/secchat-runnerd:1.0.0"  # the runnerd image (required when enabled)
+namespace = "secchat-pool"
+service_account = "secchat"                          # SecChat's ServiceAccount (create/delete pods)
+service_account_namespace = "secchat"
+git_host = "git.sec.internal"                        # the enclave git host pods may reach
+secchat_url = ""                                     # cluster-internal URL a pod dials back (default: SecChat's own)
+max_pods = 20
+ttl_seconds = 3600
+```
+
+When enabled, `deploy` does two things at the SecChat wiring step:
+
+1. writes `SECCHAT_POOL_*` into `work/secchat/.env` (image, namespace, callback URL, limits, TTL),
+   so the SecChat backend offers the pool; and
+2. emits the cluster manifests — namespace, a Role granting SecChat's ServiceAccount create/delete
+   on pods + its binding, a ResourceQuota, and a default-deny-ingress NetworkPolicy — to
+   `<out>/addressing/secchat-pool.k8s.json`, which the operator applies with
+   `kubectl apply -f secchat-pool.k8s.json`. The NetworkPolicy's egress is port-scoped (DNS + git);
+   tighten it with real `to:` ipBlocks for your cluster. See
+   [secchat's docs/agent-pool.md](https://github.com/secrouter/secchat/blob/main/docs/agent-pool.md).
+
 ## Precedence and back-compat
 
 `secdeploy verify` / `plan` / `deploy` / `bundle` all resolve the active site config the same
