@@ -455,6 +455,7 @@ def deploy(
     autostart_models: list[str] | None = None,
     inference_backend: str = "auto",  # macOS-only (vLLM-Metal); accepted+ignored here
     users=None,
+    secchat_pool=None,
 ) -> None:
     users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
@@ -665,10 +666,16 @@ def deploy(
             P.log("secsso: pointed the SecChat OIDC client at its topology callback "
                   "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
         sc_env = wiring.sync_secchat_env(
-            work / "secsso" / ".env", work / "secchat" / ".env", topology, without)
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without, pool=secchat_pool)
         if sc_env:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(sc_env)} keys)")
+        # Optional Kubernetes agent pool: emit the cluster manifests for the operator to apply.
+        if secchat_pool is not None and secchat_pool.enabled and addr_dir is not None:
+            pool_path = wiring.write_pool_manifests(secchat_pool, addr_dir)
+            if pool_path:
+                P.log(f"secchat: wrote Kubernetes agent-pool manifests → {pool_path} "
+                      "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

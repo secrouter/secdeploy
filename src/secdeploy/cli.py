@@ -282,6 +282,7 @@ def cmd_deploy(args) -> int:
         autostart_models=_resolved_list(args.autostart_models, opts.autostart_models),
         inference_backend=opts.inference_backend,
         users=site.users if from_file else None,
+        secchat_pool=site.secchat_pool if from_file else None,
     )
     return 0
 

@@ -62,6 +62,12 @@ DEPLOY_TABLE_KEYS = {"without", "ssh"}
 # The top-level [[users]] array-of-tables — declared accounts SecDeploy provisions in SecSSO.
 USER_KEYS = {"username", "email", "name", "groups"}
 
+# The [secchat.pool] sub-table — the optional Kubernetes agent pool. Mirrors PoolOptions' fields.
+SECCHAT_POOL_KEYS = {
+    "enabled", "image", "namespace", "service_account", "service_account_namespace",
+    "git_host", "secchat_url", "cpu", "memory", "max_pods", "ttl_seconds",
+}
+
 
 @dataclass
 class DeployOptions:
@@ -107,6 +113,31 @@ class UserSpec:
 
 
 @dataclass
+class PoolOptions:
+    """The optional Kubernetes agent pool for SecChat coding agents (secsite.toml's
+    ``[secchat.pool]``). When ``enabled``, SecDeploy writes the ``SECCHAT_POOL_*`` env into
+    secchat's ``.env`` and emits Kubernetes manifests (namespace / ServiceAccount / Role +
+    binding / NetworkPolicy / ResourceQuota) to ``<out>/addressing/secchat-pool.k8s.json`` for the
+    operator to ``kubectl apply`` to their cluster. Off by default — a deployment with no cluster
+    simply omits this section and the pool stays unavailable. ``image`` (the runnerd image) is
+    required when enabled; ``git_host`` (the enclave git host the pods may reach) scopes the egress
+    NetworkPolicy; ``secchat_url`` is the cluster-internal URL a pod dials back (defaults to
+    SecChat's own address from the topology)."""
+
+    enabled: bool = False
+    image: str = ""
+    namespace: str = "secchat-pool"
+    service_account: str = "secchat"
+    service_account_namespace: str = "secchat"
+    git_host: str = ""
+    secchat_url: str = ""
+    cpu: str = "1"
+    memory: str = "1Gi"
+    max_pods: int = 20
+    ttl_seconds: int = 3600
+
+
+@dataclass
 class SiteConfig:
     """The whole site: WHERE things run (a :class:`Topology`) + how ``deploy`` should run them.
 
@@ -125,6 +156,7 @@ class SiteConfig:
     ssh: bool = False
     deploy_options: dict[str, DeployOptions] = field(default_factory=dict)
     users: list[UserSpec] = field(default_factory=list)
+    secchat_pool: PoolOptions = field(default_factory=PoolOptions)
     path: Path | None = None
 
     # ── construction ───────────────────────────────────────────────────────────────
@@ -207,13 +239,48 @@ class SiteConfig:
                 groups=[str(g).strip() for g in (u.get("groups") or []) if str(g).strip()],
             ))
 
+        # Optional [secchat.pool] — the Kubernetes agent pool. Additive top-level table (silently
+        # ignored before this parser existed), with the same fail-loud unknown-key rejection.
+        secchat_table = data.get("secchat") or {}
+        if not isinstance(secchat_table, dict):
+            errors.append("[secchat] must be a table")
+            secchat_table = {}
+        unknown_secchat = sorted(k for k in secchat_table if k != "pool")
+        if unknown_secchat:
+            errors.append(f"[secchat]: unknown key(s) {', '.join(unknown_secchat)} (expected: pool)")
+        pool_data = secchat_table.get("pool") or {}
+        if not isinstance(pool_data, dict):
+            errors.append("[secchat.pool] must be a table")
+            pool_data = {}
+        unknown_pool = sorted(k for k in pool_data if k not in SECCHAT_POOL_KEYS)
+        if unknown_pool:
+            errors.append(
+                f"[secchat.pool]: unknown key(s) {', '.join(unknown_pool)} "
+                f"(expected: {', '.join(sorted(SECCHAT_POOL_KEYS))})"
+            )
+        secchat_pool = PoolOptions(
+            enabled=bool(pool_data.get("enabled", False)),
+            image=str(pool_data.get("image", "")).strip(),
+            namespace=str(pool_data.get("namespace", "secchat-pool")).strip() or "secchat-pool",
+            service_account=str(pool_data.get("service_account", "secchat")).strip() or "secchat",
+            service_account_namespace=str(pool_data.get("service_account_namespace", "secchat")).strip() or "secchat",
+            git_host=str(pool_data.get("git_host", "")).strip(),
+            secchat_url=str(pool_data.get("secchat_url", "")).strip(),
+            cpu=str(pool_data.get("cpu", "1")).strip() or "1",
+            memory=str(pool_data.get("memory", "1Gi")).strip() or "1Gi",
+            max_pods=int(pool_data.get("max_pods", 20)),
+            ttl_seconds=int(pool_data.get("ttl_seconds", 3600)),
+        )
+        if secchat_pool.enabled and not secchat_pool.image:
+            errors.append("[secchat.pool]: image is required when enabled = true")
+
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
         # rather than one tangled into the other (see validate() below).
         topology = Topology.from_data(data, manifest, path=path, validate=False)
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
-            deploy_options=deploy_options, users=users, path=path,
+            deploy_options=deploy_options, users=users, secchat_pool=secchat_pool, path=path,
         )
         site.validate()
         if errors:
@@ -344,4 +411,21 @@ class SiteConfig:
                 out.append(f'name = "{u.name}"')
                 out.append(f"groups = {_arr(u.groups)}")
                 out.append("")
+        pool = self.secchat_pool
+        if pool.enabled:
+            out.append("# Optional Kubernetes agent pool — coding agents run in server-launched pods.")
+            out.append("# SecDeploy emits the K8s manifests to <out>/addressing/secchat-pool.k8s.json.")
+            out.append("[secchat.pool]")
+            out.append(f"enabled = {_bool(pool.enabled)}")
+            out.append(f'image = "{pool.image}"')
+            out.append(f'namespace = "{pool.namespace}"')
+            out.append(f'service_account = "{pool.service_account}"')
+            out.append(f'service_account_namespace = "{pool.service_account_namespace}"')
+            out.append(f'git_host = "{pool.git_host}"')
+            out.append(f'secchat_url = "{pool.secchat_url}"')
+            out.append(f'cpu = "{pool.cpu}"')
+            out.append(f'memory = "{pool.memory}"')
+            out.append(f"max_pods = {pool.max_pods}")
+            out.append(f"ttl_seconds = {pool.ttl_seconds}")
+            out.append("")
         return "\n".join(out).rstrip() + "\n"

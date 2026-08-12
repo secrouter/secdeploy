@@ -128,3 +128,24 @@ resource = "core"
 #
 # …or just delete secsite.toml (and topology.toml) — that is exactly what single-host mode
 # does for you, with every deploy option at its default.
+
+# ── Optional: Kubernetes agent pool for SecChat coding agents ─────────────────────────
+# When enabled, a coding agent whose launch environment is "pool" runs in a server-launched,
+# ephemeral Kubernetes pod (the runnerd image) instead of the user's desktop. SecDeploy writes
+# the SECCHAT_POOL_* env into secchat's .env AND emits the cluster manifests (namespace / Role +
+# binding / ResourceQuota / NetworkPolicy) to <out>/addressing/secchat-pool.k8s.json for the
+# operator to `kubectl apply`. Off by default — omit this whole section if you have no cluster.
+# See docs/agent-pool.md.
+#
+# [secchat.pool]
+# enabled = true
+# image = "registry.internal/secchat-runnerd:1.0.0"  # the runnerd image (required when enabled)
+# namespace = "secchat-pool"                          # where pool pods are created
+# service_account = "secchat"                         # SecChat's ServiceAccount (create/delete pods)
+# service_account_namespace = "secchat"               # ...and the namespace it lives in
+# git_host = "git.sec.internal"                       # the enclave git host pods may reach
+# secchat_url = ""                                    # cluster-internal URL a pod dials back (default: SecChat's own)
+# cpu = "1"
+# memory = "1Gi"
+# max_pods = 20                                       # ResourceQuota pod cap for the pool namespace
+# ttl_seconds = 3600                                  # hard pod TTL backstop

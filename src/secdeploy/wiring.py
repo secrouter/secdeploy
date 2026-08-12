@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .manifest import Manifest
-from .site import SiteConfig, UserSpec
+from .site import PoolOptions, SiteConfig, UserSpec
 from .topology import Topology
 
 # This suite's internal-CUI classification level — the default `authorizedClassifications`
@@ -701,9 +701,99 @@ _SECCHAT_MANAGED_KEYS = frozenset({
 })
 
 
+def secchat_pool_env(
+    pool: PoolOptions, topology: Topology,
+    without: list[str] | None = None, scheme: str = "https",
+) -> dict[str, str]:
+    """The ``SECCHAT_POOL_*`` env for a configured Kubernetes agent pool (secsite.toml's
+    ``[secchat.pool]``). Empty when the pool is disabled. ``SECCHAT_POOL_SECCHAT_URL`` is the
+    cluster-internal URL a pool pod dials back to reach ``/runner`` — the operator's explicit
+    ``secchat_url`` if set, else SecChat's own address from the topology. These enable the pool in
+    the backend (src/config.ts); the runner-token secret it also needs is the stack's own session
+    secret, already seeded."""
+    if not pool.enabled:
+        return {}
+    secchat_url = pool.secchat_url or (topology.urls(without, scheme).get("SECCHAT", "") or "").rstrip("/")
+    env = {
+        "SECCHAT_POOL_IMAGE": pool.image,
+        "SECCHAT_POOL_NAMESPACE": pool.namespace,
+        "SECCHAT_POOL_CPU": pool.cpu,
+        "SECCHAT_POOL_MEMORY": pool.memory,
+        "SECCHAT_POOL_TTL": str(pool.ttl_seconds),
+    }
+    if secchat_url:
+        env["SECCHAT_POOL_SECCHAT_URL"] = secchat_url
+    return env
+
+
+def k8s_pool_manifests(pool: PoolOptions) -> dict[str, object]:
+    """The Kubernetes manifests SecDeploy emits for an enabled agent pool, as a ``v1/List`` object
+    (``kubectl apply -f`` applies every item). Namespace + a Role granting SecChat's ServiceAccount
+    create/delete/get on pods there + its RoleBinding + a ResourceQuota bounding the pod count + a
+    NetworkPolicy that denies all inbound and restricts pod egress to DNS and the git/SecChat ports.
+
+    SecChat's ServiceAccount is REFERENCED, not created (it belongs to SecChat's own deployment). The
+    NetworkPolicy's port-only egress rules are a sane default the operator should tighten with real
+    ``to:`` ipBlocks (a NetworkPolicy can't name hosts) — see docs/agent-pool.md. Pure/deterministic
+    for testing; secrets never appear (the runner token is minted per session, not baked in)."""
+    ns, sa, sa_ns = pool.namespace, pool.service_account, pool.service_account_namespace
+    labels = {"app.kubernetes.io/part-of": "secchat", "app.kubernetes.io/component": "agent-pool"}
+    return {
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns, "labels": labels}},
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                "metadata": {"name": "secchat-pool-manager", "namespace": ns, "labels": labels},
+                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]}],
+            },
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                "metadata": {"name": "secchat-pool-manager", "namespace": ns, "labels": labels},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "secchat-pool-manager"},
+                "subjects": [{"kind": "ServiceAccount", "name": sa, "namespace": sa_ns}],
+            },
+            {
+                "apiVersion": "v1", "kind": "ResourceQuota",
+                "metadata": {"name": "secchat-pool-quota", "namespace": ns, "labels": labels},
+                "spec": {"hard": {"pods": str(pool.max_pods)}},
+            },
+            {
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": {"name": "secchat-pool-egress", "namespace": ns, "labels": labels},
+                "spec": {
+                    "podSelector": {},
+                    "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [],  # deny all inbound — nothing should connect TO an agent pod
+                    "egress": [
+                        {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},  # DNS
+                        {"ports": [{"protocol": "TCP", "port": 22}, {"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 9418}]},  # git ssh/https/git
+                    ],
+                },
+            },
+        ],
+    }
+
+
+def write_pool_manifests(pool: PoolOptions, out_dir: str | Path) -> str | None:
+    """Write the pool's Kubernetes manifests (:func:`k8s_pool_manifests`) to
+    ``<out_dir>/secchat-pool.k8s.json`` for the operator to ``kubectl apply``, mirroring how
+    :func:`write_addressing` emits ``secrouter-egress.json``. Returns the path, or ``None`` when the
+    pool is disabled (nothing to emit)."""
+    if not pool.enabled:
+        return None
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "secchat-pool.k8s.json"
+    path.write_text(json.dumps(k8s_pool_manifests(pool), indent=2) + "\n")
+    return str(path)
+
+
 def sync_secchat_env(
     secsso_env_path: str | Path, secchat_env_path: str | Path,
     topology: Topology, without: list[str] | None = None, scheme: str = "https",
+    pool: PoolOptions | None = None,
 ) -> list[str] | None:
     """Make the native SecChat's stack ``.env`` turnkey: mirror the OIDC login-client secret SecSSO
     generated and write the topology-derived OIDC/gateway env into ``work/secchat/.env``.
@@ -733,6 +823,11 @@ def sync_secchat_env(
     managed = dict(topology.env_for("secchat", without, scheme))
     managed["SECCHAT_OIDC_CLIENT_SECRET"] = client_secret
     to_write = {k: v for k, v in managed.items() if k in _SECCHAT_MANAGED_KEYS}
+    # The optional Kubernetes agent pool's env (SECCHAT_POOL_*) — added OUTSIDE the managed-key
+    # filter, since it's a site-config capability, not a topology-derived key. Absent ⇒ pool off,
+    # so the existing managed-only behavior (and its test) is unchanged.
+    if pool is not None:
+        to_write.update(secchat_pool_env(pool, topology, without, scheme))
     _set_env_keys(secchat_env_path, to_write)
     return sorted(to_write)
 
