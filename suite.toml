@@ -68,7 +68,10 @@ role = "local inference — vLLM control plane (SecRouter routes to it)"
 # ── Gateway ──
 [components.secrouter]
 repo = "secrouter/secrouter"
-ref = "v1.1.0"
+# main (post-v1.1.0): forwards OpenAI-format `tools`/`tool_choice` to the upstream (v1.1.0 dropped
+# them, so agent tool-calls never reached secllm — the model hallucinated calls as text), plus the
+# SecLLM `<tag>` model remap and health-aware routing. Re-pin to a tag once cut.
+ref = "main"
 kind = "service"
 tier = "gateway"
 port = 47002
