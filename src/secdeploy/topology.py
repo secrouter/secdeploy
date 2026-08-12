@@ -353,6 +353,7 @@ class Topology:
     def env_for(
         self, component: str, without: list[str] | None = None, scheme: str = "https",
         *, secllm_token: str | None = None, secrouter_egress_file: str | None = None,
+        secllm_models: dict[str, str] | None = None,
     ) -> dict[str, str]:
         """Environment for ``component``: its own identity plus every *other* peer's URL.
 
@@ -368,12 +369,16 @@ class Topology:
         a pool; SecLLM is never fronted (inference must dial direct, never through the proxy),
         so this stays direct+ported no matter what else is fronted.
 
-        ``secllm_token``/``secrouter_egress_file`` fold ``SECROUTER_SECLLM_TOKEN`` (the shared
-        SecRouter<->SecLLM bearer token) / ``SECROUTER_EGRESS_FILE`` (the installed egress
-        allow-list path) into SecRouter's env when given — see ``wiring.secllm_shared_token`` /
-        ``wiring.secrouter_egress_rules``. Both are secrets/paths a caller supplies rather than
-        topology-derived data, unlike everything else this method computes, and (like
-        ``SECROUTER_SECLLM_ENDPOINTS``) only apply to ``component == "secrouter"``.
+        ``secllm_token``/``secrouter_egress_file``/``secllm_models`` fold
+        ``SECROUTER_SECLLM_TOKEN`` (the shared SecRouter<->SecLLM bearer token) /
+        ``SECROUTER_EGRESS_FILE`` (the installed egress allow-list path) /
+        ``SECROUTER_SECLLM_MODELS`` (a tier-tag → real-model-id remap for a custom pool catalog —
+        secsite.toml's ``[inference.models]``; emitted only alongside the endpoints) into
+        SecRouter's env when given — see ``wiring.secllm_shared_token`` /
+        ``wiring.secrouter_egress_rules`` / ``SiteConfig.inference_models``. All three are
+        caller-supplied (secrets/paths/operator config) rather than topology-derived data, unlike
+        everything else this method computes, and (like ``SECROUTER_SECLLM_ENDPOINTS``) only apply
+        to ``component == "secrouter"``.
 
         SecAgent gets its own dedicated block (``SECAGENT_LLM__*``/``SECAGENT_SECSSO__*`` —
         secagent's pydantic-settings nested-env convention, double-underscore-delimited, distinct
@@ -399,6 +404,13 @@ class Topology:
             endpoints = self.instance_urls("secllm", without, scheme, path="/v1")
             if endpoints:
                 env["SECROUTER_SECLLM_ENDPOINTS"] = ",".join(endpoints)
+                # Custom-catalog remap for the pool above — SecRouter's SECROUTER_SECLLM_MODELS
+                # turnkey intake reads this only alongside the endpoints, so only emit it when a
+                # pool exists (an operator-supplied map from secsite.toml's [inference.models]).
+                if secllm_models:
+                    env["SECROUTER_SECLLM_MODELS"] = ",".join(
+                        f"{tag}={mid}" for tag, mid in secllm_models.items()
+                    )
             if secllm_token:
                 env["SECROUTER_SECLLM_TOKEN"] = secllm_token
             if secrouter_egress_file:

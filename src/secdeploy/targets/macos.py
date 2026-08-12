@@ -714,6 +714,7 @@ def deploy(
     native_services: bool = True,
     autostart_models: list[str] | None = None,
     users=None,
+    secllm_models: dict[str, str] | None = None,
 ) -> None:
     without = without or []
     users = users or []
@@ -765,12 +766,25 @@ def deploy(
     P.log(f"deploy {NAME} — suite {manifest.suite} (SECSUITE_VERSION passed to compose)")
     written: dict[str, object] | None = None
     if topology is not None and not dry_run and out is not None:
-        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
+        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without,
+                                          secllm_models=secllm_models)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     if dry_run and topology is not None:
         here = ", ".join(services) or "(none)"
         print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
               f"components here: {here}")
+    # SecRouter's compose service references out/addressing/env/secrouter.env via the
+    # widely-compatible short-form `env_file` (deploy/macos/compose.yaml) — accepted by every
+    # Docker Compose version, but the file must exist at `up` time. write_addressing() above
+    # creates it for topology deploys; seed an empty one for the no-topology single-host path
+    # (and clean-checkout edges) so compose never fails schema validation on a missing file.
+    # Real values still come from write_addressing() when present, or the service's own
+    # environment: defaults otherwise.
+    if not dry_run and _here("secrouter"):
+        _router_env = (Path(out) if out is not None else root / "out") / "addressing" / "env" / "secrouter.env"
+        if not _router_env.exists():
+            _router_env.parent.mkdir(parents=True, exist_ok=True)
+            _router_env.write_text("")
     for cmd, desc in steps:
         if dry_run:
             print(f"  · {desc}: {' '.join(cmd)}")

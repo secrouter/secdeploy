@@ -49,6 +49,18 @@ without = []
 # Needs at least one resource below with an `ssh` endpoint set.
 ssh = false
 
+# ── Custom inference catalog (optional) ──────────────────────────────────────────────
+# Only needed when your SecLLM pool serves a CUSTOM catalog whose model ids are NOT SecLLM's
+# default fast/balanced/large/reasoning tags (e.g. a vLLM/MLX/Ollama server with "org/model"
+# ids). Remap each tier tag to the id your pool actually serves; unspecified tags keep the
+# literal default. Wired into SecRouter as SECROUTER_SECLLM_MODELS. Omit the whole table for a
+# default SecLLM. "balanced" (MEDIUM tier) is the assistant model-picker's mid-tier pick.
+# [inference.models]
+# fast      = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+# balanced  = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+# large     = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+# reasoning = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+
 # ── Compute resources (hosts) ────────────────────────────────────────────────────────
 [resources.core]
 target = "fedora-fips"      # deploy mechanism: macos | fedora-fips

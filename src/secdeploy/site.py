@@ -58,6 +58,13 @@ RESOURCE_DEPLOY_KEYS = {
 # The suite-wide [deploy] table's keys. Mirrors SiteConfig's own without/ssh fields exactly.
 DEPLOY_TABLE_KEYS = {"without", "ssh"}
 
+# The suite-wide [inference.models] table — remaps SecLLM tier tags to the REAL backend model
+# ids a custom pool serves, wired into SecRouter as SECROUTER_SECLLM_MODELS (its turnkey intake
+# otherwise forwards the literal tag, which only exists in SecLLM's own default catalog). Keys
+# are the four SecLLM catalog tags; values are upstream model ids (e.g. "org/model").
+INFERENCE_TABLE_KEYS = {"models"}
+INFERENCE_MODEL_TAGS = {"fast", "balanced", "large", "reasoning"}
+
 # The top-level [[users]] array-of-tables — declared accounts SecDeploy provisions in SecSSO.
 USER_KEYS = {"username", "email", "name", "groups"}
 
@@ -120,6 +127,10 @@ class SiteConfig:
     ssh: bool = False
     deploy_options: dict[str, DeployOptions] = field(default_factory=dict)
     users: list[UserSpec] = field(default_factory=list)
+    # Suite-wide SecLLM tier-tag → backend model-id remap (secsite.toml's [inference.models]),
+    # wired into SecRouter as SECROUTER_SECLLM_MODELS. Empty = SecRouter forwards the literal
+    # tags (its default-catalog behavior). See INFERENCE_MODEL_TAGS.
+    inference_models: dict[str, str] = field(default_factory=dict)
     path: Path | None = None
 
     # ── construction ───────────────────────────────────────────────────────────────
@@ -201,13 +212,38 @@ class SiteConfig:
                 groups=[str(g).strip() for g in (u.get("groups") or []) if str(g).strip()],
             ))
 
+        # Suite-wide [inference.models] — SecLLM tier-tag → real backend model id (SecRouter's
+        # SECROUTER_SECLLM_MODELS). Fail-loud on an unknown tag or empty id; additive and
+        # backward-compatible (absent table ⇒ empty map ⇒ SecRouter keeps its literal-tag default).
+        inference_table = data.get("inference") or {}
+        unknown_inf = sorted(k for k in inference_table if k not in INFERENCE_TABLE_KEYS)
+        if unknown_inf:
+            errors.append(
+                f"[inference]: unknown key(s) {', '.join(unknown_inf)} "
+                f"(expected: {', '.join(sorted(INFERENCE_TABLE_KEYS))})"
+            )
+        inference_models: dict[str, str] = {}
+        for tag, mid in (inference_table.get("models") or {}).items():
+            if tag not in INFERENCE_MODEL_TAGS:
+                errors.append(
+                    f"[inference.models]: unknown tier tag {tag!r} "
+                    f"(expected: {', '.join(sorted(INFERENCE_MODEL_TAGS))})"
+                )
+                continue
+            mid_s = str(mid).strip()
+            if not mid_s:
+                errors.append(f"[inference.models]: empty model id for tag {tag!r}")
+                continue
+            inference_models[tag] = mid_s
+
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
         # rather than one tangled into the other (see validate() below).
         topology = Topology.from_data(data, manifest, path=path, validate=False)
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
-            deploy_options=deploy_options, users=users, path=path,
+            deploy_options=deploy_options, users=users,
+            inference_models=inference_models, path=path,
         )
         site.validate()
         if errors:
@@ -302,6 +338,14 @@ class SiteConfig:
             f"ssh = {_bool(self.ssh)}",
             "",
         ]
+        # Suite-wide inference catalog remap (only when set — it's a mapping, not a fixed set of
+        # toggles, so an empty table is simply omitted rather than written out with no keys).
+        if self.inference_models:
+            out.append("[inference.models]")
+            for tag in ("fast", "balanced", "large", "reasoning"):
+                if tag in self.inference_models:
+                    out.append(f'{tag} = "{self.inference_models[tag]}"')
+            out.append("")
         for r in topo.resources.values():
             opts = self.deploy_for(r.name)
             out.append(f"[resources.{r.name}]")

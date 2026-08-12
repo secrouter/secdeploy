@@ -22,13 +22,16 @@ below. You never have to migrate an existing `topology.toml`.
 
 ## What's new on top of placement
 
-Two kinds of options, two scopes:
+Two scopes of deploy options, plus a suite-wide inference-catalog table:
 
 - a suite-wide **`[deploy]`** table — `without` (optional components to drop) and `ssh`
   (control-host push mode instead of a local deploy);
 - **per-resource** deploy toggles, as extra keys on each `[resources.<name>]` block (alongside
   the placement fields `target`/`address`/`ssh`/`capabilities`) — because whether to stand up
   SecLLM, or configure a Mac's TLS/hosts/keychain, is a property of *that host*, not the suite.
+- a suite-wide **`[inference.models]`** table — remaps SecLLM's tier tags
+  (`fast`/`balanced`/`large`/`reasoning`) to the real model ids a **custom** pool serves, wired
+  into SecRouter as `SECROUTER_SECLLM_MODELS` (see [Custom inference catalog](#custom-inference-catalog)).
 
 ```toml
 domain = "sec.internal"
@@ -37,6 +40,12 @@ upstream_dns = ["1.1.1.1"]
 [deploy]
 without = []          # optional components to drop, e.g. ["seccert", "secsso"]
 ssh = false           # control-host push mode (needs resources with an `ssh` endpoint below)
+
+# Optional — only when your SecLLM pool serves a CUSTOM catalog (ids ≠ fast/balanced/large/
+# reasoning). Omit entirely for a default SecLLM. See "Custom inference catalog" below.
+[inference.models]
+balanced = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+fast     = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 
 [resources.core]
 target = "fedora-fips"
@@ -61,6 +70,30 @@ overrides the file's `without` entirely for that run).
 
 A full, commented reference lives in [`secsite.toml.example`](../secsite.toml.example) — copy
 it to `secsite.toml` and edit, or generate one interactively with the wizard below.
+
+## Custom inference catalog
+
+`[inference.models]` exists because SecRouter's turnkey SecLLM intake
+(`SECROUTER_SECLLM_ENDPOINTS`) routes its four tiers — SIMPLE/MEDIUM/COMPLEX/REASONING — to the
+model ids `secllm/fast`, `secllm/balanced`, `secllm/large`, `secllm/reasoning`. Those tags exist
+only in SecLLM's **default** catalog. A pool serving a different OpenAI-compatible catalog — a
+vLLM/MLX/Ollama server whose ids look like `org/model` — 404s those tags.
+
+Each key remaps one tag to the real model id the pool serves; unspecified tags keep the literal
+default. Deploy folds the map into SecRouter's env as `SECROUTER_SECLLM_MODELS` (only on the
+resource where SecRouter is placed, and only when a SecLLM pool exists):
+
+```toml
+[inference.models]
+fast      = "mlx-community/Llama-3.2-3B-Instruct-4bit"           # SIMPLE tier
+balanced  = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"  # MEDIUM tier — the assistant's "balanced" pick
+large     = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"  # COMPLEX tier
+reasoning = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"  # REASONING tier
+```
+
+Valid tags are exactly `fast`, `balanced`, `large`, `reasoning`; an unknown tag or an empty id is
+a fail-loud config error. This is the turnkey alternative to hand-authoring `providers.secllm` +
+the tier maps in a SecRouter config file.
 
 ## The `configure` wizard
 

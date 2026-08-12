@@ -281,6 +281,7 @@ def cmd_deploy(args) -> int:
         native_services=args.native_services,
         autostart_models=_resolved_list(args.autostart_models, opts.autostart_models),
         users=site.users if from_file else None,
+        secllm_models=site.inference_models if from_file else None,
     )
     return 0
 

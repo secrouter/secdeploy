@@ -63,7 +63,7 @@ role = "local inference — vLLM control plane (SecRouter routes to it)"
 # ── Gateway ──
 [components.secrouter]
 repo = "secrouter/secrouter"
-ref = "v1.1.0"
+ref = "main"
 kind = "service"
 tier = "gateway"
 port = 47002

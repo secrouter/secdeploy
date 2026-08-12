@@ -454,6 +454,7 @@ def deploy(
     native_services: bool = True,
     autostart_models: list[str] | None = None,
     users=None,
+    secllm_models: dict[str, str] | None = None,
 ) -> None:
     users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
@@ -582,7 +583,8 @@ def deploy(
     written: dict[str, object] | None = None
     if addr_dir is not None:
         written = wiring.write_addressing(topology, addr_dir, resource, without,
-                                          secrouter_egress_path=str(SECROUTER_EGRESS_FILE))
+                                          secrouter_egress_path=str(SECROUTER_EGRESS_FILE),
+                                          secllm_models=secllm_models)
         if "secproxy" in services and topology is not None:
             # Landing page (see wiring.landing_page_html) — staged here alongside the nginx
             # config write_addressing just produced; _deploy_steps installs it from this path.

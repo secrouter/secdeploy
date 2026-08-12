@@ -369,6 +369,24 @@ def test_env_text_secrouter_gets_secllm_endpoints_pool(tmp_path):
             "http://secllm-gpu2.sec.internal:11400/v1") in text
 
 
+# ── custom-catalog remap: secsite.toml [inference.models] → SECROUTER_SECLLM_MODELS ─────
+def test_env_for_secrouter_emits_secllm_models_remap(tmp_path):
+    topo = _topo(tmp_path)
+    env = topo.env_for("secrouter", secllm_models={"balanced": "org/gemma-26b", "fast": "org/llama-3b"})
+    assert env["SECROUTER_SECLLM_MODELS"] == "balanced=org/gemma-26b,fast=org/llama-3b"
+
+
+def test_env_for_secrouter_no_secllm_models_when_unset(tmp_path):
+    assert "SECROUTER_SECLLM_MODELS" not in _topo(tmp_path).env_for("secrouter")
+
+
+def test_write_addressing_threads_secllm_models_into_secrouter_env(tmp_path):
+    topo = _topo(tmp_path)
+    out = tmp_path / "addr"
+    wiring.write_addressing(topo, out, "core", secllm_models={"balanced": "org/gemma-26b"})
+    assert "SECROUTER_SECLLM_MODELS=balanced=org/gemma-26b" in (out / "env" / "secrouter.env").read_text()
+
+
 def test_zone_text_has_both_secllm_instances(tmp_path):
     topo = _multi_topo(tmp_path)
     text = wiring.zone_text(topo)

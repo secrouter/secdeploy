@@ -318,3 +318,34 @@ def test_users_round_trip(tmp_path):
     reloaded = _site(tmp_path, site.to_toml())
     assert [(u.username, u.email, u.name, u.groups) for u in reloaded.users] == \
            [(u.username, u.email, u.name, u.groups) for u in site.users]
+
+
+# ── [inference.models] — SecLLM tier-tag → backend model-id remap (SECROUTER_SECLLM_MODELS) ──
+def test_load_parses_inference_models(tmp_path):
+    site = _site(tmp_path, BARE + '\n[inference.models]\nbalanced = "org/gemma-26b"\nfast = "org/llama-3b"\n')
+    assert site.inference_models == {"balanced": "org/gemma-26b", "fast": "org/llama-3b"}
+
+
+def test_inference_models_absent_is_empty(tmp_path):
+    assert _site(tmp_path, BARE).inference_models == {}
+
+
+def test_inference_models_unknown_tag_rejected(tmp_path):
+    with pytest.raises(ValueError, match="bogus"):
+        _site(tmp_path, BARE + '\n[inference.models]\nbogus = "org/x"\n')
+
+
+def test_inference_models_empty_id_rejected(tmp_path):
+    with pytest.raises(ValueError, match="balanced"):
+        _site(tmp_path, BARE + '\n[inference.models]\nbalanced = ""\n')
+
+
+def test_inference_table_unknown_key_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[inference\]:"):
+        _site(tmp_path, BARE + '\n[inference]\nbogus = 1\n')
+
+
+def test_inference_models_round_trip(tmp_path):
+    site = _site(tmp_path, BARE + '\n[inference.models]\nfast = "org/llama-3b"\nbalanced = "org/gemma-26b"\n')
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.inference_models == site.inference_models

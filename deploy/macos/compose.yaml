@@ -27,17 +27,21 @@ services:
     build:
       context: ../../work/secrouter
     # The generated peer-wiring env (SECROUTER_SECLLM_ENDPOINTS/_TOKEN, SECAGENT_URL, etc. —
-    # see wiring.write_addressing) — deploy() writes this BEFORE bringing the container up, so
-    # it's always present for a real (non-dry-run) secdeploy deploy. `required: false` so a
-    # standalone `docker compose up` (no secdeploy run first) doesn't hard-fail on a missing
-    # file — it just falls back to this service's own `environment:` defaults below, same as
-    # before this existed. This was a real gap: SecRouter ran with ZERO topology-derived
-    # config on macOS (unlike the native launchd services, which already got it) — confirmed
-    # live, "auto"-model routing 502'd because SECROUTER_SECLLM_ENDPOINTS never reached the
-    # container despite being correctly generated in out/addressing/env/secrouter.env.
+    # see wiring.write_addressing) — deploy() writes this BEFORE any compose `up`, so it's
+    # always present for a real (non-dry-run) secdeploy deploy, and deploy() additionally seeds
+    # an empty one on the no-topology single-host path so this reference always resolves. This
+    # was a real gap: SecRouter ran with ZERO topology-derived config on macOS (unlike the
+    # native launchd services, which already got it) — confirmed live, "auto"-model routing
+    # 502'd because SECROUTER_SECLLM_ENDPOINTS never reached the container despite being
+    # correctly generated in out/addressing/env/secrouter.env.
+    #
+    # SHORT FORM (a bare path string), not the `{path, required:false}` long form: the long form
+    # needs Docker Compose >= 2.24, and older compose plugins reject it at schema-validation time
+    # ("services.secrouter.env_file.0 must be a string"), which fails the deploy on any host with
+    # an older compose — before the daemon is even contacted. The short form is accepted by every
+    # Compose version; deploy() guarantees the file exists first (above), so nothing is lost.
     env_file:
-      - path: ../../out/addressing/env/secrouter.env
-        required: false
+      - ../../out/addressing/env/secrouter.env
     volumes:
       # SECROUTER_EGRESS_FILE (from the env_file above) is a HOST-relative path
       # (out/addressing/secrouter-egress.json) — meaningless inside the container's own
@@ -70,7 +74,13 @@ services:
       # multi-instance SecLLM pool spanning OTHER resources needs real per-instance
       # reachability (some local via host.docker.internal, some remote via DNS/IP), which a
       # single static override can't express; that scenario needs hand-tuning here.
-      SECROUTER_SECLLM_ENDPOINTS: http://host.docker.internal:11400/v1
+      # TEST-INSTANCE: repointed from SecLLM (:11400 mock, no GPU on macOS) to the two local MLX
+      # model servers on the host — :8081 Llama-3.2-3B (fast), :8082 Gemma-4-26B (tool-calling).
+      SECROUTER_SECLLM_ENDPOINTS: http://host.docker.internal:8081/v1,http://host.docker.internal:8082/v1
+      # SECROUTER_SECLLM_MODELS (the tier-tag → real-MLX-id remap) is NOT hardcoded here — it is
+      # generated into out/addressing/env/secrouter.env from secsite.toml's [inference.models] (the
+      # turnkey path) and loaded via this service's env_file above. Only the endpoints override
+      # stays inline, because the topology's SecLLM FQDN can't name the host's MLX ports.
     depends_on:
       - seccert
     ports:
