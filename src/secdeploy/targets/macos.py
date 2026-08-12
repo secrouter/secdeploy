@@ -209,8 +209,12 @@ def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
                "(see secagent docs/leanctx.md)")
         return
     P.log(f"installing LeanCTX (binary + pi extension, pinned {LEANCTX_VERSION})")
+    # --loglevel=error --no-fund: quiet npm's funding spam and the deprecation warnings from
+    # third-party transitives in the pi-coding-agent tree (e.g. node-domexception@1.0.0, dead
+    # weight on Node 17+ but not ours to remove) — nothing here is actionable by us, and real
+    # errors (loglevel=error) still print.
     P.run(["npm", "install", "-g", f"lean-ctx-bin@{LEANCTX_VERSION}",
-           f"pi-lean-ctx@{LEANCTX_VERSION}"], check=False)
+           f"pi-lean-ctx@{LEANCTX_VERSION}", "--loglevel=error", "--no-fund"], check=False)
     if not P.which("lean-ctx"):
         P.warn("LeanCTX binary not on PATH after install — pi-side compression won't run yet "
                "(re-run once `lean-ctx` is installed; see secagent docs/leanctx.md)")
@@ -528,7 +532,11 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     # since pi is only needed for interactive use, never for secagent's own review/MCP servers.
     if "secagent" not in without:
         if P.which("npm"):
-            P.run(["npm", "install", "-g", "@earendil-works/pi-coding-agent"], check=False)
+            # --loglevel=error --no-fund: pi's transitive deps still pull deprecated third-party
+            # packages (node-domexception@1.0.0 &c.) we can't remove — quiet that non-actionable
+            # noise while keeping real errors visible. See install_leanctx for the same rationale.
+            P.run(["npm", "install", "-g", "@earendil-works/pi-coding-agent",
+                   "--loglevel=error", "--no-fund"], check=False)
         else:
             P.warn("npm not found — pi (the agent runtime secagent's tools/skills plug into) "
                    "won't be installed; install Node.js, then `npm install -g "
@@ -607,10 +615,30 @@ def _venv_bin(root: Path, project: str, script: str) -> Path:
     return root / "work" / project / ".venv" / "bin" / script
 
 
-def _secllm_backend(root: Path) -> str:
-    """"mlx" if secllm's venv actually has mlx-lm installed (the real inference engine on Apple
-    Silicon — see build()'s "secllm": ["--extra", "mlx"]), else "mock" with a warning — e.g. an
-    Intel Mac, or a deploy that ran before a `build macos` synced the mlx extra."""
+def _metal_venv() -> Path:
+    """The vLLM-Metal venv secllm's `metal` backend runs `vllm serve` from — mirrors secllm's
+    own ``SECLLM_METAL_VENV`` default (~/.venv-vllm-metal), honoring an override if the operator
+    set one in this deploy's environment."""
+    return Path(os.environ.get("SECLLM_METAL_VENV", "~/.venv-vllm-metal")).expanduser()
+
+
+def _secllm_backend(root: Path, prefer: str = "auto") -> str:
+    """Resolve the SecLLM backend the launchd daemon runs.
+
+    ``prefer`` is the secsite.toml ``inference_backend``: "metal" selects vLLM-Metal iff its venv
+    (``vllm`` present — see :func:`_metal_venv`) is installed, else warns and falls through to
+    auto. "auto"/"mlx" pick "mlx" when secllm's venv has mlx-lm (build()'s ``--extra mlx``), else
+    "mock" with a warning (e.g. an Intel Mac, or a deploy before ``build macos`` synced it).
+    "mock" forces the stub."""
+    if prefer == "metal":
+        if (_metal_venv() / "bin" / "vllm").exists():
+            return "metal"
+        P.warn(f"secllm: inference_backend=metal but no vLLM-Metal venv at {_metal_venv()} "
+               "(install it: curl -fsSL "
+               "https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash) "
+               "— falling back to auto (mlx/mock)")
+    if prefer == "mock":
+        return "mock"
     python = _venv_bin(root, "secllm", "python3")
     if python.exists():
         r = P.run([str(python), "-c", "import mlx_lm"], check=False)
@@ -713,6 +741,7 @@ def deploy(
     with_agent: bool = False,
     native_services: bool = True,
     autostart_models: list[str] | None = None,
+    inference_backend: str = "auto",
     users=None,
 ) -> None:
     without = without or []
@@ -849,7 +878,10 @@ def deploy(
     # installed (see _secllm_backend). Runs as the user (high port).
     if with_inference and topology is not None and _here("secllm"):
         port = manifest.components["secllm"].port
-        backend = _secllm_backend(root)
+        backend = _secllm_backend(root, inference_backend)
+        # The metal backend runs `vllm serve` from an external venv — tell secllm where it is
+        # (its own default is the same path, but be explicit so an operator override flows through).
+        metal_env = {"SECLLM_METAL_VENV": str(_metal_venv())} if backend == "metal" else {}
         fallback = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND={backend} "
                     f"uv run --project work/secllm secllm serve")
         if not dry_run and native_services and not _ensure_native_venv(root, "secllm"):
@@ -863,9 +895,14 @@ def deploy(
                 name="secllm",
                 program_args=[str(_venv_bin(root, "secllm", "secllm")), "serve"],
                 log_dir=log_dir,
+                # SECLLM_MAX_LOADED unset → secllm's default 0 = "models coexist, no eviction"
+                # (its concurrent multi-model serving). On macOS/MLX there's no GPU inventory to
+                # pack against, so workers just launch and share unified memory — both autostart
+                # models stay resident. (Set >0 only to restore the old hard ceiling / switch
+                # semantics, e.g. 1 = loading a new model evicts the oldest.)
                 env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(port),
                      "SECLLM_BACKEND": backend, "SECLLM_ADMIN_TOKEN": admin_token,
-                     "SECLLM_AUTOSTART": ",".join(autostart_models or [])},
+                     "SECLLM_AUTOSTART": ",".join(autostart_models or []), **metal_env},
                 working_dir=str(root), user=user,
             )
             _install_or_note(secllm, staging_dir, native_services=native_services,

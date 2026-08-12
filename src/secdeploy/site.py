@@ -53,6 +53,7 @@ RESOURCE_PLACEMENT_KEYS = {"target", "address", "ssh", "capabilities"}
 RESOURCE_DEPLOY_KEYS = {
     "with_inference", "with_agent", "configure_resolver",
     "tls", "configure_hosts", "trust_ca", "model_dir", "autostart_models",
+    "inference_backend",
 }
 
 # The suite-wide [deploy] table's keys. Mirrors SiteConfig's own without/ssh fields exactly.
@@ -85,6 +86,10 @@ class DeployOptions:
     trust_ca: bool = False
     model_dir: str = ""
     autostart_models: list[str] = field(default_factory=list)
+    # macOS-only: which SecLLM inference backend the launchd daemon runs. "auto" (default) =
+    # mlx if mlx-lm is installed, else mock. "metal" = vLLM-Metal (full vLLM engine on Apple
+    # Silicon; serves archs mlx-lm lacks) from ~/.venv-vllm-metal — see targets/macos.py.
+    inference_backend: str = "auto"
 
 
 @dataclass
@@ -169,6 +174,7 @@ class SiteConfig:
                 trust_ca=bool(rdata.get("trust_ca", False)),
                 model_dir=str(rdata.get("model_dir", "")),
                 autostart_models=[str(m) for m in rdata.get("autostart_models", [])],
+                inference_backend=str(rdata.get("inference_backend", "auto")),
             )
 
         # Declared end-user accounts — a top-level [[users]] array-of-tables. Fail-loud on
@@ -318,6 +324,7 @@ class SiteConfig:
             out.append(f"trust_ca = {_bool(opts.trust_ca)}")
             out.append(f'model_dir = "{opts.model_dir}"')
             out.append(f"autostart_models = {_arr(opts.autostart_models)}")
+            out.append(f'inference_backend = "{opts.inference_backend}"')
             out.append("")
         for tier, res_list in topo.groups.items():
             out.append(f"[groups.{tier}]")
