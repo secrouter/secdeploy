@@ -1153,3 +1153,74 @@ def test_generate_secsso_users_blueprint_is_idempotent(tmp_path):
         [UserSpec(username="alice"), UserSpec(username="carol")], dest)
     assert set(second) == {"carol"}                   # only the newly-added user is returned
     assert f'password: "{first["alice"]}"' in dest.read_text()  # alice's original survives
+
+
+# ── Kubernetes agent pool (Part C) ────────────────────────────────────────────────────
+from secdeploy.site import PoolOptions  # noqa: E402
+
+
+def _pool(**kw) -> PoolOptions:
+    base = dict(enabled=True, image="reg/secchat-runnerd:1", namespace="chat-pool",
+                service_account="secchat", service_account_namespace="chat",
+                git_host="git.sec.internal", secchat_url="http://secchat.chat.svc:47010",
+                max_pods=7, ttl_seconds=1800)
+    base.update(kw)
+    return PoolOptions(**base)
+
+
+def test_secchat_pool_env_disabled_is_empty(tmp_path):
+    assert wiring.secchat_pool_env(PoolOptions(), _topo(tmp_path)) == {}
+
+
+def test_secchat_pool_env_carries_the_pool_settings(tmp_path):
+    env = wiring.secchat_pool_env(_pool(), _topo(tmp_path))
+    assert env["SECCHAT_POOL_IMAGE"] == "reg/secchat-runnerd:1"
+    assert env["SECCHAT_POOL_NAMESPACE"] == "chat-pool"
+    assert env["SECCHAT_POOL_SECCHAT_URL"] == "http://secchat.chat.svc:47010"
+    assert env["SECCHAT_POOL_TTL"] == "1800"
+
+
+def test_secchat_pool_env_defaults_secchat_url_from_topology(tmp_path):
+    # No explicit secchat_url ⇒ derived from SecChat's own address in the topology.
+    env = wiring.secchat_pool_env(_pool(secchat_url=""), _topo(tmp_path))
+    assert env["SECCHAT_POOL_SECCHAT_URL"].startswith("http")
+
+
+def test_k8s_pool_manifests_shape_and_rbac(tmp_path):
+    m = wiring.k8s_pool_manifests(_pool())
+    assert m["kind"] == "List"
+    kinds = [i["kind"] for i in m["items"]]
+    assert kinds == ["Namespace", "Role", "RoleBinding", "ResourceQuota", "NetworkPolicy"]
+    by = {i["kind"]: i for i in m["items"]}
+    assert by["Namespace"]["metadata"]["name"] == "chat-pool"
+    # The RoleBinding references SecChat's ServiceAccount (create/delete pods), not a created SA.
+    assert by["RoleBinding"]["subjects"][0] == {"kind": "ServiceAccount", "name": "secchat", "namespace": "chat"}
+    assert "pods" in by["Role"]["rules"][0]["resources"]
+    assert by["ResourceQuota"]["spec"]["hard"]["pods"] == "7"
+    # NetworkPolicy denies all ingress; no ServiceAccount is created here; no secrets leak.
+    assert by["NetworkPolicy"]["spec"]["ingress"] == []
+    assert "ServiceAccount" not in kinds
+    assert "TOKEN" not in json.dumps(m) and "PRIVATE" not in json.dumps(m)
+
+
+def test_write_pool_manifests_writes_json_when_enabled_else_none(tmp_path):
+    out = tmp_path / "addressing"
+    path = wiring.write_pool_manifests(_pool(), out)
+    assert path == str(out / "secchat-pool.k8s.json")
+    assert json.loads(Path(path).read_text()) == wiring.k8s_pool_manifests(_pool())
+    # Disabled ⇒ nothing written.
+    assert wiring.write_pool_manifests(PoolOptions(), out / "off") is None
+    assert not (out / "off").exists()
+
+
+def test_sync_secchat_env_adds_pool_keys_when_configured(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n")
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_OIDC_CLIENT_SECRET=SEED\nSECCHAT_SESSION_SECRET=keep\n")
+    written = wiring.sync_secchat_env(secsso_env, secchat_env, topo, pool=_pool())
+    vals = _env_dict(secchat_env)
+    assert vals["SECCHAT_POOL_IMAGE"] == "reg/secchat-runnerd:1"
+    assert vals["SECCHAT_SESSION_SECRET"] == "keep"  # non-managed still untouched
+    assert "SECCHAT_POOL_IMAGE" in written
