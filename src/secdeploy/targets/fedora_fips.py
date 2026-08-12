@@ -453,6 +453,7 @@ def deploy(
     with_agent: bool = False,
     native_services: bool = True,
     autostart_models: list[str] | None = None,
+    inference_backend: str = "auto",  # macOS-only (vLLM-Metal); accepted+ignored here
     users=None,
 ) -> None:
     users = users or []
