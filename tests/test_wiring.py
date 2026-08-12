@@ -1126,7 +1126,7 @@ def test_generate_secsso_users_blueprint(tmp_path):
     from secdeploy.site import UserSpec
     users = [
         UserSpec(username="alice", email="alice@x.mil", name="Alice", groups=["analysts"]),
-        UserSpec(username="bob"),  # no name/email/groups → those keys omitted
+        UserSpec(username="bob"),  # no name/email/groups → email/groups omitted, name defaulted
     ]
     dest = tmp_path / "users.generated.yaml"
     creds = wiring.generate_secsso_users_blueprint(users, dest)
@@ -1142,6 +1142,13 @@ def test_generate_secsso_users_blueprint(tmp_path):
     assert 'username: "bob"' in text
     # bob's password is written even though he has no name/email
     assert f'password: "{creds["bob"]}"' in text
+    # `name` is required by authentik_core.user: always emitted, defaulting to the username.
+    # Without it authentik rejects the WHOLE blueprint and no declared user is created.
+    assert 'name: "Alice"' in text
+    assert 'name: "bob"' in text
+    user_blocks = text.split("  - model: authentik_core.user")[1:]
+    assert len(user_blocks) == len(users)
+    assert all("      name: " in block for block in user_blocks)
 
 
 def test_generate_secsso_users_blueprint_is_idempotent(tmp_path):

@@ -992,9 +992,12 @@ def generate_secsso_users_blueprint(users: list[UserSpec], dest: str | Path) -> 
             "    attrs:",
             "      type: internal",
             f"      password: {_yaml_q(pw)}",
+            # `name` is REQUIRED by authentik_core.user's serializer. It is not optional like
+            # email/groups: omitting it fails validation for the ENTIRE blueprint, so a single
+            # nameless user silently leaves EVERY declared account uncreated while the deploy
+            # still prints their initial credentials. Default to the username when unset.
+            f"      name: {_yaml_q(u.name or u.username)}",
         ]
-        if u.name:
-            lines.append(f"      name: {_yaml_q(u.name)}")
         if u.email:
             lines.append(f"      email: {_yaml_q(u.email)}")
         if u.groups:
