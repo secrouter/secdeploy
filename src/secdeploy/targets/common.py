@@ -134,7 +134,17 @@ def fetch(
             P.run(["git", "-C", str(dest), "fetch", "--tags", "--quiet", "origin"])
         else:
             P.run(["git", "clone", "--quiet", c.url, str(dest)])
-        P.run(["git", "-C", str(dest), "-c", "advice.detachedHead=false", "checkout", "--quiet", c.ref])
+        # Pin to the ref, DETACHED. When c.ref is a branch, a plain `checkout <branch>` lands on
+        # the (possibly stale) LOCAL branch — `fetch` updates origin/<branch> but never fast-
+        # forwards the local one — so a re-fetch after origin advanced silently keeps old code.
+        # Target origin/<ref> when it resolves (branch); tags and SHAs have no such remote ref and
+        # fall through to c.ref itself. --detach: these are read-only pinned checkouts, not
+        # branches to commit on, so we never want a tracking branch that can drift.
+        on_origin = P.run(["git", "-C", str(dest), "rev-parse", "--verify", "--quiet",
+                           f"refs/remotes/origin/{c.ref}"], check=False, capture=True)
+        target = f"origin/{c.ref}" if on_origin.returncode == 0 else c.ref
+        P.run(["git", "-C", str(dest), "-c", "advice.detachedHead=false",
+               "checkout", "--quiet", "--detach", target])
         sha = P.run(["git", "-C", str(dest), "rev-parse", "HEAD"], capture=True).stdout.strip()
         P.log(f"{name} @ {c.ref} → {sha[:12]}")
     return work_dir

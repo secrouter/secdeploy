@@ -53,7 +53,12 @@ role = "internal DNS — resolves the suite's *.internal names (drop it when you
 # ── Inference ──
 [components.secllm]
 repo = "secrouter/secllm"
-ref = "v1.1.0"
+# main (post-v1.1.0): the integrated superset — native Apple-Silicon MLX backend (the `mlx`
+# extra + backends/mlx_server.py + mlx_model catalog quants), the admin Download button
+# (decoupled from Load) with live download-progress, concurrent multi-model serving
+# (max_loaded=0 default: models coexist without eviction), and API-call tracking. Required for
+# real local inference on macOS — v1.1.0 has only the vllm/mock backends. Re-pin to a tag once cut.
+ref = "main"
 kind = "service"
 tier = "inference"
 port = 11400

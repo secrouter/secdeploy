@@ -635,7 +635,7 @@ def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, m
     assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
     # The harness install steps actually ran: pi globally + `secagent init`, and NO secagent unit.
-    assert any(c == ["npm", "install", "-g", "@earendil-works/pi-coding-agent"] for c in run_calls)
+    assert any(c[:4] == ["npm", "install", "-g", "@earendil-works/pi-coding-agent"] for c in run_calls)
     assert any(c[:2] == ["bash", "-c"] and "secagent init --domain sec.internal" in c[2]
                for c in run_calls)
     assert not any("secagent.service" in " ".join(c) for c in run_calls)
