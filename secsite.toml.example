@@ -149,3 +149,29 @@ resource = "core"
 # memory = "1Gi"
 # max_pods = 20                                       # ResourceQuota pod cap for the pool namespace
 # ttl_seconds = 3600                                  # hard pod TTL backstop
+
+# ── Users & admin groups ───────────────────────────────────────────────────────────────
+# Optional [[users]] blocks seed SSO logins. Each is provisioned into SecSSO (Authentik) and
+# written to blueprints/users.generated.yaml with a one-time password (that generated file is
+# gitignored — it holds secrets — so this real secsite.toml is too; keep both out of git).
+#
+# Every name in a user's `groups` becomes an Authentik group + membership. Admin access is
+# per-service, gated on a named group (a valid login is necessary but not sufficient):
+#
+#   secrouter-admins  → the SecRouter admin console
+#   secllm-admins     → the SecLLM admin console (SECLLM_ADMIN_GROUP)
+#   secchat-admins    → the SecChat admin console + webhook management (SECCHAT_ADMIN_GROUP)
+#
+# Put a user in the group for each service they administer — e.g. an operator who runs
+# everything gets all three. A user in none of them is a normal, non-admin member.
+#
+#   [[users]]
+#   username = "austin"
+#   name     = "Austin"
+#   email    = "austin@example.mil"
+#   groups   = ["secrouter-admins", "secllm-admins", "secchat-admins"]
+#
+#   [[users]]
+#   username = "casey"
+#   name     = "Casey"
+#   groups   = []   # a normal member — can sign in, no admin consoles
