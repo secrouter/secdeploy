@@ -36,8 +36,7 @@ services:
     # live, "auto"-model routing 502'd because SECROUTER_SECLLM_ENDPOINTS never reached the
     # container despite being correctly generated in out/addressing/env/secrouter.env.
     env_file:
-      - path: ../../out/addressing/env/secrouter.env
-        required: false
+      - ../../out/addressing/env/secrouter.env
     volumes:
       # SECROUTER_EGRESS_FILE (from the env_file above) is a HOST-relative path
       # (out/addressing/secrouter-egress.json) — meaningless inside the container's own
