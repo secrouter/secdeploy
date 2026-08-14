@@ -484,5 +484,5 @@ macOS notes specific to this target:
 ## Notes
 
 - SecRouter runs in **dev mode** here (security disabled). For anything real, mount a hardened
-  `freerouter.config.json` (see the SecRouter repo) — or use the `fedora-fips` target.
+  `secrouter.config.json` (see the SecRouter repo) — or use the `fedora-fips` target.
 - The Mac path is not a FIPS environment; use it for evaluation, not accreditation.

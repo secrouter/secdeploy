@@ -606,7 +606,7 @@ def secrouter_oidc_config(
     shape exactly (``issuer``, ``audience``, ``jwksUri``, ``serviceSubjects``).
 
     NOT env-var-driven in SecRouter today (unlike ``SECROUTER_SECLLM_ENDPOINTS``'s turnkey
-    intake) — SecRouter's ``FREEROUTER_CONFIG`` is a hand-authored JSON file, so this fragment
+    intake) — SecRouter's ``SECROUTER_CONFIG`` is a hand-authored JSON file, so this fragment
     is meant to be read and merged into ``security.oidc`` there by the operator (see
     :func:`write_addressing`, which writes it to ``secrouter-oidc.json`` for exactly that).
 
