@@ -816,6 +816,11 @@ def secchat_pool_env(
         "SECCHAT_POOL_CPU": pool.cpu,
         "SECCHAT_POOL_MEMORY": pool.memory,
         "SECCHAT_POOL_TTL": str(pool.ttl_seconds),
+        # In-process admission caps — the same numbers the ResourceQuota bounds, so SecChat rejects a
+        # burst fast (with a clear message) instead of leaning on the cluster to (opaquely) reject the
+        # pod create. max_pods also bounds the quota; max_per_owner is SecChat-only (no quota analogue).
+        "SECCHAT_POOL_MAX_PODS": str(pool.max_pods),
+        "SECCHAT_POOL_MAX_PER_OWNER": str(pool.max_per_owner),
     }
     if secchat_url:
         env["SECCHAT_POOL_SECCHAT_URL"] = secchat_url
@@ -857,7 +862,14 @@ def k8s_pool_manifests(pool: PoolOptions) -> dict[str, object]:
             },
             {
                 "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
-                "metadata": {"name": "secchat-pool-egress", "namespace": ns, "labels": labels},
+                "metadata": {
+                    "name": "secchat-pool-egress", "namespace": ns, "labels": labels,
+                    # A vanilla NetworkPolicy can't match hosts, so the port-only egress below can't be
+                    # narrowed to git_host here. Surface the intended host as an annotation so an
+                    # FQDN-aware layer (Cilium/Calico egress-by-FQDN) or the operator can scope it —
+                    # keeping git_host meaningful rather than silently dropped.
+                    **({"annotations": {"secchat.io/git-host": pool.git_host}} if pool.git_host else {}),
+                },
                 "spec": {
                     "podSelector": {},
                     "policyTypes": ["Ingress", "Egress"],
@@ -884,6 +896,33 @@ def write_pool_manifests(pool: PoolOptions, out_dir: str | Path) -> str | None:
     path = out_dir / "secchat-pool.k8s.json"
     path.write_text(json.dumps(k8s_pool_manifests(pool), indent=2) + "\n")
     return str(path)
+
+
+# ── Turnkey pool helpers: pure command construction (execution lives in the target, so these stay
+#    unit-testable without docker/kubectl). ──────────────────────────────────────────────────────
+
+def runnerd_image_ref(registry: str, tag: str) -> str:
+    """The tagged runnerd image reference to build+push: ``<registry>/secchat-runnerd:<tag>``. The
+    registry's trailing slash (if any) is normalized off."""
+    return f"{registry.rstrip('/')}/secchat-runnerd:{tag}"
+
+
+def runnerd_build_argv(context_dir: str | Path, image_ref: str) -> list[str]:
+    """``docker build`` argv for the runnerd image — ``Dockerfile.runnerd`` at the root of the fetched
+    secchat checkout (``context_dir``), which is also the build context."""
+    context = str(context_dir)
+    return ["docker", "build", "-f", f"{context}/Dockerfile.runnerd", "-t", image_ref, context]
+
+
+def runnerd_push_argv(image_ref: str) -> list[str]:
+    """``docker push`` argv for the built runnerd image."""
+    return ["docker", "push", image_ref]
+
+
+def kubectl_apply_argv(manifest_path: str | Path, context: str = "") -> list[str]:
+    """``kubectl apply -f <manifest>`` argv, with ``--context`` prepended when the site pins one."""
+    ctx = ["--context", context] if context else []
+    return ["kubectl", *ctx, "apply", "-f", str(manifest_path)]
 
 
 def sync_secchat_env(

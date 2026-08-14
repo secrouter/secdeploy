@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from .. import process as P
+from .. import wiring
 from ..manifest import Manifest
 
 # A ``KEY=`` line whose value is empty (ignoring trailing whitespace) — the convention every
@@ -107,6 +108,57 @@ def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
             continue
         P.log(f"stack {name}: bringing up via bootstrap/{name}.sh up")
         P.run(["bash", str(boot), "up"], check=False)
+
+
+# ── Turnkey Kubernetes agent pool (shared by macos + fedora-fips) ──────────────────────────────
+
+def build_push_runnerd_image(pool, work: Path) -> str | None:
+    """(``[secchat.pool].build_image``) Build ``Dockerfile.runnerd`` from the fetched secchat checkout
+    and push it to ``pool.registry``; return the pushed image reference (the immutable digest when
+    docker can report it, else the sha tag). The tag is the secchat checkout's short commit sha, so a
+    given secchat commit always maps to the same image. Best-effort: a missing docker or a failed
+    build/push warns (with what to run by hand) and returns ``None`` — the deploy continues and the
+    operator can build/push + set ``image`` themselves."""
+    if not P.which("docker"):
+        P.warn("docker not found — can't build the runnerd image; build+push it yourself and set "
+               "[secchat.pool].image (see docs/agent-pool.md)")
+        return None
+    secchat_dir = work / "secchat"
+    if not (secchat_dir / "Dockerfile.runnerd").exists():
+        P.warn(f"no Dockerfile.runnerd in {secchat_dir} — skipping runnerd image build (set "
+               "[secchat.pool].image manually)")
+        return None
+    sha = P.run(["git", "-C", str(secchat_dir), "rev-parse", "--short", "HEAD"],
+                check=False, capture=True).stdout.strip() or "latest"
+    image_ref = wiring.runnerd_image_ref(pool.registry, sha)
+    P.log(f"building + pushing the runnerd image ({image_ref})")
+    b = P.run(wiring.runnerd_build_argv(secchat_dir, image_ref), check=False)
+    if getattr(b, "returncode", 1) != 0:
+        P.warn("runnerd image build failed — set [secchat.pool].image manually (see docs/agent-pool.md)")
+        return None
+    p = P.run(wiring.runnerd_push_argv(image_ref), check=False)
+    if getattr(p, "returncode", 1) != 0:
+        P.warn(f"runnerd image push failed ({image_ref}) — is {pool.registry} reachable + authenticated?")
+        return None
+    # Prefer the immutable digest ref (registry/secchat-runnerd@sha256:…) when docker reports it, so
+    # the pod spec pins a content-addressed image rather than a movable tag.
+    dig = P.run(["docker", "inspect", "--format", "{{index .RepoDigests 0}}", image_ref],
+                check=False, capture=True).stdout.strip()
+    return dig or image_ref
+
+
+def apply_pool_manifests(pool, pool_path: str) -> None:
+    """(``[secchat.pool].apply``) ``kubectl apply`` the emitted pool manifests, best-effort. A missing
+    kubectl / unreachable cluster warns with the exact command to run by hand — it never aborts the
+    deploy (SecChat on the host is already up; the pool RBAC can be applied out of band)."""
+    if not P.which("kubectl"):
+        P.warn(f"kubectl not found — apply the pool manifests yourself: kubectl apply -f {pool_path}")
+        return
+    argv = wiring.kubectl_apply_argv(pool_path, pool.kube_context)
+    P.log(f"applying the agent-pool manifests ({' '.join(argv)})")
+    r = P.run(argv, check=False)
+    if getattr(r, "returncode", 1) != 0:
+        P.warn(f"kubectl apply failed — apply the pool manifests yourself: {' '.join(argv)}")
 
 
 def fetch(
