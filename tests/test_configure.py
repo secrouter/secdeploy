@@ -243,7 +243,7 @@ def test_secret_seeding_writes_fedora_env_files_never_in_secsite_toml(tmp_path):
         "sup3r-ca-pass", "sup3r-admin-tok",    # SecCert
         "sso-secret-xyz",                       # SecAgent (SECAGENT_CLIENT_SECRET)
         "hf_test_token",                        # SecRecorder
-        "/etc/secsuite/secrouter.config.hardened.json",  # SecRouter FREEROUTER_CONFIG
+        "/etc/secsuite/secrouter.config.hardened.json",  # SecRouter SECROUTER_CONFIG
     ]
     driver = _driver(answers)
     result = configure.run(
@@ -269,7 +269,7 @@ def test_secret_seeding_writes_fedora_env_files_never_in_secsite_toml(tmp_path):
     assert "SECCERT_ADMIN_TOKEN=sup3r-admin-tok" in seccert_env.read_text()
     assert "SECAGENT_CLIENT_SECRET=sso-secret-xyz" in secagent_env.read_text()
     assert "HF_TOKEN=hf_test_token" in secrecorder_env.read_text()
-    assert "FREEROUTER_CONFIG=/etc/secsuite/secrouter.config.hardened.json" in secrouter_env.read_text()
+    assert "SECROUTER_CONFIG=/etc/secsuite/secrouter.config.hardened.json" in secrouter_env.read_text()
     # a fedora-fips-only site must never touch macOS's shared secrets.env
     assert not (root / "deploy/macos/secrets.env").exists()
 
@@ -289,7 +289,7 @@ def test_secret_seeding_macos_shares_one_secrets_env_file(tmp_path):
         "ca-pass-mac", "admin-tok-mac",
         "sso-secret-mac",            # SecAgent (SECAGENT_CLIENT_SECRET)
         "hf-tok-mac",
-        "",                          # FREEROUTER_CONFIG left blank -> skipped
+        "",                          # SECROUTER_CONFIG left blank -> skipped
     ]
     driver = _driver(answers)
     result = configure.run(
@@ -305,7 +305,7 @@ def test_secret_seeding_macos_shares_one_secrets_env_file(tmp_path):
     assert "SECCERT_ADMIN_TOKEN=admin-tok-mac" in text
     assert "SECAGENT_CLIENT_SECRET=sso-secret-mac" in text
     assert "HF_TOKEN=hf-tok-mac" in text
-    assert "FREEROUTER_CONFIG" not in text  # left blank -> never written at all
+    assert "SECROUTER_CONFIG" not in text  # left blank -> never written at all
     assert "ca-pass-mac" not in dest.read_text()  # never in secsite.toml either
     # no per-component fedora-fips-style file for a macOS-only site
     assert not any((root / "deploy/fedora-fips").glob("*.env"))
@@ -332,7 +332,7 @@ def test_secret_seeding_autogenerates_internal_seccert_secrets(tmp_path):
         "y",                   # auto-generate internal secrets? yes (SecCert NOT asked below)
         "sso-secret-auto",     # SecAgent SECAGENT_CLIENT_SECRET — still asked (shared)
         "hf-auto",             # SecRecorder HF_TOKEN — still asked (external)
-        "",                    # SecRouter FREEROUTER_CONFIG — blank
+        "",                    # SecRouter SECROUTER_CONFIG — blank
     ]
     driver = _driver(answers)
     result = configure.run(
@@ -391,7 +391,7 @@ def test_secret_seeding_blank_values_writes_nothing(tmp_path):
         "n",             # auto-generate internal secrets? no — leave blank (below)
         "", "",          # SecCert — both blank
         "",              # SecRecorder HF_TOKEN — blank
-        "",              # SecRouter FREEROUTER_CONFIG — blank
+        "",              # SecRouter SECROUTER_CONFIG — blank
     ]
     driver = _driver(answers)
     result = configure.run(

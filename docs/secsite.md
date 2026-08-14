@@ -125,7 +125,7 @@ to skip any single value:
 | SecCert | placed (identity tier) and not dropped via `without` | `SECCERT_CA_PASSPHRASE`, `SECCERT_ADMIN_TOKEN` |
 | SecAgent | placed (collab tier) **and** `with_agent` is on for that resource | `SECAGENT_CLIENT_SECRET` (SecSSO service-account secret) |
 | SecRecorder | placed (collab tier) | `HF_TOKEN` (optional — only needed for the gated diarizer model) |
-| SecRouter | placed (gateway tier) | `FREEROUTER_CONFIG` — a **path** to a hardened config, not a secret; asked as plain text, not masked |
+| SecRouter | placed (gateway tier) | `SECROUTER_CONFIG` — a **path** to a hardened config, not a secret; asked as plain text, not masked |
 
 **secrets never land in `secsite.toml`.** They're written into the same local, gitignored
 `*.env` files `deploy` already reads (`*.env` / `!*.env.example` in `.gitignore`):

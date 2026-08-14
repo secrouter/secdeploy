@@ -41,10 +41,10 @@ services:
       # SECROUTER_EGRESS_FILE (from the env_file above) is a HOST-relative path
       # (out/addressing/secrouter-egress.json) — meaningless inside the container's own
       # filesystem without this mount. Read-only: this container only ever reads it.
-      # Also carries the hardened freerouter.config.json (FREEROUTER_CONFIG below) —
+      # Also carries the hardened secrouter.config.json (SECROUTER_CONFIG below) —
       # same mount, no separate bind needed.
       - ../../out/addressing:/addressing:ro
-      # security.storePath (/var/lib/secrouter/secrouter.db in freerouter.config.json) —
+      # security.storePath (/var/lib/secrouter/secrouter.db in secrouter.config.json) —
       # the admin-override DB, usage ledger, and hash-chained audit log. Named volume so
       # it survives container recreation; without this a `docker compose up` recreate
       # silently resets accounting/audit history.
@@ -55,7 +55,7 @@ services:
       # work/secchat/compose.yaml.
       - ${SUITE_CA_PATH:-../../out/seccert-root.pem}:/etc/ssl/certs/suite-ca.pem:ro
     extra_hosts:
-      # security.oidc's issuer/jwksUri (out/addressing/freerouter.config.json) point at
+      # security.oidc's issuer/jwksUri (out/addressing/secrouter.config.json) point at
       # secsso.sec.internal — that name only resolves via the HOST's resolver (macOS
       # /etc/resolver/sec.internal, served by SecDNS), invisible to this container the same
       # way secllm.sec.internal already is (see SECROUTER_SECLLM_ENDPOINTS below). Without
@@ -73,14 +73,14 @@ services:
       # UNABLE_TO_VERIFY_LEAF_SIGNATURE (self-signed-from-Node's-perspective root).
       NODE_EXTRA_CA_CERTS: /etc/ssl/certs/suite-ca.pem
       # CUI-hardened config (security.enabled=true, OIDC required, egress allow-list) —
-      # see out/addressing/freerouter.config.json. Explicitly hand-authors the secllm
+      # see out/addressing/secrouter.config.json. Explicitly hand-authors the secllm
       # provider + tier routing rather than relying on the SECROUTER_SECLLM_ENDPOINTS
       # turnkey intake below: src/config.ts's applySecllmEndpointsIntake is a no-op the
       # moment a config file defines providers.secllm, so once this is mounted the
       # SECROUTER_SECLLM_ENDPOINTS override two lines down stops driving routing (kept
       # set anyway as a harmless fallback for a plain `docker compose up` without this
-      # file, or for a future FREEROUTER_CONFIG-less run).
-      FREEROUTER_CONFIG: /addressing/freerouter.config.json
+      # file, or for a future SECROUTER_CONFIG-less run).
+      SECROUTER_CONFIG: /addressing/secrouter.config.json
       # Overrides the env_file's host-relative value with the in-container mount path above
       # (environment: wins over env_file for the same key — see Compose's own precedence
       # rules). Confirmed live: without this SecRouter FATALs on boot (ENOENT) the moment

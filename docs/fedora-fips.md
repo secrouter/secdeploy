@@ -229,7 +229,7 @@ SecSSO's `issuer_mode: global` means every client shares one issuer, so SecRoute
 `jwksUri` set explicitly (auto-discovery from `issuer` alone won't resolve) and SecAgent's
 non-interactive service account added to `serviceSubjects` (client_credentials tokens carry no
 MFA assertion, so `svc-secagent` would otherwise trip `requireMfa`). Unlike
-`SECROUTER_EGRESS_FILE`, this ISN'T env-var-driven — SecRouter's `FREEROUTER_CONFIG` is a
+`SECROUTER_EGRESS_FILE`, this ISN'T env-var-driven — SecRouter's `SECROUTER_CONFIG` is a
 hand-authored JSON file — so `deploy --with-agent` writes a documented fragment,
 `out/addressing/secrouter-oidc.json`, for you to merge into `security.oidc` by hand:
 
@@ -451,20 +451,20 @@ Edit the env files the installer dropped (they don't overwrite existing ones):
 
 ```bash
 sudoedit /etc/secsuite/seccert.env      # set SECCERT_ADMIN_TOKEN, SECCERT_CA_PASSPHRASE, external URL
-sudoedit /etc/secsuite/secrouter.env    # point FREEROUTER_CONFIG at a hardened config
+sudoedit /etc/secsuite/secrouter.env    # point SECROUTER_CONFIG at a hardened config
 sudoedit /etc/secsuite/secrecorder.env  # or: sudo systemctl mask secrecorder.service to skip it
 sudoedit /etc/secsuite/secagent.env     # --with-agent only: SECAGENT_CLIENT_SECRET (service/CI auth)
 sudo systemctl restart secsuite.target
 ```
 
 SecRouter's config must enable the security block and `tls.mode: frontend|native`; it fails
-closed if FIPS is required but unavailable. Start from `freerouter.config.hardened.example.json`
+closed if FIPS is required but unavailable. Start from `secrouter.config.hardened.example.json`
 in the SecRouter checkout.
 
 > **Filling these in *before* the first deploy.** `secdeploy configure`'s optional secret-
 > seeding step (asked right after it writes `secsite.toml`) can pre-fill these same values —
 > `SECCERT_ADMIN_TOKEN`/`SECCERT_CA_PASSPHRASE`, `SECAGENT_CLIENT_SECRET`,
-> `HF_TOKEN`, `FREEROUTER_CONFIG` — into the checkout's own
+> `HF_TOKEN`, `SECROUTER_CONFIG` — into the checkout's own
 > `deploy/fedora-fips/<svc>.env` (gitignored, `0600`), which `deploy` then installs to
 > `/etc/secsuite/<svc>.env` on first run **in place of** the blank `.env.example` (the
 > `test -f … || install …` non-clobber guard still applies — an already-seeded target host is

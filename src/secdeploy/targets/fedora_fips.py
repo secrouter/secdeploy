@@ -467,7 +467,7 @@ def deploy(
                "WHISPER_MODEL/WHISPER_DIARIZE_MODEL directly in /etc/secsuite/secrecorder.env")
     if tls or configure_hosts or trust_ca:
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
-               "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
+               "secrouter.env's SECROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
     without = without or []
     # Placement: which native services run on THIS resource. secdns is only deployed with a
     # topology (it needs a generated zone); single-host (no topology) is byte-identical. secllm
@@ -520,7 +520,7 @@ def deploy(
     )
 
     # SecRouter's OIDC config fragment (security.oidc.issuer/jwksUri/serviceSubjects) — not a
-    # turnkey env var like SECROUTER_EGRESS_FILE (SecRouter's FREEROUTER_CONFIG is hand-authored
+    # turnkey env var like SECROUTER_EGRESS_FILE (SecRouter's SECROUTER_CONFIG is hand-authored
     # JSON), so write_addressing() writes it as a documented fragment for the operator to merge
     # rather than installing it anywhere. It's generated whenever SecRouter+SecSSO are co-placed
     # (--with-agent or not — same placement-only precedent as the rest of write_addressing), but
