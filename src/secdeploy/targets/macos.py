@@ -202,7 +202,7 @@ def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
     install = f"npm install -g lean-ctx-bin@{LEANCTX_VERSION} pi-lean-ctx@{LEANCTX_VERSION}"
     if dry_run:
         print(f"  · (--with-agent) LeanCTX: {install}, then LEAN_CTX_NO_UPDATE_CHECK=1 "
-              "lean-ctx harden && lean-ctx init --agent pi (air-gapped; best-effort)")
+              "lean-ctx init --agent pi (air-gapped; best-effort; pi-scoped — no global `harden`)")
         return
     if not P.which("npm"):
         P.warn(f"npm not found — skipping LeanCTX (context compression). Install it, then: {install} "
@@ -219,12 +219,16 @@ def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
         P.warn("LeanCTX binary not on PATH after install — pi-side compression won't run yet "
                "(re-run once `lean-ctx` is installed; see secagent docs/leanctx.md)")
         return
-    # Air-gapped: never phone home for updates. harden tightens the MCP/shell surface; init --agent
-    # pi writes pi's LeanCTX config. Both best-effort — a failure here never aborts the deploy.
+    # Air-gapped: never phone home for updates. `init --agent pi` writes pi's OWN LeanCTX config —
+    # the only thing we run. We deliberately do NOT run `lean-ctx harden`: it hardens the OPERATOR's
+    # Claude Code GLOBALLY (writes ~/.claude/settings.json PreToolUse hooks that gate every Bash/Read
+    # tool call, deny the Grep/Glob tools, and auto-allow the lean-ctx MCP). LeanCTX is meant to wrap
+    # pi's own shell for context compression, not to intercept the developer's editor — hardening the
+    # operator's Claude Code is out of scope for `--with-agent` and surprised users. Best-effort — a
+    # failure here never aborts the deploy.
     env = {**_os_environ(), "LEAN_CTX_NO_UPDATE_CHECK": "1"}
-    P.run(["lean-ctx", "harden"], check=False, env=env)
     P.run(["lean-ctx", "init", "--agent", "pi"], check=False, env=env)
-    P.log("LeanCTX wired into pi (hardened, update-check disabled)")
+    P.log("LeanCTX wired into pi (pi-scoped; update-check disabled)")
 
 
 def _configure_hosts(assume_yes: bool = False) -> None:
