@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -266,7 +267,31 @@ def test_nginx_conf_text_websocket_map_and_upgrade_headers(tmp_path):
     # standard reverse-proxy headers on every fronted block
     assert text.count("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;") == len(FRONTED)
     assert text.count("proxy_set_header X-Forwarded-Proto $scheme;") == len(FRONTED)
-    assert text.count("proxy_set_header Host $host;") == len(FRONTED)
+    # +1: secsso's block also carries a `Host $host;` on its extra well-known rewrite location —
+    # see test_nginx_conf_text_secsso_well_known_openid_configuration_rewrite below.
+    assert text.count("proxy_set_header Host $host;") == len(FRONTED) + 1
+
+
+def test_nginx_conf_text_secsso_well_known_openid_configuration_rewrite(tmp_path):
+    # With issuer_mode: global (secrouter-admin-console.yaml et al.), a client's OIDC discovery
+    # fetch off the root issuer (SecRouter's admin-ui.ts login()) hits
+    # https://secsso.sec.internal/.well-known/openid-configuration — a path Authentik never
+    # serves at the root (only under /application/o/<slug>/...). secsso's own :443 block must
+    # rewrite that one path to the secrouter-admin-console application's real discovery doc, or
+    # every admin console sign-in 404s at the very first fetch.
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    secsso_block = text[text.index("server_name secsso.sec.internal;"):]
+    secsso_block = secsso_block[:secsso_block.index("\n\tserver {")]
+    assert "location = /.well-known/openid-configuration {" in secsso_block
+    assert (
+        "/application/o/secrouter-admin-console/.well-known/openid-configuration;"
+    ) in secsso_block
+    # Rewritten to the SAME backend secsso's own `location /` proxies to (its real addr:port),
+    # not a hardcoded loopback — this topology's core resource sits at 10.0.0.5.
+    assert "proxy_pass http://10.0.0.5:9000/application/o/secrouter-admin-console" in secsso_block
+    # Only secsso's block gets it — every other fronted server stays exactly as before.
+    assert text.count("location = /.well-known/openid-configuration {") == 1
 
 
 def test_nginx_conf_text_port_80_acme_webroot_and_redirect(tmp_path):
@@ -416,7 +441,7 @@ def test_secrouter_egress_rules_single_instance_shape(tmp_path):
     assert set(rule) == {"provider", "allowedHost", "authorizedClassifications", "authorization"}
     assert rule["provider"] == "secllm"
     assert rule["allowedHost"] == ["secllm.sec.internal:11400"]  # host:port, matches checkEgress
-    assert rule["authorizedClassifications"] == ["CUI"]  # this suite's internal-CUI level
+    assert rule["authorizedClassifications"] == ["UNCLASSIFIED", "CUI"]  # internal-CUI level + everything below
     assert isinstance(rule["authorization"], str) and rule["authorization"]
 
 
@@ -437,7 +462,7 @@ def test_secrouter_egress_rules_classifications_overridable(tmp_path):
     )
     assert rules[0]["authorizedClassifications"] == ["UNCLASSIFIED", "CUI", "CUI//SP-PRVCY"]
     # the default wasn't mutated by the override
-    assert wiring.secrouter_egress_rules(topo)[0]["authorizedClassifications"] == ["CUI"]
+    assert wiring.secrouter_egress_rules(topo)[0]["authorizedClassifications"] == ["UNCLASSIFIED", "CUI"]
 
 
 def test_secrouter_egress_rules_json_round_trips(tmp_path):
@@ -570,9 +595,10 @@ def test_secrouter_oidc_config_shape(tmp_path):
         "issuer": "http://secsso.sec.internal:9000/",
         "audience": "secrouter",
         "jwksUri": "http://secsso.sec.internal:9000/application/o/secrouter/jwks/",
-        # svc-secagent is SecAgent's non-interactive service account (client_credentials tokens
-        # can't carry an MFA assertion, so it's trusted to skip requireMfa).
-        "serviceSubjects": ["svc-secagent"],
+        # svc-secagent (SecAgent) and svc-secchat (SecChat's shared service identity) are both
+        # non-interactive service accounts — client_credentials tokens can't carry an MFA
+        # assertion, so both are trusted to skip requireMfa.
+        "serviceSubjects": ["svc-secagent", "svc-secchat"],
     }
 
 
@@ -689,6 +715,48 @@ def test_sync_secagent_service_secret_missing_secsso_secret_is_a_noop(tmp_path):
     secrets_env.write_text("SECAGENT_CLIENT_SECRET=\n")
     assert wiring.sync_secagent_service_secret(secsso_env, secrets_env) is None
     assert "SECAGENT_CLIENT_SECRET=\n" in secrets_env.read_text()
+
+
+# ── sync_secchat_service_secret: mirrors SecSSO's generated svc-secchat app-password, as a
+#    base64("svc-secchat:<password>") composite, into SecChat's own env — NOT a straight copy
+#    (see secchat-service.yaml's "Getting an exact sub"). Same blank-fill shape as
+#    sync_secagent_service_secret above. ──
+def test_sync_secchat_service_secret_fills_blank_value(tmp_path):
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text(
+        "SECCHAT_SERVICE_PROVIDER_SECRET=unused-dead-weight\n"
+        "SECCHAT_SVC_APP_PASSWORD=app-pw-123\n"
+        "OTHER=x\n"
+    )
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_SECROUTER_CLIENT_SECRET=\nOTHER_KEY=y\n")
+    synced = wiring.sync_secchat_service_secret(secsso_env, secchat_env)
+    expected = base64.b64encode(b"svc-secchat:app-pw-123").decode()
+    assert synced == expected
+    text = secchat_env.read_text()
+    assert f"SECCHAT_SECROUTER_CLIENT_SECRET={expected}" in text
+    assert "OTHER_KEY=y" in text  # untouched lines survive
+    # NEVER the provider's own client_secret — that authenticates nothing (see the blueprint).
+    assert "unused-dead-weight" not in text
+
+
+def test_sync_secchat_service_secret_never_overwrites_non_blank_value(tmp_path):
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECCHAT_SVC_APP_PASSWORD=app-pw-123\n")
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_SECROUTER_CLIENT_SECRET=already-set\n")
+    synced = wiring.sync_secchat_service_secret(secsso_env, secchat_env)
+    assert synced is None
+    assert "SECCHAT_SECROUTER_CLIENT_SECRET=already-set" in secchat_env.read_text()
+
+
+def test_sync_secchat_service_secret_missing_secsso_secret_is_a_noop(tmp_path):
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("OTHER=x\n")  # no SECCHAT_SVC_APP_PASSWORD line at all
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_SECROUTER_CLIENT_SECRET=\n")
+    assert wiring.sync_secchat_service_secret(secsso_env, secchat_env) is None
+    assert "SECCHAT_SECROUTER_CLIENT_SECRET=\n" in secchat_env.read_text()
 
 
 # ── env_for secchat branch + sync_secchat_env / sync_secsso_secchat_redirect: turnkey native
