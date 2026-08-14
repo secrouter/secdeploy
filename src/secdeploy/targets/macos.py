@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import getpass
 import html
+import json
 import os
 import pwd
 import re
@@ -190,19 +191,23 @@ def _ensure_nginx() -> None:
 
 
 def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
-    """Install the pinned LeanCTX binary + pi extension and wire them into pi on this box —
-    context compression for the developer's pi (secagent v0.3.0 ships LeanCTX on by default; see
-    its docs/leanctx.md). Best-effort + air-gapped: ``LEAN_CTX_NO_UPDATE_CHECK=1`` so it never
-    phones home, and a missing ``npm`` just skips it (secagent degrades gracefully — ``secagent
-    doctor`` reports whether LeanCTX is actually present).
+    """Install the pinned LeanCTX binary + pi extension so ``secagent init`` (run right after) can
+    wire them into pi. The WIRING is secagent's job now, and it is launch-time + pi-scoped:
+    ``secagent init`` installs the pi-lean-ctx extension and DE-REGISTERS it from pi's global
+    settings.json, and ``secagent pi run`` / SecChat's runner load it per-process via ``-e``.
 
-    Scope note: this wires the pi-side compression only. secagent's OWN-CALL compression needs
-    LeanCTX's persistent daemon, which it self-manages (its own LaunchAgents, incl. an
-    auto-updater) — a separate, deliberately-deferred piece to verify live before enabling."""
+    secdeploy no longer runs ``lean-ctx init --agent pi`` (which globally auto-registered the
+    extension for every pi) or ``lean-ctx harden`` (which wrapped the OPERATOR's shell + Claude
+    Code) — LeanCTX rides along only on the pi processes secagent/SecChat actually launch, per
+    "LeanCTX only for pi-with-secagent". :func:`_unwrap_leanctx_operator` cleans up any prior wrap.
+
+    Best-effort + air-gapped (``LEAN_CTX_NO_UPDATE_CHECK=1`` so it never phones home): a missing
+    ``npm`` just skips it — secagent degrades gracefully and ``secagent doctor`` reports whether
+    LeanCTX is present."""
     install = f"npm install -g lean-ctx-bin@{LEANCTX_VERSION} pi-lean-ctx@{LEANCTX_VERSION}"
     if dry_run:
-        print(f"  · (--with-agent) LeanCTX: {install}, then LEAN_CTX_NO_UPDATE_CHECK=1 "
-              "lean-ctx init --agent pi (air-gapped; best-effort; pi-scoped — no global `harden`)")
+        print(f"  · (--with-agent) LeanCTX: {install} (air-gapped, LEAN_CTX_NO_UPDATE_CHECK=1; pi "
+              "wiring is secagent init's job — launch-time + pi-scoped, no global init/harden)")
         return
     if not P.which("npm"):
         P.warn(f"npm not found — skipping LeanCTX (context compression). Install it, then: {install} "
@@ -212,23 +217,119 @@ def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
     # --loglevel=error --no-fund: quiet npm's funding spam and the deprecation warnings from
     # third-party transitives in the pi-coding-agent tree (e.g. node-domexception@1.0.0, dead
     # weight on Node 17+ but not ours to remove) — nothing here is actionable by us, and real
-    # errors (loglevel=error) still print.
+    # errors (loglevel=error) still print. LEAN_CTX_NO_UPDATE_CHECK so the install never phones home.
+    env = {**_os_environ(), "LEAN_CTX_NO_UPDATE_CHECK": "1"}
     P.run(["npm", "install", "-g", f"lean-ctx-bin@{LEANCTX_VERSION}",
-           f"pi-lean-ctx@{LEANCTX_VERSION}", "--loglevel=error", "--no-fund"], check=False)
+           f"pi-lean-ctx@{LEANCTX_VERSION}", "--loglevel=error", "--no-fund"], check=False, env=env)
     if not P.which("lean-ctx"):
         P.warn("LeanCTX binary not on PATH after install — pi-side compression won't run yet "
                "(re-run once `lean-ctx` is installed; see secagent docs/leanctx.md)")
         return
-    # Air-gapped: never phone home for updates. `init --agent pi` writes pi's OWN LeanCTX config —
-    # the only thing we run. We deliberately do NOT run `lean-ctx harden`: it hardens the OPERATOR's
-    # Claude Code GLOBALLY (writes ~/.claude/settings.json PreToolUse hooks that gate every Bash/Read
-    # tool call, deny the Grep/Glob tools, and auto-allow the lean-ctx MCP). LeanCTX is meant to wrap
-    # pi's own shell for context compression, not to intercept the developer's editor — hardening the
-    # operator's Claude Code is out of scope for `--with-agent` and surprised users. Best-effort — a
-    # failure here never aborts the deploy.
-    env = {**_os_environ(), "LEAN_CTX_NO_UPDATE_CHECK": "1"}
-    P.run(["lean-ctx", "init", "--agent", "pi"], check=False, env=env)
-    P.log("LeanCTX wired into pi (pi-scoped; update-check disabled)")
+    P.log("LeanCTX binary + pi extension installed — `secagent init` wires pi (launch-time, pi-scoped)")
+
+
+# The marker-bounded blocks `lean-ctx init`/`harden` write into the operator's ~/.zshrc: the shell
+# hook that sources the compression wrapper, and the agent aliases that wrap claude/codex/gemini.
+_LEANCTX_ZSHRC_BLOCKS = (
+    ("# lean-ctx shell hook — begin", "# lean-ctx shell hook — end"),
+    ("# >>> lean-ctx agent aliases >>>", "# <<< lean-ctx agent aliases <<<"),
+)
+
+
+def _strip_leanctx_zshrc(text: str) -> str:
+    """Remove the marker-bounded LeanCTX blocks (:data:`_LEANCTX_ZSHRC_BLOCKS`) from a ~/.zshrc body,
+    collapsing the blank lines left behind. Anything outside those markers is left byte-for-byte
+    as-is. Idempotent — a body with no LeanCTX block is returned unchanged."""
+    for start, end in _LEANCTX_ZSHRC_BLOCKS:
+        text = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"[^\n]*\n?", "",
+                      text, flags=re.DOTALL)
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def _strip_leanctx_claude(path: Path) -> bool:
+    """Drop LeanCTX's hooks + MCP allows + the Grep/Glob deny from a Claude Code ``settings.json``,
+    leaving every other setting untouched. Returns whether anything changed (so the caller only
+    rewrites + logs on a real edit). Any hook whose command mentions ``lean-ctx`` is removed; an
+    event group left empty is dropped."""
+    data = json.loads(path.read_text() or "{}")
+    changed = False
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            groups = hooks[event]
+            if not isinstance(groups, list):
+                continue
+            kept_groups = []
+            for group in groups:
+                cmds = group.get("hooks") if isinstance(group, dict) else None
+                if not isinstance(cmds, list):
+                    kept_groups.append(group)
+                    continue
+                kept = [h for h in cmds
+                        if not (isinstance(h, dict) and "lean-ctx" in str(h.get("command", "")))]
+                if len(kept) != len(cmds):
+                    changed = True
+                if kept:
+                    kept_groups.append({**group, "hooks": kept})
+            if kept_groups:
+                hooks[event] = kept_groups
+            else:
+                del hooks[event]
+                changed = True
+        if not hooks:
+            data.pop("hooks", None)
+    perms = data.get("permissions")
+    if isinstance(perms, dict):
+        allow = perms.get("allow")
+        if isinstance(allow, list):
+            kept = [a for a in allow if not str(a).startswith("mcp__lean-ctx__")]
+            if len(kept) != len(allow):
+                perms["allow"] = kept
+                changed = True
+        deny = perms.get("deny")
+        if isinstance(deny, list):
+            kept = [d for d in deny if d not in ("Grep", "Glob")]
+            if len(kept) != len(deny):
+                perms["deny"] = kept
+                changed = True
+        for key in ("allow", "deny"):
+            if key in perms and not perms[key]:
+                del perms[key]
+        if not perms:
+            data.pop("permissions", None)
+    if changed:
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    return changed
+
+
+def _unwrap_leanctx_operator(dry_run: bool = False) -> None:
+    """Remove any GLOBAL LeanCTX wrap from the operator's shell + Claude Code. LeanCTX must attach
+    only at pi-launch time (secagent's launch contract) — never to the developer's interactive
+    shell or their OTHER agents (claude/codex/gemini). Cleans the marker-bounded block an older
+    ``lean-ctx init``/``harden`` left in ~/.zshrc and drops lean-ctx hooks/allows from
+    ~/.claude/settings.json. Idempotent + best-effort: a box that was never wrapped is a no-op."""
+    _user, home = _native_user()
+    home_path = Path(home)
+    zshrc = home_path / ".zshrc"
+    claude = home_path / ".claude" / "settings.json"
+    if dry_run:
+        print("  · (--with-agent) LeanCTX: un-wrap the operator (~/.zshrc shell hook + agent "
+              "aliases, ~/.claude lean-ctx hooks) — pi-launch-time only, never a host-wide wrap")
+        return
+    try:
+        if zshrc.exists():
+            text = zshrc.read_text()
+            cleaned = _strip_leanctx_zshrc(text)
+            if cleaned != text:
+                zshrc.write_text(cleaned)
+                P.log("un-wrapped LeanCTX from ~/.zshrc (shell hook + agent aliases)")
+    except OSError as exc:
+        P.warn(f"could not un-wrap ~/.zshrc — remove the lean-ctx block by hand: {exc}")
+    try:
+        if claude.exists() and _strip_leanctx_claude(claude):
+            P.log("removed LeanCTX hooks from ~/.claude/settings.json")
+    except (OSError, json.JSONDecodeError) as exc:
+        P.warn(f"could not clean ~/.claude/settings.json — remove lean-ctx hooks by hand: {exc}")
 
 
 def _configure_hosts(assume_yes: bool = False) -> None:
@@ -1094,6 +1195,12 @@ def deploy(
                       "work/secagent/pi/extensions/secagent.ts`")
             else:
                 P.warn(f"secagent init failed — wire up pi yourself: {init_cmd}")
+
+        # Belt-and-suspenders: strip any GLOBAL LeanCTX wrap from the operator's shell + Claude
+        # Code that an older deploy (or `secagent init`'s own `lean-ctx init --agent pi`) may have
+        # left. LeanCTX attaches only at pi-launch time now — never to the developer's interactive
+        # shell or their other agents. No-op on a box that was never wrapped.
+        _unwrap_leanctx_operator(dry_run)
 
     # SecRecorder — native MLX/Metal (never containerized on macOS). Runs as the user; TLS optional
     # (a SecCert cert via certbot, reachable across the container boundary through
