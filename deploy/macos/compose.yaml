@@ -41,12 +41,46 @@ services:
       # SECROUTER_EGRESS_FILE (from the env_file above) is a HOST-relative path
       # (out/addressing/secrouter-egress.json) — meaningless inside the container's own
       # filesystem without this mount. Read-only: this container only ever reads it.
+      # Also carries the hardened freerouter.config.json (FREEROUTER_CONFIG below) —
+      # same mount, no separate bind needed.
       - ../../out/addressing:/addressing:ro
+      # security.storePath (/var/lib/secrouter/secrouter.db in freerouter.config.json) —
+      # the admin-override DB, usage ledger, and hash-chained audit log. Named volume so
+      # it survives container recreation; without this a `docker compose up` recreate
+      # silently resets accounting/audit history.
+      - secrouter-data:/var/lib/secrouter
+      # SecCert's root CA — lets Node verify the seccert-issued TLS cert that secproxy
+      # terminates secsso.sec.internal with, instead of failing UNABLE_TO_VERIFY_LEAF_SIGNATURE
+      # on the first JWKS fetch (NODE_EXTRA_CA_CERTS below). Same file/mechanism as
+      # work/secchat/compose.yaml.
+      - ${SUITE_CA_PATH:-../../out/seccert-root.pem}:/etc/ssl/certs/suite-ca.pem:ro
+    extra_hosts:
+      # security.oidc's issuer/jwksUri (out/addressing/freerouter.config.json) point at
+      # secsso.sec.internal — that name only resolves via the HOST's resolver (macOS
+      # /etc/resolver/sec.internal, served by SecDNS), invisible to this container the same
+      # way secllm.sec.internal already is (see SECROUTER_SECLLM_ENDPOINTS below). Without
+      # this, the JWKS fetch on the first authenticated request fails ENOTFOUND and every
+      # request 401s. Mirrors work/secchat/compose.yaml's identical extra_hosts entry.
+      - "secsso.sec.internal:host-gateway"
     environment:
       # server.ts defaults to 127.0.0.1, which is unreachable through the published
       # port — Docker's healthcheck passes because it runs inside the same container.
       SECROUTER_HOST: "0.0.0.0"
       SECROUTER_PORT: "47002"
+      # Trust anchor for the seccert-issued TLS cert secproxy terminates secsso.sec.internal
+      # (and every other fronted FQDN) with — see the suite-ca.pem bind above. Without this the
+      # OIDC JWKS fetch to https://secsso.sec.internal/... fails
+      # UNABLE_TO_VERIFY_LEAF_SIGNATURE (self-signed-from-Node's-perspective root).
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/suite-ca.pem
+      # CUI-hardened config (security.enabled=true, OIDC required, egress allow-list) —
+      # see out/addressing/freerouter.config.json. Explicitly hand-authors the secllm
+      # provider + tier routing rather than relying on the SECROUTER_SECLLM_ENDPOINTS
+      # turnkey intake below: src/config.ts's applySecllmEndpointsIntake is a no-op the
+      # moment a config file defines providers.secllm, so once this is mounted the
+      # SECROUTER_SECLLM_ENDPOINTS override two lines down stops driving routing (kept
+      # set anyway as a harmless fallback for a plain `docker compose up` without this
+      # file, or for a future FREEROUTER_CONFIG-less run).
+      FREEROUTER_CONFIG: /addressing/freerouter.config.json
       # Overrides the env_file's host-relative value with the in-container mount path above
       # (environment: wins over env_file for the same key — see Compose's own precedence
       # rules). Confirmed live: without this SecRouter FATALs on boot (ENOENT) the moment
@@ -78,3 +112,4 @@ services:
 
 volumes:
   seccert-data:
+  secrouter-data:

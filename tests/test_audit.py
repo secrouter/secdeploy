@@ -522,7 +522,7 @@ def test_fedora_deploy_real_run_2instance_writes_egress_and_shared_token(tmp_pat
     assert rules == [{
         "provider": "secllm",
         "allowedHost": ["secllm-gpu1.sec.internal:11400", "secllm-gpu2.sec.internal:11400"],
-        "authorizedClassifications": ["CUI"],
+        "authorizedClassifications": ["UNCLASSIFIED", "CUI"],
         "authorization": rules[0]["authorization"],
     }]
 
@@ -628,9 +628,11 @@ def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, m
     # no daemon-only pi models.json is generated (secagent init writes the harness one live)
     assert not (addr_dir / "secagent-pi-models.json").exists()
 
-    # SecRouter's OIDC config fragment — only svc-secagent (SecAgent's non-interactive account).
+    # SecRouter's OIDC config fragment — svc-secagent (SecAgent's non-interactive account) and
+    # svc-secchat (SecChat's shared service identity), unconditionally, regardless of whether
+    # either is actually placed in this topology.
     oidc = json.loads((addr_dir / "secrouter-oidc.json").read_text())
-    assert oidc["serviceSubjects"] == ["svc-secagent"]
+    assert oidc["serviceSubjects"] == ["svc-secagent", "svc-secchat"]
     assert "delegatingSubjects" not in oidc
     assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
