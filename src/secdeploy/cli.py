@@ -195,6 +195,13 @@ def cmd_configure(args) -> int:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest = str(dest_path)
     m = Manifest.load(args.manifest)
+    # --web: the graphical configurator — a local SecRouter-themed page with every option +
+    # explanation; saving round-trips through the same SiteConfig validation as the wizard.
+    if getattr(args, "web", False):
+        from . import webconfig
+
+        webconfig.serve(m, dest, port=args.port)
+        return 0
     ok = configure.run(m, dest=dest, root=_root(args))
     if ok and getattr(args, "name", None):
         print(f"saved profile {args.name!r} — use it with: secdeploy deploy <target> --site {args.name}")
@@ -422,6 +429,15 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument(
         "--list", action="store_true",
         help="list the saved site profiles and exit",
+    )
+    cp.add_argument(
+        "--web", action="store_true",
+        help="graphical configurator: serve a local web page (loopback only) with every option "
+             "+ explanation; saving applies the same validation as the wizard",
+    )
+    cp.add_argument(
+        "--port", type=int, default=4477,
+        help="port for --web (default 4477)",
     )
     cp.set_defaults(fn=cmd_configure)
 
