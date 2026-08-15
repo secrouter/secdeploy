@@ -65,7 +65,8 @@ USER_KEYS = {"username", "email", "name", "groups"}
 # The [secchat.pool] sub-table — the optional Kubernetes agent pool. Mirrors PoolOptions' fields.
 SECCHAT_POOL_KEYS = {
     "enabled", "image", "namespace", "service_account", "service_account_namespace",
-    "git_host", "secchat_url", "cpu", "memory", "max_pods", "ttl_seconds",
+    "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
+    "build_image", "registry", "apply", "kube_context",
 }
 
 
@@ -116,13 +117,23 @@ class UserSpec:
 class PoolOptions:
     """The optional Kubernetes agent pool for SecChat coding agents (secsite.toml's
     ``[secchat.pool]``). When ``enabled``, SecDeploy writes the ``SECCHAT_POOL_*`` env into
-    secchat's ``.env`` and emits Kubernetes manifests (namespace / ServiceAccount / Role +
-    binding / NetworkPolicy / ResourceQuota) to ``<out>/addressing/secchat-pool.k8s.json`` for the
-    operator to ``kubectl apply`` to their cluster. Off by default — a deployment with no cluster
-    simply omits this section and the pool stays unavailable. ``image`` (the runnerd image) is
-    required when enabled; ``git_host`` (the enclave git host the pods may reach) scopes the egress
-    NetworkPolicy; ``secchat_url`` is the cluster-internal URL a pod dials back (defaults to
-    SecChat's own address from the topology)."""
+    secchat's ``.env`` and emits Kubernetes manifests (namespace / Role + binding / NetworkPolicy /
+    ResourceQuota) to ``<out>/addressing/secchat-pool.k8s.json``. Off by default — a deployment with
+    no cluster simply omits this section and the pool stays unavailable.
+
+    Turnkey knobs (all default off, so the manifest-only "write it, operator applies it" behaviour is
+    unchanged):
+
+    - ``build_image``: build ``Dockerfile.runnerd`` from the fetched secchat checkout, push it to
+      ``registry``, and set ``image`` to the pushed digest. ``registry`` is then required.
+    - ``apply``: ``kubectl apply`` the emitted manifests (``--context kube_context`` when set) instead
+      of leaving them for the operator.
+
+    ``image`` (the runnerd image) is required when ``enabled`` unless ``build_image`` produces it;
+    ``git_host`` (the enclave git host the pods may reach) scopes the egress NetworkPolicy;
+    ``secchat_url`` is the cluster-internal URL a pod dials back (defaults to SecChat's own address
+    from the topology). ``max_pods``/``max_per_owner`` drive both the ResourceQuota and SecChat's own
+    in-process admission caps (``SECCHAT_POOL_MAX_PODS`` / ``SECCHAT_POOL_MAX_PER_OWNER``)."""
 
     enabled: bool = False
     image: str = ""
@@ -134,7 +145,13 @@ class PoolOptions:
     cpu: str = "1"
     memory: str = "1Gi"
     max_pods: int = 20
+    max_per_owner: int = 3
     ttl_seconds: int = 3600
+    # Turnkey deploy knobs (default off → the historical write-manifests-only behaviour).
+    build_image: bool = False
+    registry: str = ""
+    apply: bool = False
+    kube_context: str = ""
 
 
 @dataclass
@@ -269,10 +286,17 @@ class SiteConfig:
             cpu=str(pool_data.get("cpu", "1")).strip() or "1",
             memory=str(pool_data.get("memory", "1Gi")).strip() or "1Gi",
             max_pods=int(pool_data.get("max_pods", 20)),
+            max_per_owner=int(pool_data.get("max_per_owner", 3)),
             ttl_seconds=int(pool_data.get("ttl_seconds", 3600)),
+            build_image=bool(pool_data.get("build_image", False)),
+            registry=str(pool_data.get("registry", "")).strip(),
+            apply=bool(pool_data.get("apply", False)),
+            kube_context=str(pool_data.get("kube_context", "")).strip(),
         )
-        if secchat_pool.enabled and not secchat_pool.image:
-            errors.append("[secchat.pool]: image is required when enabled = true")
+        if secchat_pool.enabled and not secchat_pool.image and not secchat_pool.build_image:
+            errors.append("[secchat.pool]: image is required when enabled = true (or set build_image = true)")
+        if secchat_pool.build_image and not secchat_pool.registry:
+            errors.append("[secchat.pool]: registry is required when build_image = true (where to push the runnerd image)")
 
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
@@ -426,6 +450,11 @@ class SiteConfig:
             out.append(f'cpu = "{pool.cpu}"')
             out.append(f'memory = "{pool.memory}"')
             out.append(f"max_pods = {pool.max_pods}")
+            out.append(f"max_per_owner = {pool.max_per_owner}")
             out.append(f"ttl_seconds = {pool.ttl_seconds}")
+            out.append(f"build_image = {_bool(pool.build_image)}")
+            out.append(f'registry = "{pool.registry}"')
+            out.append(f"apply = {_bool(pool.apply)}")
+            out.append(f'kube_context = "{pool.kube_context}"')
             out.append("")
         return "\n".join(out).rstrip() + "\n"

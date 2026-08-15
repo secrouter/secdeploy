@@ -665,17 +665,25 @@ def deploy(
         if sc_redir:
             P.log("secsso: pointed the SecChat OIDC client at its topology callback "
                   "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+        # Optional agent pool: build+push the runnerd image first (when requested) so the .env sync +
+        # manifests below reference the pushed (digest-pinned) image.
+        if secchat_pool is not None and secchat_pool.enabled and secchat_pool.build_image:
+            built = common.build_push_runnerd_image(secchat_pool, work)
+            if built:
+                secchat_pool.image = built
         sc_env = wiring.sync_secchat_env(
             work / "secsso" / ".env", work / "secchat" / ".env", topology, without, pool=secchat_pool)
         if sc_env:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(sc_env)} keys)")
-        # Optional Kubernetes agent pool: emit the cluster manifests for the operator to apply.
+        # Optional Kubernetes agent pool: emit the cluster manifests, and (when apply is set) apply them.
         if secchat_pool is not None and secchat_pool.enabled and addr_dir is not None:
             pool_path = wiring.write_pool_manifests(secchat_pool, addr_dir)
             if pool_path:
                 P.log(f"secchat: wrote Kubernetes agent-pool manifests → {pool_path} "
                       "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
+                if secchat_pool.apply:
+                    common.apply_pool_manifests(secchat_pool, pool_path)
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

@@ -331,7 +331,12 @@ service_account_namespace = "chat"
 git_host = "git.sec.internal"
 secchat_url = "http://secchat.chat.svc:47010"
 max_pods = 12
+max_per_owner = 4
 ttl_seconds = 1800
+build_image = true
+registry = "registry.internal"
+apply = true
+kube_context = "enclave"
 """
 
 
@@ -352,12 +357,28 @@ def test_secchat_pool_parses_all_fields(tmp_path):
     assert pool.git_host == "git.sec.internal"
     assert pool.secchat_url == "http://secchat.chat.svc:47010"
     assert pool.max_pods == 12
+    assert pool.max_per_owner == 4
     assert pool.ttl_seconds == 1800
+    assert pool.build_image is True
+    assert pool.registry == "registry.internal"
+    assert pool.apply is True
+    assert pool.kube_context == "enclave"
 
 
 def test_secchat_pool_enabled_without_image_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="image is required"):
         _site(tmp_path, BARE + "\n[secchat.pool]\nenabled = true\n")
+
+
+def test_secchat_pool_enabled_without_image_ok_when_build_image(tmp_path):
+    # build_image produces the image, so an explicit image isn't required (registry must be set).
+    pool = _site(tmp_path, BARE + '\n[secchat.pool]\nenabled = true\nbuild_image = true\nregistry = "reg.io"\n').secchat_pool
+    assert pool.enabled is True and pool.build_image is True and pool.image == ""
+
+
+def test_secchat_pool_build_image_without_registry_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="registry is required"):
+        _site(tmp_path, BARE + '\n[secchat.pool]\nenabled = true\nimage = "x"\nbuild_image = true\n')
 
 
 def test_secchat_pool_unknown_key_is_rejected(tmp_path):

@@ -1253,6 +1253,9 @@ def test_secchat_pool_env_carries_the_pool_settings(tmp_path):
     assert env["SECCHAT_POOL_NAMESPACE"] == "chat-pool"
     assert env["SECCHAT_POOL_SECCHAT_URL"] == "http://secchat.chat.svc:47010"
     assert env["SECCHAT_POOL_TTL"] == "1800"
+    # Admission caps flow to the backend (SecChat rejects a burst fast, same numbers as the quota).
+    assert env["SECCHAT_POOL_MAX_PODS"] == "7"
+    assert env["SECCHAT_POOL_MAX_PER_OWNER"] == "3"  # PoolOptions default
 
 
 def test_secchat_pool_env_defaults_secchat_url_from_topology(tmp_path):
@@ -1276,6 +1279,26 @@ def test_k8s_pool_manifests_shape_and_rbac(tmp_path):
     assert by["NetworkPolicy"]["spec"]["ingress"] == []
     assert "ServiceAccount" not in kinds
     assert "TOKEN" not in json.dumps(m) and "PRIVATE" not in json.dumps(m)
+    # git_host surfaces as a NetworkPolicy annotation (a plain NetworkPolicy can't match hosts, so an
+    # FQDN-aware layer / the operator consumes it) — kept meaningful, not silently dropped.
+    assert by["NetworkPolicy"]["metadata"]["annotations"]["secchat.io/git-host"] == "git.sec.internal"
+
+
+def test_k8s_pool_manifests_omits_git_host_annotation_when_unset():
+    m = wiring.k8s_pool_manifests(_pool(git_host=""))
+    np = next(i for i in m["items"] if i["kind"] == "NetworkPolicy")
+    assert "annotations" not in np["metadata"]
+
+
+def test_pool_turnkey_command_construction():
+    # Pure argv builders (execution lives in the target, so these stay testable without docker/kubectl).
+    assert wiring.runnerd_image_ref("reg.io/", "abc123") == "reg.io/secchat-runnerd:abc123"
+    assert wiring.runnerd_build_argv("/w/secchat", "reg.io/secchat-runnerd:abc") == \
+        ["docker", "build", "-f", "/w/secchat/Dockerfile.runnerd", "-t", "reg.io/secchat-runnerd:abc", "/w/secchat"]
+    assert wiring.runnerd_push_argv("reg.io/secchat-runnerd:abc") == ["docker", "push", "reg.io/secchat-runnerd:abc"]
+    assert wiring.kubectl_apply_argv("/o/pool.json") == ["kubectl", "apply", "-f", "/o/pool.json"]
+    assert wiring.kubectl_apply_argv("/o/pool.json", "enclave") == \
+        ["kubectl", "--context", "enclave", "apply", "-f", "/o/pool.json"]
 
 
 def test_write_pool_manifests_writes_json_when_enabled_else_none(tmp_path):

@@ -1056,6 +1056,13 @@ def deploy(
         if redir:
             P.log("secsso: pointed the SecChat OIDC client at its topology callback "
                   "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+        # Optional agent pool: when build_image is set, build+push the runnerd image FIRST so the
+        # .env sync + manifests below reference the pushed (digest-pinned) image. Mutates the in-memory
+        # PoolOptions.image; best-effort (a build/push failure leaves image as-is and warns).
+        if secchat_pool is not None and secchat_pool.enabled and secchat_pool.build_image:
+            built = common.build_push_runnerd_image(secchat_pool, work)
+            if built:
+                secchat_pool.image = built
         # NB: a distinct name — NOT `written` — so this doesn't clobber the addressing dict from
         # write_addressing() above, which the deploy-audit call below still needs as `addressing=`.
         written_secchat = wiring.sync_secchat_env(
@@ -1063,12 +1070,15 @@ def deploy(
         if written_secchat:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(written_secchat)} keys)")
-        # Optional Kubernetes agent pool: emit the cluster manifests for the operator to apply.
+        # Optional Kubernetes agent pool: emit the cluster manifests, and (when apply is set) apply
+        # them for the operator instead of leaving them as inert JSON.
         if secchat_pool is not None and secchat_pool.enabled:
             pool_path = wiring.write_pool_manifests(secchat_pool, base_out / "addressing")
             if pool_path:
                 P.log(f"secchat: wrote Kubernetes agent-pool manifests → {pool_path} "
                       "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
+                if secchat_pool.apply:
+                    common.apply_pool_manifests(secchat_pool, pool_path)
 
     # SecRecorder (a NATIVE service, not a stack) turnkey SSO. Same early-seed + SecSSO-co-placement
     # requirement as the SecChat block above, but adapted to a native service: there's no stack .env
