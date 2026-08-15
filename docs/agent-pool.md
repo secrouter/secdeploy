@@ -118,3 +118,32 @@ docker push <registry>/secchat-runnerd:<tag>
 # set [secchat.pool].image to that ref, redeploy (writes the .env), then:
 kubectl apply -f <out>/addressing/secchat-pool.k8s.json
 ```
+
+## Out-of-cluster SecChat (compose on the host)
+
+When SecChat runs outside the cluster — this suite's normal shape — set:
+
+```toml
+[secchat.pool]
+api_server = "https://<node-ip>:<api-port>"   # reachable FROM the SecChat container, in the cert SANs
+create_service_account = true                  # emit the SA + token Secret; deploy mounts the credential
+```
+
+The deploy then extracts the ServiceAccount token + cluster CA into `work/secchat/pool-sa/` and
+writes a `compose.override.yaml` mounting them at the standard in-cluster paths, so the backend's
+unmodified Kubernetes client works from compose.
+
+### colima (macOS test instances)
+
+`colima kubernetes start` adds k3s to the running VM. Notes from a live bring-up:
+
+- k3s shares the **docker runtime**, so a locally-built image (`docker build -f Dockerfile.runnerd
+  -t secchat-runnerd:local .`) is visible to the cluster with **no registry** — set
+  `image = "secchat-runnerd:local"`.
+- The API server does **not** listen on 6443: colima runs it on a nonstandard port bound on all VM
+  interfaces (find it with `colima ssh -- sh -c "sudo ss -tlnp | grep k3s"` — the `*:<port>`
+  listener, the same port as the macOS kubeconfig's `127.0.0.1:<port>`). Use
+  `api_server = "https://192.168.5.1:<that-port>"` — `192.168.5.1` is the VM/node IP and is in the
+  API cert's SANs. If a colima restart re-mints the port, update `api_server` and re-deploy.
+- The pod dial-back URL is the VM IP too: `secchat_url = "http://192.168.5.1:47010"` (docker
+  publishes SecChat's port on the VM's interfaces).
