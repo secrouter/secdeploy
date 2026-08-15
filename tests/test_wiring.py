@@ -1268,8 +1268,10 @@ def test_k8s_pool_manifests_shape_and_rbac(tmp_path):
     m = wiring.k8s_pool_manifests(_pool())
     assert m["kind"] == "List"
     kinds = [i["kind"] for i in m["items"]]
-    assert kinds == ["Namespace", "Role", "RoleBinding", "ResourceQuota", "NetworkPolicy"]
-    by = {i["kind"]: i for i in m["items"]}
+    # Two NetworkPolicies: the restricted base (all pods) + the opt-in open-egress one (label-selected).
+    assert kinds == ["Namespace", "Role", "RoleBinding", "ResourceQuota", "NetworkPolicy", "NetworkPolicy"]
+    by = {i["kind"]: i for i in m["items"] if i["kind"] != "NetworkPolicy"}
+    by["NetworkPolicy"] = next(i for i in m["items"] if i["metadata"]["name"] == "secchat-pool-egress")
     assert by["Namespace"]["metadata"]["name"] == "chat-pool"
     # The RoleBinding references SecChat's ServiceAccount (create/delete pods), not a created SA.
     assert by["RoleBinding"]["subjects"][0] == {"kind": "ServiceAccount", "name": "secchat", "namespace": "chat"}
@@ -1288,6 +1290,26 @@ def test_k8s_pool_manifests_omits_git_host_annotation_when_unset():
     m = wiring.k8s_pool_manifests(_pool(git_host=""))
     np = next(i for i in m["items"] if i["kind"] == "NetworkPolicy")
     assert "annotations" not in np["metadata"]
+
+
+def test_k8s_pool_manifests_open_egress_policy_is_label_scoped():
+    # The internet toggle: a pod labeled `secchat.io/egress: open` (only when its agent explicitly
+    # opted in — SecChat's default label is "restricted") gets allow-all egress ON TOP of the base
+    # allowlist. Unlabeled pods never match this policy.
+    m = wiring.k8s_pool_manifests(_pool())
+    open_np = next(i for i in m["items"]
+                   if i["kind"] == "NetworkPolicy" and i["metadata"]["name"] == "secchat-pool-egress-open")
+    assert open_np["spec"]["podSelector"] == {"matchLabels": {"secchat.io/egress": "open"}}
+    assert open_np["spec"]["policyTypes"] == ["Egress"]
+    assert open_np["spec"]["egress"] == [{}]  # allow-all for opted-in pods only
+
+
+def test_secchat_pool_env_carries_the_analysis_catalog(tmp_path):
+    env = wiring.secchat_pool_env(
+        _pool(analysis_images={"rust": "secagent-analyzer-rust:1", "ikos": "secagent-analysis:1"}),
+        _topo(tmp_path))
+    assert env["SECCHAT_POOL_ANALYSIS_IMAGES"] == "ikos=secagent-analysis:1,rust=secagent-analyzer-rust:1"
+    assert "SECCHAT_POOL_ANALYSIS_IMAGES" not in wiring.secchat_pool_env(_pool(), _topo(tmp_path))
 
 
 def test_k8s_pool_manifests_egress_allows_the_secchat_dialback_port():

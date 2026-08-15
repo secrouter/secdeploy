@@ -828,6 +828,11 @@ def secchat_pool_env(
     # in-cluster default https://kubernetes.default.svc only resolves inside the cluster).
     if pool.api_server:
         env["SECCHAT_POOL_APISERVER"] = pool.api_server
+    # Analysis sidecar catalog (name=image, sorted for a deterministic .env) — SecChat offers these
+    # per agent pod, each sharing the pod's /workspace volume with the agent's code.
+    if pool.analysis_images:
+        env["SECCHAT_POOL_ANALYSIS_IMAGES"] = ",".join(
+            f"{name}={pool.analysis_images[name]}" for name in sorted(pool.analysis_images))
     return env
 
 
@@ -906,6 +911,19 @@ def k8s_pool_manifests(pool: PoolOptions) -> dict[str, object]:
                         {"ports": [{"protocol": "TCP", "port": 22}, {"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 9418}]},  # git ssh/https/git
                         {"ports": [{"protocol": "TCP", "port": secchat_port}]},  # SecChat dial-back (/runner + /agent-llm)
                     ],
+                },
+            },
+            # Opt-in INTERNET egress: SecChat labels a pod `secchat.io/egress: open` only when its
+            # agent explicitly enabled internet access (default off). NetworkPolicies are additive,
+            # so labeled pods get this allow-all-egress ON TOP of the restricted base; unlabeled
+            # pods keep the base allowlist alone. Emitted unconditionally — inert without the label.
+            {
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": {"name": "secchat-pool-egress-open", "namespace": ns, "labels": labels},
+                "spec": {
+                    "podSelector": {"matchLabels": {"secchat.io/egress": "open"}},
+                    "policyTypes": ["Egress"],
+                    "egress": [{}],  # allow all egress (the pod opted into the internet)
                 },
             },
         ],

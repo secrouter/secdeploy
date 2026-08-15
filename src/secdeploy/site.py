@@ -67,6 +67,7 @@ SECCHAT_POOL_KEYS = {
     "enabled", "image", "namespace", "service_account", "service_account_namespace",
     "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
     "build_image", "registry", "apply", "kube_context", "api_server", "create_service_account",
+    "analysis_images",
 }
 
 
@@ -162,6 +163,10 @@ class PoolOptions:
     # unmodified in-cluster client just works. Leave both unset for a truly in-cluster SecChat.
     api_server: str = ""
     create_service_account: bool = False
+    # Analysis sidecar catalog, name → image (`[secchat.pool.analysis_images]`). Each named
+    # container can be attached to an agent's pod at creation, sharing the pod's /workspace volume
+    # so its tooling operates on the agent's code (→ SECCHAT_POOL_ANALYSIS_IMAGES). Empty = off.
+    analysis_images: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -304,7 +309,14 @@ class SiteConfig:
             kube_context=str(pool_data.get("kube_context", "")).strip(),
             api_server=str(pool_data.get("api_server", "")).strip(),
             create_service_account=bool(pool_data.get("create_service_account", False)),
+            analysis_images={
+                str(k).strip(): str(v).strip()
+                for k, v in (pool_data.get("analysis_images") or {}).items()
+                if str(k).strip() and str(v).strip()
+            } if isinstance(pool_data.get("analysis_images", {}), dict) else {},
         )
+        if not isinstance(pool_data.get("analysis_images", {}), dict):
+            errors.append("[secchat.pool]: analysis_images must be a table of name = \"image\"")
         if secchat_pool.enabled and not secchat_pool.image and not secchat_pool.build_image:
             errors.append("[secchat.pool]: image is required when enabled = true (or set build_image = true)")
         if secchat_pool.build_image and not secchat_pool.registry:
@@ -470,5 +482,10 @@ class SiteConfig:
             out.append(f'kube_context = "{pool.kube_context}"')
             out.append(f'api_server = "{pool.api_server}"')
             out.append(f"create_service_account = {_bool(pool.create_service_account)}")
+            if pool.analysis_images:
+                out.append("")
+                out.append("[secchat.pool.analysis_images]")
+                for name in sorted(pool.analysis_images):
+                    out.append(f'{name} = "{pool.analysis_images[name]}"')
             out.append("")
         return "\n".join(out).rstrip() + "\n"

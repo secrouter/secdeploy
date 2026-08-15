@@ -339,6 +339,10 @@ apply = true
 kube_context = "enclave"
 api_server = "https://192.168.5.1:6443"
 create_service_account = true
+
+[secchat.pool.analysis_images]
+rust = "secagent-analyzer-rust:1"
+ikos = "secagent-analysis:1"
 """
 
 
@@ -367,6 +371,7 @@ def test_secchat_pool_parses_all_fields(tmp_path):
     assert pool.kube_context == "enclave"
     assert pool.api_server == "https://192.168.5.1:6443"
     assert pool.create_service_account is True
+    assert pool.analysis_images == {"rust": "secagent-analyzer-rust:1", "ikos": "secagent-analysis:1"}
 
 
 def test_secchat_pool_enabled_without_image_is_rejected(tmp_path):
