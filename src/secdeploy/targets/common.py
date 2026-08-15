@@ -110,6 +110,49 @@ def deploy_stacks(work: Path, stacks: list[str], dry_run: bool = False) -> None:
         P.run(["bash", str(boot), "up"], check=False)
 
 
+# ── Optional site container builds ([[builds]] in secsite.toml; shared by both targets) ────────
+
+def run_site_builds(builds, work: Path, dry_run: bool = False) -> list[str]:
+    """Build (and optionally push) each declared ``[[builds]]`` image from its fetched component
+    checkout. Returns the refs successfully built. Best-effort per entry — a missing docker /
+    checkout / failed build warns with the command to run by hand and moves on (a tooling image
+    failing must not take the suite deploy down); docker's layer cache makes re-runs cheap."""
+    if not builds:
+        return []
+    if dry_run:
+        for b in builds:
+            push = f", push → {b.push_ref}" if b.push else " (local only, no push)"
+            print(f"  · build {b.local_ref}: docker build -f work/{b.component}/{b.dockerfile} "
+                  f"work/{b.component}/{b.context}{push}")
+        return []
+    if not P.which("docker"):
+        P.warn(f"docker not found — skipping {len(builds)} site image build(s); see docs/secsite.md")
+        return []
+    built: list[str] = []
+    for b in builds:
+        component_dir = work / b.component
+        dockerfile = component_dir / b.dockerfile
+        context = component_dir / b.context
+        if not dockerfile.exists():
+            P.warn(f"build {b.name}: no {dockerfile} — is the checkout fetched? skipping")
+            continue
+        P.log(f"building {b.local_ref} (from work/{b.component})")
+        r = P.run(wiring.image_build_argv(context, dockerfile, b.local_ref, b.platform), check=False)
+        if getattr(r, "returncode", 1) != 0:
+            P.warn(f"build {b.name} FAILED — run by hand: "
+                   f"docker build -f {dockerfile} -t {b.local_ref} {context}")
+            continue
+        built.append(b.local_ref)
+        if b.push:
+            P.run(wiring.image_tag_argv(b.local_ref, b.push_ref), check=False)
+            p = P.run(wiring.image_push_argv(b.push_ref), check=False)
+            if getattr(p, "returncode", 1) != 0:
+                P.warn(f"push {b.push_ref} FAILED — is {b.registry} reachable + authenticated?")
+            else:
+                built.append(b.push_ref)
+    return built
+
+
 # ── Turnkey Kubernetes agent pool (shared by macos + fedora-fips) ──────────────────────────────
 
 def build_push_runnerd_image(pool, work: Path) -> str | None:

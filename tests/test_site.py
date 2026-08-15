@@ -320,6 +320,98 @@ def test_users_round_trip(tmp_path):
            [(u.username, u.email, u.name, u.groups) for u in site.users]
 
 
+# ── Named site profiles (sites/<name>.toml) ──────────────────────────────────────────
+
+def test_resolve_site_ref_paths_and_profiles(tmp_path):
+    from secdeploy.site import list_site_profiles, resolve_site_ref, site_profile_path
+
+    # No value → None; a real path → unchanged.
+    assert resolve_site_ref(None, tmp_path) is None
+    real = tmp_path / "somewhere.toml"
+    real.write_text("x = 1\n")
+    assert resolve_site_ref(str(real), tmp_path) == str(real)
+
+    # A bare name resolves to sites/<name>.toml when saved…
+    p = site_profile_path("colima-test", tmp_path)
+    p.parent.mkdir(parents=True)
+    p.write_text("domain = 'sec.internal'\n")
+    assert resolve_site_ref("colima-test", tmp_path) == str(p)
+    assert list_site_profiles(tmp_path) == ["colima-test"]
+
+    # …an unsaved name / an explicit .toml path pass through unchanged (downstream errors name
+    # what the caller typed).
+    assert resolve_site_ref("nope", tmp_path) == "nope"
+    assert resolve_site_ref("missing.toml", tmp_path) == "missing.toml"
+
+
+# ── Optional container builds ([[builds]]) ───────────────────────────────────────────
+SITE_BUILDS = BARE + """
+[[builds]]
+name = "secchat-runnerd"
+component = "secchat"
+dockerfile = "Dockerfile.runnerd"
+
+[[builds]]
+name = "secagent-analyzer-rust"
+component = "secagent"
+dockerfile = "docker/analyzer-rust.Dockerfile"
+tag = "v1"
+push = true
+registry = "registry.internal"
+platform = "linux/arm64"
+"""
+
+
+def test_builds_default_empty_when_absent(tmp_path):
+    assert _site(tmp_path, BARE).builds == []
+
+
+def test_builds_parse_all_fields_and_refs(tmp_path):
+    builds = _site(tmp_path, SITE_BUILDS).builds
+    assert [b.name for b in builds] == ["secchat-runnerd", "secagent-analyzer-rust"]
+    first = builds[0]
+    assert (first.component, first.dockerfile, first.tag, first.context, first.push) == \
+        ("secchat", "Dockerfile.runnerd", "local", ".", False)
+    assert first.local_ref == "secchat-runnerd:local"
+    second = builds[1]
+    assert second.push is True and second.registry == "registry.internal"
+    assert second.platform == "linux/arm64"
+    assert second.local_ref == "secagent-analyzer-rust:v1"
+    assert second.push_ref == "registry.internal/secagent-analyzer-rust:v1"
+
+
+def test_builds_missing_required_fields_rejected(tmp_path):
+    with pytest.raises(ValueError, match="name, component, and dockerfile are required"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\n')
+
+
+def test_builds_unknown_component_rejected(tmp_path):
+    with pytest.raises(ValueError, match="unknown component 'nope'"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\ncomponent = "nope"\ndockerfile = "Dockerfile"\n')
+
+
+def test_builds_push_without_registry_rejected(tmp_path):
+    with pytest.raises(ValueError, match="registry is required when push"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\ncomponent = "secchat"\ndockerfile = "Dockerfile"\npush = true\n')
+
+
+def test_builds_duplicate_name_rejected(tmp_path):
+    dup = ('\n[[builds]]\nname = "x"\ncomponent = "secchat"\ndockerfile = "Dockerfile"\n' * 2)
+    with pytest.raises(ValueError, match="duplicate name 'x'"):
+        _site(tmp_path, BARE + dup)
+
+
+def test_builds_unknown_key_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[\[builds\]\]\[0\]: unknown key"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\ncomponent = "secchat"\ndockerfile = "D"\nbogus = 1\n')
+
+
+def test_builds_round_trip_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_BUILDS)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.builds == site.builds
+
+
 # ── Kubernetes agent pool ([secchat.pool]) ───────────────────────────────────────────
 SITE_POOL = BARE + """
 [secchat.pool]
