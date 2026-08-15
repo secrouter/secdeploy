@@ -246,3 +246,16 @@ secdeploy deploy macos --site colima-test  # every --site accepts a profile NAME
 ```
 
 A `--site` value that exists as a file always wins; a bare name resolves to `sites/<name>.toml`.
+
+## Graphical configurator — `configure --web`
+
+```bash
+secdeploy configure --web [--port 4477] [--name <profile>]
+```
+
+Serves ONE SecRouter-themed page on 127.0.0.1 with every option in this document laid out with
+an explanation — Site, Resources (per-host deploy toggles), Tier placement, suite deploy options,
+Users, the agent pool, and container builds. Saving round-trips the form through the SAME
+validation `SiteConfig.load` applies on the CLI: errors render inline and nothing is written
+until the config is valid. The save bar accepts a bare name to save as a `sites/<name>.toml`
+profile. Pure standard library, loopback-only, no CDN.

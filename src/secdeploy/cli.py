@@ -1,8 +1,11 @@
 """``secdeploy`` — the suite release/deploy CLI.
 
 Subcommands:
-  configure interactively write secsite.toml (placement + deploy options; optionally seeds
-            operator secrets into the gitignored *.env files) — see docs/secsite.md
+  configure write secsite.toml — interactively (the wizard), or graphically via --web (a local
+            SecRouter-themed page with every option + explanation). --name saves a NAMED profile
+            (sites/<name>.toml; list with --list) selectable anywhere --site is accepted, by
+            name. Optionally seeds operator secrets into the gitignored *.env files —
+            see docs/secsite.md
   verify    validate the manifest and that each target's assets are present
   plan      show what a target deploy would do (pinned versions + steps)
   fetch     git clone/checkout every component at its pinned ref into ./work
