@@ -849,9 +849,14 @@ def deploy(
     inference_backend: str = "auto",
     users=None,
     secchat_pool=None,
+    site_builds=None,
 ) -> None:
     without = without or []
     users = users or []
+    # Optional site container builds ([[builds]] in secsite.toml) — run FIRST so every image a
+    # later step references (the pool runnerd, analyzer sidecars, tooling) exists by the time the
+    # pool spec / catalog needs it. Best-effort; docker's cache makes repeat deploys cheap.
+    common.run_site_builds(site_builds or [], work, dry_run)
     # Topology placement: only bring up the components placed on `resource` (single-host
     # synthesis places everything here, so this is a no-op without a topology.toml).
     placed = set(topology.components_on(resource, without)) if topology is not None else None

@@ -1290,6 +1290,32 @@ def test_k8s_pool_manifests_omits_git_host_annotation_when_unset():
     assert "annotations" not in np["metadata"]
 
 
+def test_image_build_argv_construction():
+    assert wiring.image_build_argv("/w/secagent", "/w/secagent/docker/x.Dockerfile", "img:local") == \
+        ["docker", "build", "-f", "/w/secagent/docker/x.Dockerfile", "-t", "img:local", "/w/secagent"]
+    assert wiring.image_build_argv("/c", "/c/D", "i:1", platform="linux/arm64")[:3] == \
+        ["docker", "build", "--platform"]
+    assert wiring.image_push_argv("r/i:1") == ["docker", "push", "r/i:1"]
+    assert wiring.image_tag_argv("i:local", "r/i:local") == ["docker", "tag", "i:local", "r/i:local"]
+
+
+def test_run_site_builds_dry_run_prints_and_builds_nothing(tmp_path, capsys):
+    from secdeploy.site import BuildSpec
+    from secdeploy.targets import common as tcommon
+
+    builds = [
+        BuildSpec(name="a", component="secchat", dockerfile="Dockerfile.runnerd"),
+        BuildSpec(name="b", component="secagent", dockerfile="docker/x.Dockerfile",
+                  push=True, registry="reg.io"),
+    ]
+    assert tcommon.run_site_builds(builds, tmp_path, dry_run=True) == []
+    out = capsys.readouterr().out
+    assert "build a:local" in out and "(local only, no push)" in out
+    assert "build b:local" in out and "push → reg.io/b:local" in out
+    # Empty list: a no-op either way.
+    assert tcommon.run_site_builds([], tmp_path, dry_run=False) == []
+
+
 def test_pool_turnkey_command_construction():
     # Pure argv builders (execution lives in the target, so these stay testable without docker/kubectl).
     assert wiring.runnerd_image_ref("reg.io/", "abc123") == "reg.io/secchat-runnerd:abc123"

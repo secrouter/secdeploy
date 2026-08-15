@@ -901,6 +901,24 @@ def write_pool_manifests(pool: PoolOptions, out_dir: str | Path) -> str | None:
 # ── Turnkey pool helpers: pure command construction (execution lives in the target, so these stay
 #    unit-testable without docker/kubectl). ──────────────────────────────────────────────────────
 
+def image_build_argv(context_dir: str | Path, dockerfile: str | Path, ref: str,
+                     platform: str = "") -> list[str]:
+    """Generic ``docker build`` argv for a site ``[[builds]]`` entry: dockerfile + tag + optional
+    ``--platform``, with ``context_dir`` as the build context."""
+    plat = ["--platform", platform] if platform else []
+    return ["docker", "build", *plat, "-f", str(dockerfile), "-t", ref, str(context_dir)]
+
+
+def image_push_argv(ref: str) -> list[str]:
+    """``docker push`` argv for a built image reference."""
+    return ["docker", "push", ref]
+
+
+def image_tag_argv(src: str, dst: str) -> list[str]:
+    """``docker tag`` argv — retags the local build as its push reference."""
+    return ["docker", "tag", src, dst]
+
+
 def runnerd_image_ref(registry: str, tag: str) -> str:
     """The tagged runnerd image reference to build+push: ``<registry>/secchat-runnerd:<tag>``. The
     registry's trailing slash (if any) is normalized off."""
