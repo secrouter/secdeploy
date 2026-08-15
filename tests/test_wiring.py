@@ -1304,6 +1304,19 @@ def test_k8s_pool_manifests_open_egress_policy_is_label_scoped():
     assert open_np["spec"]["egress"] == [{}]  # allow-all for opted-in pods only
 
 
+def test_k8s_pool_manifests_role_grants_pod_logs():
+    # The one-shot task API reads a task pod's report via the log subresource.
+    m = wiring.k8s_pool_manifests(_pool())
+    role = next(i for i in m["items"] if i["kind"] == "Role")
+    assert {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]} in role["rules"]
+
+
+def test_secchat_pool_env_carries_task_image_when_set(tmp_path):
+    env = wiring.secchat_pool_env(_pool(task_image="secagent-agent:local"), _topo(tmp_path))
+    assert env["SECCHAT_POOL_TASK_IMAGE"] == "secagent-agent:local"
+    assert "SECCHAT_POOL_TASK_IMAGE" not in wiring.secchat_pool_env(_pool(), _topo(tmp_path))
+
+
 def test_secchat_pool_env_carries_the_analysis_catalog(tmp_path):
     env = wiring.secchat_pool_env(
         _pool(analysis_images={"rust": "secagent-analyzer-rust:1", "ikos": "secagent-analysis:1"}),

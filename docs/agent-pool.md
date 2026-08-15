@@ -176,3 +176,18 @@ with **Internet access** enabled (a warn-tinted switch in the dialog, default of
 no label → no match → restricted egress. Note the base policy is **port-scoped, not
 destination-scoped** (a vanilla NetworkPolicy can't match hostnames): a restricted pod can still
 reach any host on 443/22/9418 — tighten with real CIDRs (see `git_host`) for production.
+
+## One-shot tasks — `task_image` + the /pool/tasks API
+
+Set `task_image` (the secagent agent image — see the `[[builds]]` for `secagent-base` +
+`secagent-agent`) and SecChat exposes an API for batch secagent jobs in ephemeral pods:
+
+```
+POST /pool/tasks   {"task": ["review", "mr", "42"], "repo": "https://git.sec.internal/x.git"}
+GET  /pool/tasks[/:id]      DELETE /pool/tasks/:id
+```
+
+The subcommand is allowlisted to secagent's batch surfaces (`review`, `docs`, `analyze`,
+`affordance`); the pod's stdout is the report (read via `pods/log` — granted in the emitted
+Role); LLM calls are attributed to the caller via SecChat's `/agent-llm` proxy; task pods always
+keep the restricted egress. `SECCHAT_POOL_MAX_TASKS` caps concurrency (default 5).

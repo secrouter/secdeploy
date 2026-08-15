@@ -833,6 +833,9 @@ def secchat_pool_env(
     if pool.analysis_images:
         env["SECCHAT_POOL_ANALYSIS_IMAGES"] = ",".join(
             f"{name}={pool.analysis_images[name]}" for name in sorted(pool.analysis_images))
+    # One-shot task API image (batch secagent jobs — /pool/tasks). Unset ⇒ the API is off.
+    if pool.task_image:
+        env["SECCHAT_POOL_TASK_IMAGE"] = pool.task_image
     return env
 
 
@@ -879,7 +882,12 @@ def k8s_pool_manifests(pool: PoolOptions) -> dict[str, object]:
             {
                 "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
                 "metadata": {"name": "secchat-pool-manager", "namespace": ns, "labels": labels},
-                "rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]}],
+                "rules": [
+                    {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]},
+                    # pods/log: the one-shot task API's result channel — a task pod's stdout IS its
+                    # report, read via the log subresource once the pod goes terminal.
+                    {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+                ],
             },
             {
                 "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",

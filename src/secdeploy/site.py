@@ -105,7 +105,7 @@ SECCHAT_POOL_KEYS = {
     "enabled", "image", "namespace", "service_account", "service_account_namespace",
     "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
     "build_image", "registry", "apply", "kube_context", "api_server", "create_service_account",
-    "analysis_images",
+    "analysis_images", "task_image",
 }
 
 
@@ -251,6 +251,10 @@ class PoolOptions:
     # container can be attached to an agent's pod at creation, sharing the pod's /workspace volume
     # so its tooling operates on the agent's code (→ SECCHAT_POOL_ANALYSIS_IMAGES). Empty = off.
     analysis_images: dict[str, str] = field(default_factory=dict)
+    # Image for ONE-SHOT POOL TASKS (the secagent agent image): the /pool/tasks API runs
+    # `secagent review mr` / `docs build` / `analyze …` batch jobs in ephemeral pods of this image
+    # (→ SECCHAT_POOL_TASK_IMAGE). Empty = the task API is off.
+    task_image: str = ""
 
 
 @dataclass
@@ -436,6 +440,7 @@ class SiteConfig:
             kube_context=str(pool_data.get("kube_context", "")).strip(),
             api_server=str(pool_data.get("api_server", "")).strip(),
             create_service_account=bool(pool_data.get("create_service_account", False)),
+            task_image=str(pool_data.get("task_image", "")).strip(),
             analysis_images={
                 str(k).strip(): str(v).strip()
                 for k, v in (pool_data.get("analysis_images") or {}).items()
@@ -623,6 +628,7 @@ class SiteConfig:
             out.append(f'kube_context = "{pool.kube_context}"')
             out.append(f'api_server = "{pool.api_server}"')
             out.append(f"create_service_account = {_bool(pool.create_service_account)}")
+            out.append(f'task_image = "{pool.task_image}"')
             if pool.analysis_images:
                 out.append("")
                 out.append("[secchat.pool.analysis_images]")
