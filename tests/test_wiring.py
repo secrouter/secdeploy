@@ -1290,6 +1290,55 @@ def test_k8s_pool_manifests_omits_git_host_annotation_when_unset():
     assert "annotations" not in np["metadata"]
 
 
+def test_k8s_pool_manifests_egress_allows_the_secchat_dialback_port():
+    # The pod must dial back to SecChat (/runner + /agent-llm) — its port belongs in the egress
+    # allowlist, else an enforcing CNI (k3s) breaks every pool attach.
+    m = wiring.k8s_pool_manifests(_pool(secchat_url="http://192.168.5.1:47010"))
+    np = next(i for i in m["items"] if i["kind"] == "NetworkPolicy")
+    ports = [p["port"] for rule in np["spec"]["egress"] for p in rule["ports"]]
+    assert 47010 in ports
+    # No secchat_url ⇒ the suite's default secchat port is still allowed.
+    m2 = wiring.k8s_pool_manifests(_pool(secchat_url=""))
+    np2 = next(i for i in m2["items"] if i["kind"] == "NetworkPolicy")
+    assert 47010 in [p["port"] for rule in np2["spec"]["egress"] for p in rule["ports"]]
+
+
+def test_k8s_pool_manifests_create_service_account_emits_sa_and_token_secret():
+    m = wiring.k8s_pool_manifests(_pool(create_service_account=True))
+    kinds = [i["kind"] for i in m["items"]]
+    assert "ServiceAccount" in kinds and "Secret" in kinds
+    sa = next(i for i in m["items"] if i["kind"] == "ServiceAccount")
+    assert sa["metadata"] == {"name": "secchat", "namespace": "chat",
+                             "labels": {"app.kubernetes.io/part-of": "secchat", "app.kubernetes.io/component": "agent-pool"}}
+    secret = next(i for i in m["items"] if i["kind"] == "Secret")
+    assert secret["type"] == "kubernetes.io/service-account-token"
+    assert secret["metadata"]["annotations"] == {"kubernetes.io/service-account.name": "secchat"}
+    # The SA namespace ("chat") differs from the pool namespace → it is ALSO created.
+    ns_names = [i["metadata"]["name"] for i in m["items"] if i["kind"] == "Namespace"]
+    assert ns_names == ["chat-pool", "chat"]
+    # Default (no create_service_account): no SA/Secret, exactly as before.
+    kinds_default = [i["kind"] for i in wiring.k8s_pool_manifests(_pool())["items"]]
+    assert "ServiceAccount" not in kinds_default and "Secret" not in kinds_default
+
+
+def test_secchat_pool_env_carries_api_server_when_set(tmp_path):
+    env = wiring.secchat_pool_env(_pool(api_server="https://192.168.5.1:6443"), _topo(tmp_path))
+    assert env["SECCHAT_POOL_APISERVER"] == "https://192.168.5.1:6443"
+    assert "SECCHAT_POOL_APISERVER" not in wiring.secchat_pool_env(_pool(), _topo(tmp_path))
+
+
+def test_pool_credential_helpers():
+    p = _pool(create_service_account=True, kube_context="colima")
+    assert wiring.pool_token_secret_name(p) == "secchat-pool-token"
+    assert wiring.pool_secret_read_argv(p, "{.data.token}") == [
+        "kubectl", "--context", "colima", "-n", "chat", "get", "secret",
+        "secchat-pool-token", "-o", "jsonpath={.data.token}",
+    ]
+    override = wiring.pool_compose_override(p)
+    assert "services:" in override and "  secchat:" in override
+    assert "./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro" in override
+
+
 def test_pool_turnkey_command_construction():
     # Pure argv builders (execution lives in the target, so these stay testable without docker/kubectl).
     assert wiring.runnerd_image_ref("reg.io/", "abc123") == "reg.io/secchat-runnerd:abc123"

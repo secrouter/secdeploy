@@ -147,6 +147,48 @@ def build_push_runnerd_image(pool, work: Path) -> str | None:
     return dig or image_ref
 
 
+def provision_pool_credentials(pool, secchat_dir: Path) -> bool:
+    """(``[secchat.pool].create_service_account``) Extract the pool ServiceAccount's token + the
+    cluster CA from the token Secret the manifests created, write them (0600) to
+    ``<secchat_dir>/pool-sa/``, and drop a ``compose.override.yaml`` that mounts them into the
+    SecChat container at the standard in-cluster credential paths. Returns whether the credential
+    was provisioned. Retries briefly — the token controller populates the Secret asynchronously.
+    Best-effort like the other pool steps: a failure warns with what to run by hand and never
+    aborts the deploy."""
+    import base64
+    import time
+
+    if not P.which("kubectl"):
+        P.warn("kubectl not found — can't extract the pool ServiceAccount token; see docs/agent-pool.md")
+        return False
+    token_b64 = ca_b64 = ""
+    for attempt in range(10):  # the token controller usually fills the Secret within a second
+        t = P.run(wiring.pool_secret_read_argv(pool, "{.data.token}"), check=False, capture=True)
+        c = P.run(wiring.pool_secret_read_argv(pool, r"{.data.ca\.crt}"), check=False, capture=True)
+        token_b64 = (t.stdout or "").strip()
+        ca_b64 = (c.stdout or "").strip()
+        if t.returncode == 0 and token_b64 and ca_b64:
+            break
+        time.sleep(1 + attempt * 0.5)
+    if not (token_b64 and ca_b64):
+        P.warn("pool ServiceAccount token Secret never populated — extract it yourself: "
+               f"kubectl -n {pool.service_account_namespace} get secret {wiring.pool_token_secret_name(pool)} "
+               "-o jsonpath='{.data.token}' | base64 -d  (and .data.ca\\.crt) → work/secchat/pool-sa/")
+        return False
+    sa_dir = secchat_dir / "pool-sa"
+    sa_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in (("token", base64.b64decode(token_b64)),
+                       ("ca.crt", base64.b64decode(ca_b64)),
+                       ("namespace", pool.namespace.encode())):
+        path = sa_dir / name
+        path.write_bytes(data)
+        path.chmod(0o600)
+    (secchat_dir / "compose.override.yaml").write_text(wiring.pool_compose_override(pool))
+    P.log("pool: extracted the ServiceAccount credential → work/secchat/pool-sa/ and wrote "
+          "compose.override.yaml (mounted into SecChat at the in-cluster paths)")
+    return True
+
+
 def apply_pool_manifests(pool, pool_path: str) -> None:
     """(``[secchat.pool].apply``) ``kubectl apply`` the emitted pool manifests, best-effort. A missing
     kubectl / unreachable cluster warns with the exact command to run by hand — it never aborts the

@@ -66,7 +66,7 @@ USER_KEYS = {"username", "email", "name", "groups"}
 SECCHAT_POOL_KEYS = {
     "enabled", "image", "namespace", "service_account", "service_account_namespace",
     "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
-    "build_image", "registry", "apply", "kube_context",
+    "build_image", "registry", "apply", "kube_context", "api_server", "create_service_account",
 }
 
 
@@ -152,6 +152,16 @@ class PoolOptions:
     registry: str = ""
     apply: bool = False
     kube_context: str = ""
+    # OUT-OF-CLUSTER SecChat support: when SecChat itself runs OUTSIDE the cluster (compose on the
+    # host — this suite's normal shape), it can't use the in-cluster defaults. `api_server` is the
+    # Kubernetes API URL reachable FROM the SecChat container (→ SECCHAT_POOL_APISERVER; e.g. the
+    # colima node IP https://192.168.5.1:6443 — an address in the API cert's SANs). When
+    # `create_service_account` is set, the emitted manifests ALSO create SecChat's ServiceAccount +
+    # a bound token Secret, and the deploy extracts that token + cluster CA and mounts them into the
+    # SecChat container at the standard in-cluster paths (via a compose override) — so the backend's
+    # unmodified in-cluster client just works. Leave both unset for a truly in-cluster SecChat.
+    api_server: str = ""
+    create_service_account: bool = False
 
 
 @dataclass
@@ -292,6 +302,8 @@ class SiteConfig:
             registry=str(pool_data.get("registry", "")).strip(),
             apply=bool(pool_data.get("apply", False)),
             kube_context=str(pool_data.get("kube_context", "")).strip(),
+            api_server=str(pool_data.get("api_server", "")).strip(),
+            create_service_account=bool(pool_data.get("create_service_account", False)),
         )
         if secchat_pool.enabled and not secchat_pool.image and not secchat_pool.build_image:
             errors.append("[secchat.pool]: image is required when enabled = true (or set build_image = true)")
@@ -456,5 +468,7 @@ class SiteConfig:
             out.append(f'registry = "{pool.registry}"')
             out.append(f"apply = {_bool(pool.apply)}")
             out.append(f'kube_context = "{pool.kube_context}"')
+            out.append(f'api_server = "{pool.api_server}"')
+            out.append(f"create_service_account = {_bool(pool.create_service_account)}")
             out.append("")
         return "\n".join(out).rstrip() + "\n"
