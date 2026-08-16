@@ -166,6 +166,27 @@ resource = "core"
 # [secchat.pool.analysis_images]
 # rust = "secagent-analyzer-rust:local"
 
+# ── Optional: 1:1 voice calls (secchat-mediad media relay + SecRecorder transcription) ────
+# When enabled, SecDeploy adds a `mediad` compose service alongside SecChat (server-side WebRTC
+# relay that records consented calls), a NEW `recordings` volume (distinct from `uploads`,
+# mounted rw on both mediad and secchat), and writes SECCHAT_TRANSCRIBE_URL/SECCHAT_MEDIAD_*/
+# SECCHAT_CALL_STUN into secchat's .env. secrecorder must NOT be in [deploy].without (voice
+# transcription needs it — see docs/voice.md). Off by default.
+#
+# [secchat.voice]
+# enabled = true
+# image = "secchat-mediad:local"        # built via a [[builds]] entry below, or push your own
+# token = ""                            # SECCHAT_MEDIAD_TOKEN — blank generates+persists one
+# stun = ""                             # SECCHAT_CALL_STUN — suite-local ONLY; NEVER a public
+#                                        # STUN server (leaks call metadata off-suite; CUI/air-
+#                                        # gap posture). Empty is fine — LAN/VPN p2p usually
+#                                        # connects via host/peer-reflexive candidates anyway.
+# advertise_addr = "192.168.5.1"        # REQUIRED — the suite host's CROSS-HOST-reachable
+#                                        # address, fed to Pion's SetNAT1To1IPs. Wrong value =
+#                                        # relayed calls never connect from a second host.
+# # media_port = 47020                  # UDP+TCP (Pion ICEUDPMux/SetICETCPMux); rarely changed
+# # control_port = 47021                # compose-internal only, never published
+
 # ── Container builds (optional) ────────────────────────────────────────────────────────
 # Images the deploy builds from fetched component checkouts (docker layer cache makes re-runs
 # cheap; local-only by default — right for colima/k3s shared runtimes; push = true needs registry).
@@ -174,6 +195,12 @@ resource = "core"
 # name = "secchat-runnerd"                            # built as <name>:<tag> (tag defaults to local)
 # component = "secchat"                               # fetched checkout = build context
 # dockerfile = "Dockerfile.runnerd"
+#
+# [[builds]]
+# name = "secchat-mediad"                             # the voice media relay (Go/Pion + ffmpeg)
+# component = "secchat"
+# dockerfile = "mediad/Dockerfile"
+# context = "mediad"                                  # Dockerfile does `COPY go.mod go.sum ./`
 #
 # [[builds]]
 # name = "secagent-analyzer-rust"

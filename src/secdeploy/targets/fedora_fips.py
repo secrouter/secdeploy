@@ -456,6 +456,7 @@ def deploy(
     inference_backend: str = "auto",  # macOS-only (vLLM-Metal); accepted+ignored here
     users=None,
     secchat_pool=None,
+    secchat_voice=None,
     site_builds=None,
 ) -> None:
     users = users or []
@@ -675,11 +676,13 @@ def deploy(
             if built:
                 secchat_pool.image = built
         sc_env = wiring.sync_secchat_env(
-            work / "secsso" / ".env", work / "secchat" / ".env", topology, without, pool=secchat_pool)
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without,
+            pool=secchat_pool, voice=secchat_voice)
         if sc_env:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(sc_env)} keys)")
         # Optional Kubernetes agent pool: emit the cluster manifests, and (when apply is set) apply them.
+        pool_sa_provisioned = False
         if secchat_pool is not None and secchat_pool.enabled and addr_dir is not None:
             pool_path = wiring.write_pool_manifests(secchat_pool, addr_dir)
             if pool_path:
@@ -688,8 +691,15 @@ def deploy(
                 if secchat_pool.apply:
                     common.apply_pool_manifests(secchat_pool, pool_path)
                 # Out-of-cluster SecChat: extract + mount the SA credential before the stack bring-up.
+                # Folds the voice media relay's mediad service into the SAME compose.override.yaml
+                # when also enabled (Compose auto-merges only one override file).
                 if secchat_pool.apply and secchat_pool.create_service_account:
-                    common.provision_pool_credentials(secchat_pool, work / "secchat")
+                    pool_sa_provisioned = common.provision_pool_credentials(
+                        secchat_pool, work / "secchat", voice=secchat_voice)
+        # Voice media relay (secchat-mediad): write its own compose.override.yaml when enabled and
+        # not already folded into the pool's above. Before the stack bring-up below.
+        if secchat_voice is not None and secchat_voice.enabled and not pool_sa_provisioned:
+            common.write_mediad_compose(secchat_voice, work / "secchat")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

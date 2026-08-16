@@ -116,6 +116,7 @@ kind = "service"
 tier = "collab"
 port = 47003
 fronted = true
+optional = true   # eval instance drops it via secsite `without` (transcription not under test)
 runtime = "python>=3.11"
 role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
 

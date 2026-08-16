@@ -311,6 +311,7 @@ def cmd_deploy(args) -> int:
         inference_backend=opts.inference_backend,
         users=site.users if from_file else None,
         secchat_pool=site.secchat_pool if from_file else None,
+        secchat_voice=site.secchat_voice if from_file else None,
         site_builds=site.builds if from_file else None,
     )
     return 0
