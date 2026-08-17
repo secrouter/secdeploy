@@ -1516,6 +1516,7 @@ def test_mediad_compose_override_shape():
     # container binds the defaults while the compose ports/env silently disagree.
     assert 'MEDIAD_MEDIA_ADDR: ":47020"' in override
     assert 'MEDIAD_CONTROL_ADDR: ":47021"' in override
+    assert 'MEDIAD_MAX_LEGS_PER_SESSION: "8"' in override  # mediad's own default, emitted explicitly
     # The control API (:47021) is never PUBLISHED (no "47021:..." port mapping) — it's
     # compose-internal only, reached via SECCHAT_MEDIAD_URL, not a host port.
     assert '"47021:' not in override
@@ -1532,6 +1533,12 @@ def test_mediad_compose_override_custom_ports_match_published_ports():
     assert 'MEDIAD_CONTROL_ADDR: ":48001"' in override
     assert '"48000:48000/udp"' in override and '"48000:48000/tcp"' in override
     assert '"47020:' not in override
+
+
+def test_mediad_compose_override_carries_configured_max_legs():
+    # A larger group-call cap must reach mediad's MEDIAD_MAX_LEGS_PER_SESSION, not stay at 8.
+    override = wiring.mediad_compose_override(_voice(max_legs_per_session=16))
+    assert 'MEDIAD_MAX_LEGS_PER_SESSION: "16"' in override
 
 
 def test_secchat_compose_override_empty_when_neither_active():

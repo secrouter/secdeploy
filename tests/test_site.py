@@ -515,6 +515,7 @@ stun = "stun.internal:3478"
 advertise_addr = "192.168.5.1"
 media_port = 48020
 control_port = 48021
+max_legs_per_session = 12
 """
 
 
@@ -525,6 +526,7 @@ def test_secchat_voice_defaults_off_when_absent(tmp_path):
     assert site.secchat_voice.image == "secchat-mediad:local"  # the default
     assert site.secchat_voice.media_port == 47020
     assert site.secchat_voice.control_port == 47021
+    assert site.secchat_voice.max_legs_per_session == 8  # mediad's own default
 
 
 def test_secchat_voice_parses_all_fields(tmp_path):
@@ -536,11 +538,20 @@ def test_secchat_voice_parses_all_fields(tmp_path):
     assert voice.advertise_addr == "192.168.5.1"
     assert voice.media_port == 48020
     assert voice.control_port == 48021
+    assert voice.max_legs_per_session == 12
 
 
 def test_secchat_voice_enabled_without_advertise_addr_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="advertise_addr is required"):
         _site(tmp_path, BARE + "\n[secchat.voice]\nenabled = true\n")
+
+
+def test_secchat_voice_rejects_max_legs_below_two(tmp_path):
+    # A cap below 2 rejects even a 1:1 call (caller + callee = two legs) at mediad — catch it at
+    # config-load time rather than letting every call fail at runtime.
+    with pytest.raises(ValueError, match="max_legs_per_session must be >= 2"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n'
+                               'max_legs_per_session = 1\n')
 
 
 def test_secchat_voice_rejects_a_public_stun_default(tmp_path):

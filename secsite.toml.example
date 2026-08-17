@@ -186,6 +186,8 @@ resource = "core"
 #                                        # relayed calls never connect from a second host.
 # # media_port = 47020                  # UDP+TCP (Pion ICEUDPMux/SetICETCPMux); rarely changed
 # # control_port = 47021                # compose-internal only, never published
+# # max_legs_per_session = 8            # MEDIAD_MAX_LEGS_PER_SESSION — participants per call;
+#                                        # raise for larger group calls, must be >= 2
 
 # ── Container builds (optional) ────────────────────────────────────────────────────────
 # Images the deploy builds from fetched component checkouts (docker layer cache makes re-runs

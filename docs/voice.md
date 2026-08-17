@@ -25,6 +25,8 @@ advertise_addr = "192.168.5.1"   # REQUIRED — see "The advertised ICE address"
 # stun = ""                      # suite-local ONLY; leave empty unless you run one (see below)
 # token = ""                     # blank = SecDeploy generates + persists one on first deploy
 # image = "secchat-mediad:local"
+# max_legs_per_session = 8       # participants per call (MEDIAD_MAX_LEGS_PER_SESSION); raise for
+#                                # larger group calls, must be >= 2
 
 [[builds]]
 name = "secchat-mediad"

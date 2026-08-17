@@ -1098,6 +1098,9 @@ def secchat_compose_override(pool: PoolOptions | None, voice: VoiceOptions | Non
             "      MEDIAD_ADVERTISE_ADDR: ${SECCHAT_MEDIAD_ADVERTISE_ADDR}\n",
             f"      MEDIAD_MEDIA_ADDR: \":{voice.media_port}\"\n",
             f"      MEDIAD_CONTROL_ADDR: \":{voice.control_port}\"\n",
+            # Participant cap per call. Emitted as a literal (like the ports above), not a .env
+            # interpolation — it's non-secret site config, one value, resolved at write time.
+            f'      MEDIAD_MAX_LEGS_PER_SESSION: "{voice.max_legs_per_session}"\n',
             "    ports:\n",
             "      # colima UDP forwarding is not at parity with the TCP publish — see docs/voice.md\n",
             f'      - "{voice.media_port}:{voice.media_port}/udp"\n',

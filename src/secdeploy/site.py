@@ -114,6 +114,7 @@ SECCHAT_POOL_KEYS = {
 # SECCHAT_TRANSCRIBE_URL/SECCHAT_MEDIAD_*/SECCHAT_CALL_STUN env in secchat's stack .env.
 SECCHAT_VOICE_KEYS = {
     "enabled", "image", "token", "stun", "advertise_addr", "media_port", "control_port",
+    "max_legs_per_session",
 }
 
 
@@ -303,6 +304,9 @@ class VoiceOptions:
     advertise_addr: str = ""
     media_port: int = 47020
     control_port: int = 47021
+    # Caps participants per call (MEDIAD_MAX_LEGS_PER_SESSION) — mediad's own default is 8; raise
+    # only for larger group calls. Must stay >= 2 so a normal 1:1 call (two legs) still fits.
+    max_legs_per_session: int = 8
 
 
 @dataclass
@@ -524,7 +528,13 @@ class SiteConfig:
             advertise_addr=str(voice_data.get("advertise_addr", "")).strip(),
             media_port=int(voice_data.get("media_port", 47020)),
             control_port=int(voice_data.get("control_port", 47021)),
+            max_legs_per_session=int(voice_data.get("max_legs_per_session", 8)),
         )
+        if secchat_voice.enabled and secchat_voice.max_legs_per_session < 2:
+            errors.append(
+                "[secchat.voice]: max_legs_per_session must be >= 2 — a 1:1 call already needs "
+                "two legs (caller + callee); a cap below 2 rejects every real call"
+            )
         if secchat_voice.enabled and not secchat_voice.advertise_addr:
             errors.append(
                 "[secchat.voice]: advertise_addr is required when enabled = true — the suite "
@@ -736,5 +746,6 @@ class SiteConfig:
             out.append(f'advertise_addr = "{voice.advertise_addr}"')
             out.append(f"media_port = {voice.media_port}")
             out.append(f"control_port = {voice.control_port}")
+            out.append(f"max_legs_per_session = {voice.max_legs_per_session}")
             out.append("")
         return "\n".join(out).rstrip() + "\n"
