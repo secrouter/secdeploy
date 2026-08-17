@@ -1087,6 +1087,12 @@ def secchat_compose_override(pool: PoolOptions | None, voice: VoiceOptions | Non
         body_lines += [
             "  mediad:\n",
             f"    image: {voice.image}\n",
+            # mediad writes recordings that the secchat backend (a DIFFERENT uid) ingests,
+            # transcribes, and deletes on the SHARED `recordings` volume. Run mediad with secchat's
+            # GID (the node base image's 1000) so its group-rwx session dirs (mediad/manager.go's
+            # 0770) are readable + cleanable by secchat — without this the backend hits EACCES on
+            # every recording. mediad keeps its own uid (999) so it still owns the volume root.
+            '    user: "999:1000"\n',
             "    environment:\n",
             "      MEDIAD_TOKEN: ${SECCHAT_MEDIAD_TOKEN}\n",
             "      MEDIAD_ADVERTISE_ADDR: ${SECCHAT_MEDIAD_ADVERTISE_ADDR}\n",
