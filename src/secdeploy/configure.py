@@ -147,7 +147,7 @@ def _ask_deploy_options(
         if opts.with_inference:
             raw = _ask(
                 input_fn, f"  [{r.name}] catalog model id(s) to download + load at boot, "
-                "comma-separated (e.g. fast,reasoning,gemma-31b — blank = none, load on demand "
+                "comma-separated (e.g. Llama-3.2-3B-Instruct,gpt-oss-20b,gemma-4-31B-it — blank = none, load on demand "
                 "later via SecLLM's /admin console)", "",
             )
             opts.autostart_models = [m.strip() for m in raw.split(",") if m.strip()]

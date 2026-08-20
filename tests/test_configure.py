@@ -154,7 +154,7 @@ def test_custom_preset(tmp_path):
         "",              # [deploy].without: drop none
         "n",             # a: configure_resolver -> False (only applicable toggle here)
         "y",             # b: with_inference -> True
-        "fast,reasoning", # b: autostart_models
+        "Llama-3.2-3B-Instruct,gpt-oss-20b", # b: autostart_models
         "y",             # b: with_agent -> True
         "",              # b: configure_resolver -> True (default)
         "y",             # b: tls -> True
@@ -178,7 +178,7 @@ def test_custom_preset(tmp_path):
 
     b_opts = site.deploy_for("b")
     assert b_opts.with_inference is True
-    assert b_opts.autostart_models == ["fast", "reasoning"]
+    assert b_opts.autostart_models == ["Llama-3.2-3B-Instruct", "gpt-oss-20b"]
     assert b_opts.with_agent is True
     assert b_opts.configure_resolver is True
     assert b_opts.tls is True
