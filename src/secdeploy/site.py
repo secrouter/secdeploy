@@ -104,7 +104,8 @@ BUILD_KEYS = {"name", "component", "dockerfile", "tag", "context", "push", "regi
 SECCHAT_POOL_KEYS = {
     "enabled", "image", "namespace", "service_account", "service_account_namespace",
     "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
-    "build_image", "registry", "apply", "kube_context",
+    "build_image", "registry", "apply", "kube_context", "api_server", "create_service_account",
+    "analysis_images", "task_image",
 }
 
 
@@ -236,6 +237,24 @@ class PoolOptions:
     registry: str = ""
     apply: bool = False
     kube_context: str = ""
+    # OUT-OF-CLUSTER SecChat support: when SecChat itself runs OUTSIDE the cluster (compose on the
+    # host — this suite's normal shape), it can't use the in-cluster defaults. `api_server` is the
+    # Kubernetes API URL reachable FROM the SecChat container (→ SECCHAT_POOL_APISERVER; e.g. the
+    # colima node IP https://192.168.5.1:6443 — an address in the API cert's SANs). When
+    # `create_service_account` is set, the emitted manifests ALSO create SecChat's ServiceAccount +
+    # a bound token Secret, and the deploy extracts that token + cluster CA and mounts them into the
+    # SecChat container at the standard in-cluster paths (via a compose override) — so the backend's
+    # unmodified in-cluster client just works. Leave both unset for a truly in-cluster SecChat.
+    api_server: str = ""
+    create_service_account: bool = False
+    # Analysis sidecar catalog, name → image (`[secchat.pool.analysis_images]`). Each named
+    # container can be attached to an agent's pod at creation, sharing the pod's /workspace volume
+    # so its tooling operates on the agent's code (→ SECCHAT_POOL_ANALYSIS_IMAGES). Empty = off.
+    analysis_images: dict[str, str] = field(default_factory=dict)
+    # Image for ONE-SHOT POOL TASKS (the secagent agent image): the /pool/tasks API runs
+    # `secagent review mr` / `docs build` / `analyze …` batch jobs in ephemeral pods of this image
+    # (→ SECCHAT_POOL_TASK_IMAGE). Empty = the task API is off.
+    task_image: str = ""
 
 
 @dataclass
@@ -419,7 +438,17 @@ class SiteConfig:
             registry=str(pool_data.get("registry", "")).strip(),
             apply=bool(pool_data.get("apply", False)),
             kube_context=str(pool_data.get("kube_context", "")).strip(),
+            api_server=str(pool_data.get("api_server", "")).strip(),
+            create_service_account=bool(pool_data.get("create_service_account", False)),
+            task_image=str(pool_data.get("task_image", "")).strip(),
+            analysis_images={
+                str(k).strip(): str(v).strip()
+                for k, v in (pool_data.get("analysis_images") or {}).items()
+                if str(k).strip() and str(v).strip()
+            } if isinstance(pool_data.get("analysis_images", {}), dict) else {},
         )
+        if not isinstance(pool_data.get("analysis_images", {}), dict):
+            errors.append("[secchat.pool]: analysis_images must be a table of name = \"image\"")
         if secchat_pool.enabled and not secchat_pool.image and not secchat_pool.build_image:
             errors.append("[secchat.pool]: image is required when enabled = true (or set build_image = true)")
         if secchat_pool.build_image and not secchat_pool.registry:
@@ -597,5 +626,13 @@ class SiteConfig:
             out.append(f'registry = "{pool.registry}"')
             out.append(f"apply = {_bool(pool.apply)}")
             out.append(f'kube_context = "{pool.kube_context}"')
+            out.append(f'api_server = "{pool.api_server}"')
+            out.append(f"create_service_account = {_bool(pool.create_service_account)}")
+            out.append(f'task_image = "{pool.task_image}"')
+            if pool.analysis_images:
+                out.append("")
+                out.append("[secchat.pool.analysis_images]")
+                for name in sorted(pool.analysis_images):
+                    out.append(f'{name} = "{pool.analysis_images[name]}"')
             out.append("")
         return "\n".join(out).rstrip() + "\n"

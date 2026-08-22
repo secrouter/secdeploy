@@ -1084,6 +1084,11 @@ def deploy(
                       "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
                 if secchat_pool.apply:
                     common.apply_pool_manifests(secchat_pool, pool_path)
+                # Out-of-cluster SecChat: extract the SA token + CA and mount them into the compose
+                # service (compose.override.yaml) — BEFORE the stacks bring-up below, so the secchat
+                # container starts with its cluster credential in place.
+                if secchat_pool.apply and secchat_pool.create_service_account:
+                    common.provision_pool_credentials(secchat_pool, work / "secchat")
 
     # SecRecorder (a NATIVE service, not a stack) turnkey SSO. Same early-seed + SecSSO-co-placement
     # requirement as the SecChat block above, but adapted to a native service: there's no stack .env
@@ -1430,7 +1435,7 @@ def _secproxy_setup_actions(
             "REQUESTS_CA_BUNDLE=$PWD/out/seccert-root.pem</code> first. Then authenticate as "
             "yourself: <code>work/secagent/.venv/bin/secagent login</code> (prints a device-code "
             "URL to approve in a browser) — then <code>pi --provider secrouter --model "
-            "balanced</code>, and to load secagent's own tools, <code>pi --extension "
+            "gemma-4-26B-A4B-it</code>, and to load secagent's own tools, <code>pi --extension "
             "work/secagent/pi/extensions/secagent.ts</code>."
         )
     return actions

@@ -521,7 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.choices["deploy"].add_argument(
         "--autostart-models", default=None,
-        help="comma-separated SecLLM catalog ids (e.g. fast,gemma-31b) to download (if not "
+        help="comma-separated SecLLM catalog ids (e.g. Llama-3.2-3B-Instruct,gemma-4-31B-it) to download (if not "
              "already cached) and load the moment the secllm service starts, instead of on "
              "first request via /admin. Only takes effect with --with-inference. Overrides the "
              "resource's secsite.toml `autostart_models` when given.",

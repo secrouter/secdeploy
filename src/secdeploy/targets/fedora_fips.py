@@ -687,6 +687,9 @@ def deploy(
                       "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
                 if secchat_pool.apply:
                     common.apply_pool_manifests(secchat_pool, pool_path)
+                # Out-of-cluster SecChat: extract + mount the SA credential before the stack bring-up.
+                if secchat_pool.apply and secchat_pool.create_service_account:
+                    common.provision_pool_credentials(secchat_pool, work / "secchat")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

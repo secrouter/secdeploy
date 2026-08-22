@@ -1268,8 +1268,10 @@ def test_k8s_pool_manifests_shape_and_rbac(tmp_path):
     m = wiring.k8s_pool_manifests(_pool())
     assert m["kind"] == "List"
     kinds = [i["kind"] for i in m["items"]]
-    assert kinds == ["Namespace", "Role", "RoleBinding", "ResourceQuota", "NetworkPolicy"]
-    by = {i["kind"]: i for i in m["items"]}
+    # Two NetworkPolicies: the restricted base (all pods) + the opt-in open-egress one (label-selected).
+    assert kinds == ["Namespace", "Role", "RoleBinding", "ResourceQuota", "NetworkPolicy", "NetworkPolicy"]
+    by = {i["kind"]: i for i in m["items"] if i["kind"] != "NetworkPolicy"}
+    by["NetworkPolicy"] = next(i for i in m["items"] if i["metadata"]["name"] == "secchat-pool-egress")
     assert by["Namespace"]["metadata"]["name"] == "chat-pool"
     # The RoleBinding references SecChat's ServiceAccount (create/delete pods), not a created SA.
     assert by["RoleBinding"]["subjects"][0] == {"kind": "ServiceAccount", "name": "secchat", "namespace": "chat"}
@@ -1288,6 +1290,88 @@ def test_k8s_pool_manifests_omits_git_host_annotation_when_unset():
     m = wiring.k8s_pool_manifests(_pool(git_host=""))
     np = next(i for i in m["items"] if i["kind"] == "NetworkPolicy")
     assert "annotations" not in np["metadata"]
+
+
+def test_k8s_pool_manifests_open_egress_policy_is_label_scoped():
+    # The internet toggle: a pod labeled `secchat.io/egress: open` (only when its agent explicitly
+    # opted in — SecChat's default label is "restricted") gets allow-all egress ON TOP of the base
+    # allowlist. Unlabeled pods never match this policy.
+    m = wiring.k8s_pool_manifests(_pool())
+    open_np = next(i for i in m["items"]
+                   if i["kind"] == "NetworkPolicy" and i["metadata"]["name"] == "secchat-pool-egress-open")
+    assert open_np["spec"]["podSelector"] == {"matchLabels": {"secchat.io/egress": "open"}}
+    assert open_np["spec"]["policyTypes"] == ["Egress"]
+    assert open_np["spec"]["egress"] == [{}]  # allow-all for opted-in pods only
+
+
+def test_k8s_pool_manifests_role_grants_pod_logs():
+    # The one-shot task API reads a task pod's report via the log subresource.
+    m = wiring.k8s_pool_manifests(_pool())
+    role = next(i for i in m["items"] if i["kind"] == "Role")
+    assert {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]} in role["rules"]
+
+
+def test_secchat_pool_env_carries_task_image_when_set(tmp_path):
+    env = wiring.secchat_pool_env(_pool(task_image="secagent-agent:local"), _topo(tmp_path))
+    assert env["SECCHAT_POOL_TASK_IMAGE"] == "secagent-agent:local"
+    assert "SECCHAT_POOL_TASK_IMAGE" not in wiring.secchat_pool_env(_pool(), _topo(tmp_path))
+
+
+def test_secchat_pool_env_carries_the_analysis_catalog(tmp_path):
+    env = wiring.secchat_pool_env(
+        _pool(analysis_images={"rust": "secagent-analyzer-rust:1", "ikos": "secagent-analysis:1"}),
+        _topo(tmp_path))
+    assert env["SECCHAT_POOL_ANALYSIS_IMAGES"] == "ikos=secagent-analysis:1,rust=secagent-analyzer-rust:1"
+    assert "SECCHAT_POOL_ANALYSIS_IMAGES" not in wiring.secchat_pool_env(_pool(), _topo(tmp_path))
+
+
+def test_k8s_pool_manifests_egress_allows_the_secchat_dialback_port():
+    # The pod must dial back to SecChat (/runner + /agent-llm) — its port belongs in the egress
+    # allowlist, else an enforcing CNI (k3s) breaks every pool attach.
+    m = wiring.k8s_pool_manifests(_pool(secchat_url="http://192.168.5.1:47010"))
+    np = next(i for i in m["items"] if i["kind"] == "NetworkPolicy")
+    ports = [p["port"] for rule in np["spec"]["egress"] for p in rule["ports"]]
+    assert 47010 in ports
+    # No secchat_url ⇒ the suite's default secchat port is still allowed.
+    m2 = wiring.k8s_pool_manifests(_pool(secchat_url=""))
+    np2 = next(i for i in m2["items"] if i["kind"] == "NetworkPolicy")
+    assert 47010 in [p["port"] for rule in np2["spec"]["egress"] for p in rule["ports"]]
+
+
+def test_k8s_pool_manifests_create_service_account_emits_sa_and_token_secret():
+    m = wiring.k8s_pool_manifests(_pool(create_service_account=True))
+    kinds = [i["kind"] for i in m["items"]]
+    assert "ServiceAccount" in kinds and "Secret" in kinds
+    sa = next(i for i in m["items"] if i["kind"] == "ServiceAccount")
+    assert sa["metadata"] == {"name": "secchat", "namespace": "chat",
+                             "labels": {"app.kubernetes.io/part-of": "secchat", "app.kubernetes.io/component": "agent-pool"}}
+    secret = next(i for i in m["items"] if i["kind"] == "Secret")
+    assert secret["type"] == "kubernetes.io/service-account-token"
+    assert secret["metadata"]["annotations"] == {"kubernetes.io/service-account.name": "secchat"}
+    # The SA namespace ("chat") differs from the pool namespace → it is ALSO created.
+    ns_names = [i["metadata"]["name"] for i in m["items"] if i["kind"] == "Namespace"]
+    assert ns_names == ["chat-pool", "chat"]
+    # Default (no create_service_account): no SA/Secret, exactly as before.
+    kinds_default = [i["kind"] for i in wiring.k8s_pool_manifests(_pool())["items"]]
+    assert "ServiceAccount" not in kinds_default and "Secret" not in kinds_default
+
+
+def test_secchat_pool_env_carries_api_server_when_set(tmp_path):
+    env = wiring.secchat_pool_env(_pool(api_server="https://192.168.5.1:6443"), _topo(tmp_path))
+    assert env["SECCHAT_POOL_APISERVER"] == "https://192.168.5.1:6443"
+    assert "SECCHAT_POOL_APISERVER" not in wiring.secchat_pool_env(_pool(), _topo(tmp_path))
+
+
+def test_pool_credential_helpers():
+    p = _pool(create_service_account=True, kube_context="colima")
+    assert wiring.pool_token_secret_name(p) == "secchat-pool-token"
+    assert wiring.pool_secret_read_argv(p, "{.data.token}") == [
+        "kubectl", "--context", "colima", "-n", "chat", "get", "secret",
+        "secchat-pool-token", "-o", "jsonpath={.data.token}",
+    ]
+    override = wiring.pool_compose_override(p)
+    assert "services:" in override and "  secchat:" in override
+    assert "./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro" in override
 
 
 def test_image_build_argv_construction():
