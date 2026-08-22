@@ -118,3 +118,76 @@ docker push <registry>/secchat-runnerd:<tag>
 # set [secchat.pool].image to that ref, redeploy (writes the .env), then:
 kubectl apply -f <out>/addressing/secchat-pool.k8s.json
 ```
+
+## Out-of-cluster SecChat (compose on the host)
+
+When SecChat runs outside the cluster — this suite's normal shape — set:
+
+```toml
+[secchat.pool]
+api_server = "https://<node-ip>:<api-port>"   # reachable FROM the SecChat container, in the cert SANs
+create_service_account = true                  # emit the SA + token Secret; deploy mounts the credential
+```
+
+The deploy then extracts the ServiceAccount token + cluster CA into `work/secchat/pool-sa/` and
+writes a `compose.override.yaml` mounting them at the standard in-cluster paths, so the backend's
+unmodified Kubernetes client works from compose.
+
+### colima (macOS test instances)
+
+`colima kubernetes start` adds k3s to the running VM. Notes from a live bring-up:
+
+- k3s shares the **docker runtime**, so a locally-built image (`docker build -f Dockerfile.runnerd
+  -t secchat-runnerd:local .`) is visible to the cluster with **no registry** — set
+  `image = "secchat-runnerd:local"`.
+- The API server does **not** listen on 6443: colima runs it on a nonstandard port bound on all VM
+  interfaces (find it with `colima ssh -- sh -c "sudo ss -tlnp | grep k3s"` — the `*:<port>`
+  listener, the same port as the macOS kubeconfig's `127.0.0.1:<port>`). Use
+  `api_server = "https://192.168.5.1:<that-port>"` — `192.168.5.1` is the VM/node IP and is in the
+  API cert's SANs. If a colima restart re-mints the port, update `api_server` and re-deploy.
+- The pod dial-back URL is the VM IP too: `secchat_url = "http://192.168.5.1:47010"` (docker
+  publishes SecChat's port on the VM's interfaces).
+
+## Analysis sidecars — `[secchat.pool.analysis_images]`
+
+Analysis tooling containers (the secagent analyzer family — IKOS, Roslyn, rust-analyzer — or any
+site image) can be attached to an agent's pod **at agent creation**, chosen per agent from the
+deployment's catalog:
+
+```toml
+[secchat.pool.analysis_images]
+rust = "secagent-analyzer-rust:local"
+ikos = "secagent-analysis:local"
+```
+
+The catalog reaches SecChat as `SECCHAT_POOL_ANALYSIS_IMAGES`; the New-Coding-Agent dialog offers
+the names as checkboxes. Each chosen analyzer becomes a hardened sidecar in the agent's pod,
+**sharing the pod's `/workspace` volume** (where pi's working tree is rooted) so its tooling
+operates on the agent's actual code. Pair with `[[builds]]` entries so the images are built at
+deploy. See secchat's own `docs/agent-pool.md` for the in-pod invocation protocol (the
+file-based work queue on the shared volume).
+
+## Internet access — per-agent, default OFF
+
+The pool's base NetworkPolicy restricts pod egress to DNS + git ports + the SecChat dial-back.
+A second, emitted-by-default policy (`secchat-pool-egress-open`) allows **all** egress — but only
+for pods labeled `secchat.io/egress: open`, which SecChat sets solely when an agent was created
+with **Internet access** enabled (a warn-tinted switch in the dialog, default off). Fail-closed:
+no label → no match → restricted egress. Note the base policy is **port-scoped, not
+destination-scoped** (a vanilla NetworkPolicy can't match hostnames): a restricted pod can still
+reach any host on 443/22/9418 — tighten with real CIDRs (see `git_host`) for production.
+
+## One-shot tasks — `task_image` + the /pool/tasks API
+
+Set `task_image` (the secagent agent image — see the `[[builds]]` for `secagent-base` +
+`secagent-agent`) and SecChat exposes an API for batch secagent jobs in ephemeral pods:
+
+```
+POST /pool/tasks   {"task": ["review", "mr", "42"], "repo": "https://git.sec.internal/x.git"}
+GET  /pool/tasks[/:id]      DELETE /pool/tasks/:id
+```
+
+The subcommand is allowlisted to secagent's batch surfaces (`review`, `docs`, `analyze`,
+`affordance`); the pod's stdout is the report (read via `pods/log` — granted in the emitted
+Role); LLM calls are attributed to the caller via SecChat's `/agent-llm` proxy; task pods always
+keep the restricted egress. `SECCHAT_POOL_MAX_TASKS` caps concurrency (default 5).

@@ -148,7 +148,37 @@ resource = "core"
 # cpu = "1"
 # memory = "1Gi"
 # max_pods = 20                                       # ResourceQuota pod cap for the pool namespace
+# max_per_owner = 3                                   # per-user cap (SecChat's own admission)
 # ttl_seconds = 3600                                  # hard pod TTL backstop
+#
+# # Turnkey knobs (all optional; default off = write manifests only):
+# build_image = false                                 # build+push Dockerfile.runnerd (needs registry)
+# registry = ""                                       # push destination when build_image
+# apply = false                                       # kubectl apply the manifests during deploy
+# kube_context = ""                                   # kubectl --context for apply/extraction
+#
+# # OUT-OF-CLUSTER SecChat (compose on the host — this suite's normal shape):
+# api_server = "https://192.168.5.1:58483"            # k8s API reachable FROM the secchat container
+# create_service_account = true                       # emit SA + token Secret; deploy mounts the credential
+#
+# # Analysis sidecar catalog — containers attachable to an agent's pod, sharing its /workspace.
+# # Internet access for a pod is a PER-AGENT toggle in the SecChat UI, default OFF.
+# [secchat.pool.analysis_images]
+# rust = "secagent-analyzer-rust:local"
+
+# ── Container builds (optional) ────────────────────────────────────────────────────────
+# Images the deploy builds from fetched component checkouts (docker layer cache makes re-runs
+# cheap; local-only by default — right for colima/k3s shared runtimes; push = true needs registry).
+#
+# [[builds]]
+# name = "secchat-runnerd"                            # built as <name>:<tag> (tag defaults to local)
+# component = "secchat"                               # fetched checkout = build context
+# dockerfile = "Dockerfile.runnerd"
+#
+# [[builds]]
+# name = "secagent-analyzer-rust"
+# component = "secagent"
+# dockerfile = "docker/analyzer-rust.Dockerfile"
 
 # ── Users & admin groups ───────────────────────────────────────────────────────────────
 # Optional [[users]] blocks seed SSO logins. Each is provisioned into SecSSO (Authentik) and

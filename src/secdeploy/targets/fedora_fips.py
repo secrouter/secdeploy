@@ -456,6 +456,7 @@ def deploy(
     inference_backend: str = "auto",  # macOS-only (vLLM-Metal); accepted+ignored here
     users=None,
     secchat_pool=None,
+    site_builds=None,
 ) -> None:
     users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
@@ -469,6 +470,8 @@ def deploy(
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
                "secrouter.env's SECROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
     without = without or []
+    # Optional site container builds ([[builds]]) — run first so later steps' images exist.
+    common.run_site_builds(site_builds or [], work, dry_run)
     # Placement: which native services run on THIS resource. secdns is only deployed with a
     # topology (it needs a generated zone); single-host (no topology) is byte-identical. secllm
     # additionally needs --with-inference: the DNS + peer-env wiring (steps 1-3) always reflects
@@ -684,6 +687,9 @@ def deploy(
                       "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
                 if secchat_pool.apply:
                     common.apply_pool_manifests(secchat_pool, pool_path)
+                # Out-of-cluster SecChat: extract + mount the SA credential before the stack bring-up.
+                if secchat_pool.apply and secchat_pool.create_service_account:
+                    common.provision_pool_credentials(secchat_pool, work / "secchat")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

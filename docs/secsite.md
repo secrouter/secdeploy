@@ -216,3 +216,33 @@ Same as `topology.toml` (see [What consumes the topology](topology.md#what-consu
 plus: `verify`/`plan`/`deploy`/`bundle` also accept `--site` and resolve every deploy-option
 toggle from it, not just placement — and every one of those toggles remains a one-off CLI flag
 override away.
+
+## Optional container builds — `[[builds]]`
+
+Declare images the deploy should build (the pool runnerd, analyzer tooling, any site image),
+instead of by-hand `docker build`s. Each builds from a fetched component checkout, before any
+step that needs the image; failures warn (with the command to run by hand) and never abort the
+deploy; docker's layer cache makes repeat deploys cheap.
+
+```toml
+[[builds]]
+name = "secagent-analyzer-rust"                  # image name → built as <name>:<tag>
+component = "secagent"                            # fetched checkout = build context
+dockerfile = "docker/analyzer-rust.Dockerfile"    # relative to the checkout
+# tag = "local"        # default — pairs with local-runtime clusters (colima) needing no registry
+# context = "."        # build context, relative to the checkout
+# push = false         # true pushes <registry>/<name>:<tag> (registry then required)
+# platform = ""        # optional --platform
+```
+
+## Named site profiles — `configure --name` / `--site <name>`
+
+Keep several site configurations on one machine and select one by name:
+
+```bash
+secdeploy configure --name colima-test     # writes sites/colima-test.toml (gitignored)
+secdeploy configure --list                 # show saved profiles
+secdeploy deploy macos --site colima-test  # every --site accepts a profile NAME or a path
+```
+
+A `--site` value that exists as a file always wins; a bare name resolves to `sites/<name>.toml`.

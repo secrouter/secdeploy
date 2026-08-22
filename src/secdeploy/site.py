@@ -62,11 +62,50 @@ DEPLOY_TABLE_KEYS = {"without", "ssh"}
 # The top-level [[users]] array-of-tables — declared accounts SecDeploy provisions in SecSSO.
 USER_KEYS = {"username", "email", "name", "groups"}
 
+# Named site profiles: `secdeploy configure --name <profile>` saves to sites/<profile>.toml, and
+# every `--site` flag accepts either a path OR a saved profile NAME (resolved via
+# resolve_site_ref). Gitignored like secsite.toml — site configs are site-specific.
+SITES_DIR = "sites"
+
+
+def site_profile_path(name: str, root: Path | None = None) -> Path:
+    """The file a named profile lives at: ``<root>/sites/<name>.toml`` (root defaults to cwd)."""
+    return (root or Path.cwd()) / SITES_DIR / f"{name}.toml"
+
+
+def list_site_profiles(root: Path | None = None) -> list[str]:
+    """The saved profile names (sorted), from ``<root>/sites/*.toml``."""
+    d = (root or Path.cwd()) / SITES_DIR
+    return sorted(p.stem for p in d.glob("*.toml")) if d.is_dir() else []
+
+
+def resolve_site_ref(value: str | None, root: Path | None = None) -> str | None:
+    """Resolve a ``--site`` argument that may be a PATH or a saved profile NAME.
+
+    A value that exists as a file is used as-is (paths always win). Otherwise, a bare name (no
+    path separators) matching a saved profile resolves to ``sites/<name>.toml``. Anything else is
+    returned unchanged so the downstream loader produces its normal missing-file error naming what
+    the caller actually typed."""
+    if value is None:
+        return None
+    if Path(value).exists():
+        return value
+    if "/" not in value and not value.endswith(".toml"):
+        candidate = site_profile_path(value, root)
+        if candidate.exists():
+            return str(candidate)
+    return value
+
+
+# The top-level [[builds]] array-of-tables — optional container-image builds run at deploy.
+BUILD_KEYS = {"name", "component", "dockerfile", "tag", "context", "push", "registry", "platform"}
+
 # The [secchat.pool] sub-table — the optional Kubernetes agent pool. Mirrors PoolOptions' fields.
 SECCHAT_POOL_KEYS = {
     "enabled", "image", "namespace", "service_account", "service_account_namespace",
     "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
-    "build_image", "registry", "apply", "kube_context",
+    "build_image", "registry", "apply", "kube_context", "api_server", "create_service_account",
+    "analysis_images", "task_image",
 }
 
 
@@ -114,6 +153,52 @@ class UserSpec:
 
 
 @dataclass
+class BuildSpec:
+    """One optional container-image build (secsite.toml ``[[builds]]``), run at deploy time.
+
+    Generalizes the one-off image builds a suite needs beyond its core services — the pool's
+    runnerd, the secagent analyzer family, any site-specific tooling image — into declarative site
+    config instead of by-hand ``docker build`` invocations:
+
+    .. code-block:: toml
+
+        [[builds]]
+        name = "secagent-analyzer-rust"          # image name (also the local ref's repo)
+        component = "secagent"                    # which fetched checkout is the build context
+        dockerfile = "docker/analyzer-rust.Dockerfile"   # relative to that checkout
+        # tag = "local"                           # default; the built ref is <name>:<tag>
+        # context = "."                           # build context, relative to the checkout
+        # push = false                            # default LOCAL-ONLY (e.g. colima's shared
+        #                                         # docker runtime needs no registry); true
+        #                                         # pushes <registry>/<name>:<tag>
+        # registry = ""                           # required when push = true
+        # platform = ""                           # optional --platform (e.g. linux/arm64)
+
+    Builds are best-effort at deploy (a failure warns with the command to run by hand and never
+    aborts the deploy), and docker's layer cache makes re-runs cheap.
+    """
+
+    name: str = ""
+    component: str = ""
+    dockerfile: str = ""
+    tag: str = "local"
+    context: str = "."
+    push: bool = False
+    registry: str = ""
+    platform: str = ""
+
+    @property
+    def local_ref(self) -> str:
+        """The locally-built image reference, ``<name>:<tag>``."""
+        return f"{self.name}:{self.tag}"
+
+    @property
+    def push_ref(self) -> str:
+        """The pushed reference, ``<registry>/<name>:<tag>`` (only meaningful when ``push``)."""
+        return f"{self.registry.rstrip('/')}/{self.name}:{self.tag}"
+
+
+@dataclass
 class PoolOptions:
     """The optional Kubernetes agent pool for SecChat coding agents (secsite.toml's
     ``[secchat.pool]``). When ``enabled``, SecDeploy writes the ``SECCHAT_POOL_*`` env into
@@ -152,6 +237,24 @@ class PoolOptions:
     registry: str = ""
     apply: bool = False
     kube_context: str = ""
+    # OUT-OF-CLUSTER SecChat support: when SecChat itself runs OUTSIDE the cluster (compose on the
+    # host — this suite's normal shape), it can't use the in-cluster defaults. `api_server` is the
+    # Kubernetes API URL reachable FROM the SecChat container (→ SECCHAT_POOL_APISERVER; e.g. the
+    # colima node IP https://192.168.5.1:6443 — an address in the API cert's SANs). When
+    # `create_service_account` is set, the emitted manifests ALSO create SecChat's ServiceAccount +
+    # a bound token Secret, and the deploy extracts that token + cluster CA and mounts them into the
+    # SecChat container at the standard in-cluster paths (via a compose override) — so the backend's
+    # unmodified in-cluster client just works. Leave both unset for a truly in-cluster SecChat.
+    api_server: str = ""
+    create_service_account: bool = False
+    # Analysis sidecar catalog, name → image (`[secchat.pool.analysis_images]`). Each named
+    # container can be attached to an agent's pod at creation, sharing the pod's /workspace volume
+    # so its tooling operates on the agent's code (→ SECCHAT_POOL_ANALYSIS_IMAGES). Empty = off.
+    analysis_images: dict[str, str] = field(default_factory=dict)
+    # Image for ONE-SHOT POOL TASKS (the secagent agent image): the /pool/tasks API runs
+    # `secagent review mr` / `docs build` / `analyze …` batch jobs in ephemeral pods of this image
+    # (→ SECCHAT_POOL_TASK_IMAGE). Empty = the task API is off.
+    task_image: str = ""
 
 
 @dataclass
@@ -174,6 +277,7 @@ class SiteConfig:
     deploy_options: dict[str, DeployOptions] = field(default_factory=dict)
     users: list[UserSpec] = field(default_factory=list)
     secchat_pool: PoolOptions = field(default_factory=PoolOptions)
+    builds: list[BuildSpec] = field(default_factory=list)
     path: Path | None = None
 
     # ── construction ───────────────────────────────────────────────────────────────
@@ -256,6 +360,48 @@ class SiteConfig:
                 groups=[str(g).strip() for g in (u.get("groups") or []) if str(g).strip()],
             ))
 
+        # Optional [[builds]] — container images built at deploy (the pool runnerd, analyzer
+        # tooling, any site image). Same fail-loud unknown-key/required-field discipline; the
+        # component must be a manifest component (its fetched checkout is the build context).
+        builds: list[BuildSpec] = []
+        seen_build_names: set[str] = set()
+        for i, b in enumerate(data.get("builds") or []):
+            if not isinstance(b, dict):
+                errors.append(f"[[builds]][{i}] must be a table")
+                continue
+            unknown_b = sorted(k for k in b if k not in BUILD_KEYS)
+            if unknown_b:
+                errors.append(
+                    f"[[builds]][{i}]: unknown key(s) {', '.join(unknown_b)} "
+                    f"(expected: {', '.join(sorted(BUILD_KEYS))})"
+                )
+            spec = BuildSpec(
+                name=str(b.get("name", "")).strip(),
+                component=str(b.get("component", "")).strip(),
+                dockerfile=str(b.get("dockerfile", "")).strip(),
+                tag=str(b.get("tag", "local")).strip() or "local",
+                context=str(b.get("context", ".")).strip() or ".",
+                push=bool(b.get("push", False)),
+                registry=str(b.get("registry", "")).strip(),
+                platform=str(b.get("platform", "")).strip(),
+            )
+            if not spec.name or not spec.component or not spec.dockerfile:
+                errors.append(f"[[builds]][{i}]: name, component, and dockerfile are required")
+                continue
+            if spec.name in seen_build_names:
+                errors.append(f"[[builds]]: duplicate name {spec.name!r}")
+                continue
+            if spec.component not in manifest.components:
+                errors.append(
+                    f"[[builds]][{i}]: unknown component {spec.component!r} "
+                    f"(expected one of: {', '.join(sorted(manifest.components))})")
+                continue
+            if spec.push and not spec.registry:
+                errors.append(f"[[builds]][{i}] ({spec.name}): registry is required when push = true")
+                continue
+            seen_build_names.add(spec.name)
+            builds.append(spec)
+
         # Optional [secchat.pool] — the Kubernetes agent pool. Additive top-level table (silently
         # ignored before this parser existed), with the same fail-loud unknown-key rejection.
         secchat_table = data.get("secchat") or {}
@@ -292,7 +438,17 @@ class SiteConfig:
             registry=str(pool_data.get("registry", "")).strip(),
             apply=bool(pool_data.get("apply", False)),
             kube_context=str(pool_data.get("kube_context", "")).strip(),
+            api_server=str(pool_data.get("api_server", "")).strip(),
+            create_service_account=bool(pool_data.get("create_service_account", False)),
+            task_image=str(pool_data.get("task_image", "")).strip(),
+            analysis_images={
+                str(k).strip(): str(v).strip()
+                for k, v in (pool_data.get("analysis_images") or {}).items()
+                if str(k).strip() and str(v).strip()
+            } if isinstance(pool_data.get("analysis_images", {}), dict) else {},
         )
+        if not isinstance(pool_data.get("analysis_images", {}), dict):
+            errors.append("[secchat.pool]: analysis_images must be a table of name = \"image\"")
         if secchat_pool.enabled and not secchat_pool.image and not secchat_pool.build_image:
             errors.append("[secchat.pool]: image is required when enabled = true (or set build_image = true)")
         if secchat_pool.build_image and not secchat_pool.registry:
@@ -304,7 +460,7 @@ class SiteConfig:
         topology = Topology.from_data(data, manifest, path=path, validate=False)
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
-            deploy_options=deploy_options, users=users, secchat_pool=secchat_pool, path=path,
+            deploy_options=deploy_options, users=users, secchat_pool=secchat_pool, builds=builds, path=path,
         )
         site.validate()
         if errors:
@@ -435,6 +591,20 @@ class SiteConfig:
                 out.append(f'name = "{u.name}"')
                 out.append(f"groups = {_arr(u.groups)}")
                 out.append("")
+        if self.builds:
+            out.append("# Optional container-image builds, run at deploy (docker layer cache makes")
+            out.append("# re-runs cheap). Each builds from a fetched component checkout.")
+            for b in self.builds:
+                out.append("[[builds]]")
+                out.append(f'name = "{b.name}"')
+                out.append(f'component = "{b.component}"')
+                out.append(f'dockerfile = "{b.dockerfile}"')
+                out.append(f'tag = "{b.tag}"')
+                out.append(f'context = "{b.context}"')
+                out.append(f"push = {_bool(b.push)}")
+                out.append(f'registry = "{b.registry}"')
+                out.append(f'platform = "{b.platform}"')
+                out.append("")
         pool = self.secchat_pool
         if pool.enabled:
             out.append("# Optional Kubernetes agent pool — coding agents run in server-launched pods.")
@@ -456,5 +626,13 @@ class SiteConfig:
             out.append(f'registry = "{pool.registry}"')
             out.append(f"apply = {_bool(pool.apply)}")
             out.append(f'kube_context = "{pool.kube_context}"')
+            out.append(f'api_server = "{pool.api_server}"')
+            out.append(f"create_service_account = {_bool(pool.create_service_account)}")
+            out.append(f'task_image = "{pool.task_image}"')
+            if pool.analysis_images:
+                out.append("")
+                out.append("[secchat.pool.analysis_images]")
+                for name in sorted(pool.analysis_images):
+                    out.append(f'{name} = "{pool.analysis_images[name]}"')
             out.append("")
         return "\n".join(out).rstrip() + "\n"

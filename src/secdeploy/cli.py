@@ -29,7 +29,7 @@ from pathlib import Path
 from . import process as P
 from . import wiring
 from .manifest import Manifest
-from .site import DeployOptions
+from .site import DeployOptions, list_site_profiles, resolve_site_ref, site_profile_path
 from .targets import common, fedora_fips, macos
 
 TARGETS = {macos.NAME: macos, fedora_fips.NAME: fedora_fips}
@@ -77,14 +77,22 @@ def _resolved_list(cli_value: str | None, site_value: list[str]) -> list[str]:
     return [s.strip() for s in cli_value.split(",") if s.strip()]
 
 
+def _site_arg(args) -> str | None:
+    """``--site`` with named-profile resolution: a bare name matching a saved profile
+    (``sites/<name>.toml`` — see `secdeploy configure --name`) resolves to its file; a real path
+    passes through unchanged."""
+    return resolve_site_ref(getattr(args, "site", None))
+
+
 def _site_or_topology_path(args) -> str:
     """The effective placement FILE PATH for commands that only need placement, not deploy
     options (verify/plan already resolve a full SiteConfig instead; bundle uses this) —
-    ``--site`` if given, else ``secsite.toml`` in the current directory if present, else
-    ``--topology``. Safe to hand straight to :meth:`~secdeploy.topology.Topology.load` (or
-    anything that loads one): a secsite.toml's extra deploy-only keys are simply ignored by
-    Topology's own parser (see :meth:`Topology.from_data`)."""
-    site_arg = getattr(args, "site", None)
+    ``--site`` (a path or a saved profile name) if given, else ``secsite.toml`` in the current
+    directory if present, else ``--topology``. Safe to hand straight to
+    :meth:`~secdeploy.topology.Topology.load` (or anything that loads one): a secsite.toml's
+    extra deploy-only keys are simply ignored by Topology's own parser (see
+    :meth:`Topology.from_data`)."""
+    site_arg = _site_arg(args)
     if site_arg is not None:
         return site_arg
     if Path("secsite.toml").exists():
@@ -144,7 +152,7 @@ def _verify_topology(args, m: Manifest) -> None:
     from .site import SiteConfig
     from .topology import Topology
 
-    site_arg = getattr(args, "site", None)
+    site_arg = _site_arg(args)
     spath = Path(site_arg) if site_arg is not None else Path("secsite.toml")
     if site_arg is None and not spath.exists():
         tpath = Path(args.topology)
@@ -169,8 +177,28 @@ def _verify_topology(args, m: Manifest) -> None:
 def cmd_configure(args) -> int:
     from . import configure
 
+    if getattr(args, "list", False):
+        profiles = list_site_profiles()
+        if not profiles:
+            print("no saved site profiles (save one with: secdeploy configure --name <profile>)")
+            return 0
+        print("saved site profiles (usable anywhere --site is accepted, by name):")
+        for name in profiles:
+            print(f"    {name:<20} {site_profile_path(name)}")
+        return 0
+    # --name <profile> saves to sites/<profile>.toml instead of secsite.toml, so a machine can
+    # hold several site configurations (e.g. colima-test vs enclave) and every command can select
+    # one BY NAME: `secdeploy deploy macos --site <profile>`.
+    dest = args.site
+    if getattr(args, "name", None):
+        dest_path = site_profile_path(args.name)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest = str(dest_path)
     m = Manifest.load(args.manifest)
-    return 0 if configure.run(m, dest=args.site, root=_root(args)) else 1
+    ok = configure.run(m, dest=dest, root=_root(args))
+    if ok and getattr(args, "name", None):
+        print(f"saved profile {args.name!r} — use it with: secdeploy deploy <target> --site {args.name}")
+    return 0 if ok else 1
 
 
 def cmd_plan(args) -> int:
@@ -178,7 +206,7 @@ def cmd_plan(args) -> int:
     mod = _target_mod(args.target)
     t = m.target(args.target)
     without = _without(args)
-    site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+    site, from_file = wiring.active_site(m, _site_arg(args), args.topology, args.target)
     topo = site.topology
     print(f"suite {m.suite}  →  target {t.name} ({t.kind})")
     print(f"  {t.description}\n")
@@ -252,7 +280,7 @@ def cmd_deploy(args) -> int:
     """
     m = Manifest.load(args.manifest).include(_with(args))
     mod = _target_mod(args.target)
-    site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+    site, from_file = wiring.active_site(m, _site_arg(args), args.topology, args.target)
     without = _resolved_without(args.without, site.without)
     ssh = args.ssh if args.ssh is not None else site.ssh
 
@@ -283,6 +311,7 @@ def cmd_deploy(args) -> int:
         inference_backend=opts.inference_backend,
         users=site.users if from_file else None,
         secchat_pool=site.secchat_pool if from_file else None,
+        site_builds=site.builds if from_file else None,
     )
     return 0
 
@@ -310,7 +339,7 @@ def _resolve_resource_opt(args, m: Manifest) -> str | None:
     single-host mode. Never fatal — the label is cosmetic (which host's archive this is), so a
     missing/oddly-shaped topology just falls back to ``--resource``/None rather than erroring."""
     try:
-        site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+        site, from_file = wiring.active_site(m, _site_arg(args), args.topology, args.target)
         if not from_file:
             return getattr(args, "resource", None)
         return wiring.resource_for(site.topology, args.target, getattr(args, "resource", None))
@@ -384,6 +413,15 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument(
         "--site", default="secsite.toml",
         help="destination site config file to write (default: secsite.toml)",
+    )
+    cp.add_argument(
+        "--name", default=None,
+        help="save as a NAMED profile (sites/<name>.toml) instead of secsite.toml — select it "
+             "later anywhere --site is accepted, by name (e.g. `deploy macos --site <name>`)",
+    )
+    cp.add_argument(
+        "--list", action="store_true",
+        help="list the saved site profiles and exit",
     )
     cp.set_defaults(fn=cmd_configure)
 
