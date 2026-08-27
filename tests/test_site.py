@@ -582,3 +582,61 @@ def test_secchat_pool_and_voice_can_coexist(tmp_path):
     site = _site(tmp_path, SITE_POOL + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n')
     assert site.secchat_pool.enabled is True
     assert site.secchat_voice.enabled is True
+
+
+# ── [audit] — optional syslog/SIEM forwarding for SecRouter's audit log (AU-3.3.x). Mirrors the
+#    [secchat.voice] coverage above: defaults, full-field parse, unknown-key/value rejection,
+#    round-trip, bare-config cleanliness. See docs/compliance.md. ─────────────────────────────
+SITE_AUDIT = BARE + """
+[audit]
+syslog_host = "siem.internal"
+syslog_port = 6514
+syslog_proto = "tcp"
+syslog_format = "cef"
+"""
+
+
+def test_audit_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.audit.syslog_host == ""
+    assert site.audit.syslog_port == 514
+    assert site.audit.syslog_proto == "udp"
+    assert site.audit.syslog_format == "json"
+
+
+def test_audit_parses_all_fields(tmp_path):
+    aud = _site(tmp_path, SITE_AUDIT).audit
+    assert aud.syslog_host == "siem.internal"
+    assert aud.syslog_port == 6514
+    assert aud.syslog_proto == "tcp"
+    assert aud.syslog_format == "cef"
+
+
+def test_audit_rejects_bad_syslog_proto(tmp_path):
+    with pytest.raises(ValueError, match="syslog_proto"):
+        _site(tmp_path, BARE + '\n[audit]\nsyslog_host = "siem.internal"\nsyslog_proto = "sctp"\n')
+
+
+def test_audit_rejects_bad_syslog_format(tmp_path):
+    with pytest.raises(ValueError, match="syslog_format"):
+        _site(tmp_path, BARE + '\n[audit]\nsyslog_host = "siem.internal"\nsyslog_format = "xml"\n')
+
+
+def test_audit_rejects_out_of_range_port(tmp_path):
+    with pytest.raises(ValueError, match="syslog_port"):
+        _site(tmp_path, BARE + '\n[audit]\nsyslog_host = "siem.internal"\nsyslog_port = 70000\n')
+
+
+def test_audit_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[audit\]: unknown key"):
+        _site(tmp_path, BARE + '\n[audit]\nbogus = 1\n')
+
+
+def test_audit_round_trips_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_AUDIT)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.audit == site.audit
+
+
+def test_bare_config_emits_no_audit_section(tmp_path):
+    assert "[audit]" not in _site(tmp_path, BARE).to_toml()

@@ -13,6 +13,11 @@ Subcommands:
   bundle    produce an air-gapped release bundle (+ SHA256SUMS)
   deploy    stand the suite up on this host for a target (use --dry-run to preview)
   status    report health of a deployed target
+  audit     deploy-audit hash-chain tooling — `secdeploy audit verify` walks out/audit/ (AU
+            3.3.8 — see docs/compliance.md)
+  evidence  fetch each reachable component's /admin/api/evidence + this host's own deploy-audit
+            chain verify result into out/evidence/suite-evidence-<date>.json — needs a live,
+            reachable deployment (see docs/compliance.md)
   teardown  remove what a deploy installed on THIS host (discovers what's actually here —
             never trusts topology.toml/deploy flags/the audit JSON; use --dry-run to preview,
             --purge to also remove persistent data)
@@ -323,6 +328,12 @@ def cmd_deploy(args) -> int:
         secchat_pool=site.secchat_pool if from_file else None,
         secchat_voice=site.secchat_voice if from_file else None,
         site_builds=site.builds if from_file else None,
+        # [audit] is suite-wide (like [deploy].without/ssh), not per-resource — so, unlike the
+        # from_file-gated fields above, it's always passed: `site` already defaults to an
+        # all-off AuditOptions() in single-host/topology-only mode (see SiteConfig.single_host/
+        # from_topology), so this is a no-op (no syslog fragment generated) exactly when there's
+        # no secsite.toml to have set it in the first place.
+        audit_opts=site.audit,
     )
     return 0
 
@@ -331,6 +342,42 @@ def cmd_status(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
     mod.status(m, root=_root(args))
+    return 0
+
+
+def cmd_audit_verify(args) -> int:
+    from . import audit as audit_mod
+
+    result = audit_mod.verify_all(args.out)
+    print(f"deploy-audit chain verify — {Path(args.out) / 'audit'}")
+    if not result["targets"]:
+        print("  (no chained audit files found yet — nothing to verify; see docs/compliance.md)")
+    for stem, r in sorted(result["targets"].items()):
+        status = "OK" if r["ok"] else f"BROKEN at {r['brokenAt']}"
+        print(f"  {stem:<30} {r['checked']:>3} checked  {status}")
+    overall = "OK" if result["ok"] else f"BROKEN ({result['brokenAt']})"
+    print(f"  overall: {result['checked']} checked — {overall}")
+    return 0 if result["ok"] else 1
+
+
+def cmd_evidence(args) -> int:
+    from . import evidence as evidence_mod
+
+    m = Manifest.load(args.manifest)
+    without = _without(args)
+    # evidence has no per-target install behavior of its own (it's a read-only HTTP client
+    # against an already-deployed suite) — "fedora-fips" is just a harmless placeholder target
+    # for active_site's single-host synthesis fallback (see wiring.active_site), never used to
+    # gate/shape anything below.
+    site, _from_file = wiring.active_site(m, _site_arg(args), args.topology, "fedora-fips")
+    urls = site.topology.urls(without)
+    result = evidence_mod.collect(urls, args.out, token=args.token, timeout=args.timeout)
+    print(f"evidence bundle written → {result['path']}")
+    for name, info in result["components"].items():
+        note = f" — {info['note']}" if info.get("note") else ""
+        print(f"  {name:<12} {info['status']:<16}{note}")
+    chain = result["audit_chain"]
+    print(f"  deploy-audit chain: {'OK' if chain['ok'] else 'BROKEN'} ({chain['checked']} checked)")
     return 0
 
 
@@ -631,6 +678,39 @@ def build_parser() -> argparse.ArgumentParser:
     _resource_arg(bp)
     _site_arg(bp)
     bp.set_defaults(fn=cmd_bundle)
+
+    ap = sub.add_parser(
+        "audit",
+        help="deploy-audit hash-chain tooling (AU-3.3.8 — CMMC evidence; see docs/compliance.md)",
+    )
+    audit_sub = ap.add_subparsers(dest="audit_cmd", required=True)
+    avp = audit_sub.add_parser(
+        "verify",
+        help="walk out/audit/ chronologically, per target+resource, and check the deploy-audit "
+             "hash chain (prevHash/hash — grandfathers old un-chained files)",
+    )
+    avp.set_defaults(fn=cmd_audit_verify)
+
+    ep = sub.add_parser(
+        "evidence",
+        help="fetch /admin/api/evidence from every reachable suite component + this host's own "
+             "deploy-audit chain verify result, bundled to out/evidence/suite-evidence-<date>.json "
+             "— NEEDS a live, reachable deployment (see docs/compliance.md)",
+    )
+    _without_arg(ep)
+    _topology_arg(ep)
+    _site_arg(ep)
+    ep.add_argument(
+        "--token", default=None,
+        help="admin bearer token sent to EVERY component's /admin/api/evidence — overridden "
+             "per-component by <COMPONENT>_ADMIN_TOKEN env vars (e.g. SECROUTER_ADMIN_TOKEN). "
+             "Never written to the output bundle.",
+    )
+    ep.add_argument(
+        "--timeout", type=float, default=5.0,
+        help="per-component HTTP timeout in seconds (default: 5)",
+    )
+    ep.set_defaults(fn=cmd_evidence)
 
     return p
 

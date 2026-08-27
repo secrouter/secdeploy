@@ -245,6 +245,24 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
 These values match `secsso.sh`'s own `oidc-config`/`secagent-config` output exactly (both
 derive from the same SecSSO external URL), so the two never disagree.
 
+### SecRouter audit syslog config fragment
+
+When `secsite.toml`'s `[audit]` table sets `syslog_host` (see
+[secsite.md](secsite.md)'s `[audit]` table), `deploy` writes the same kind
+of documented fragment as the OIDC one above — `security.audit` isn't env-var-driven either —
+to `out/addressing/secrouter-audit.json`, for you to merge into SecRouter's `SECROUTER_CONFIG`:
+
+```json
+{
+  "sink": "both",
+  "syslog": {"host": "siem.internal", "port": 514, "protocol": "udp", "format": "json"}
+}
+```
+
+`sink: "both"` keeps SecRouter's own tamper-evident SQLite audit chain as the authoritative
+record and additionally forwards each event to the syslog sink — see
+[compliance.md](compliance.md) for the full posture.
+
 ### Native SecChat turnkey env
 
 The native **SecChat** (the canonical `secchat` stack — SSO login, tamper-evident audit,
@@ -363,6 +381,20 @@ state dir `/var/lib/secsuite/secproxy`, so nothing touches nginx's default (read
 the installed file — a redeploy overwrites it. Change `topology.toml` and redeploy instead. See
 [secproxy's own `nginx-secproxy.conf.example`](https://github.com/secrouter/secproxy) for the
 exact shape the generator emits.
+
+The config also defines a named `secproxy` log format (nginx's stock `combined` fields plus
+`$request_id`/`$request_time`/`$upstream_response_time`, for correlating a request across
+secproxy and the fronted backend's own logs) and points `access_log` at it. A generated
+logrotate config (`wiring.logrotate_conf_text()`) is installed alongside it to:
+
+```
+/etc/logrotate.d/secproxy
+```
+
+— daily rotation, 14 generations, compressed, reloading nginx (`systemctl reload secproxy`) via
+`postrotate` so it reopens fresh log files. This is log **hygiene** only: retention policy, log
+**integrity**, and forwarding to a durable/tamper-evident store are downstream/environment-owned
+(see [compliance.md](compliance.md)), not something secdeploy enforces.
 
 ### TLS via SecCert (the deploy-time SAN cert)
 

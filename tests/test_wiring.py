@@ -338,6 +338,27 @@ def test_nginx_conf_text_multi_resource_topology_handled(tmp_path):
     assert "secllm-gpu1" not in text and "secllm-gpu2" not in text
 
 
+def test_nginx_conf_text_error_pages_on_every_server_block(tmp_path):
+    # Branded 502/503/504/404 pages (wiring.error_page_html) on EVERY :443 server block — the
+    # landing page's and each fronted proxy's — not just some of them.
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    assert text.count("error_page 502 503 504 /5xx.html;") == len(FRONTED) + 1
+    assert text.count("error_page 404 /404.html;") == len(FRONTED) + 1
+    assert text.count("location = /5xx.html {") == len(FRONTED) + 1
+    assert text.count("location = /404.html {") == len(FRONTED) + 1
+    # internal — never reachable except via the error_page rewrite (the tab-indented directive,
+    # not the "sec.internal;" domain suffix that appears on every server_name line)
+    assert text.count("\t\t\tinternal;") == 2 * (len(FRONTED) + 1)
+    # deliberately no proxy_intercept_errors anywhere — see nginx_conf_text's docstring: an
+    # upstream's own error body (e.g. secchat's JSON error) must pass through unbranded.
+    assert "proxy_intercept_errors" not in text
+    # state_dir is a parameter, same as cert_dir
+    other = wiring.nginx_conf_text(topo, CERT_DIR, state_dir="/opt/secproxy")
+    assert "root /opt/secproxy/www;" in other
+    assert f"root {wiring._NGINX_STATE_DIR}/www;" not in other
+
+
 def test_write_addressing_writes_nginx_conf_when_secproxy_placed_here(tmp_path):
     topo = _edge_topo(tmp_path)  # secproxy is on 'core' (edge tier)
     out = tmp_path / "out"
@@ -347,9 +368,12 @@ def test_write_addressing_writes_nginx_conf_when_secproxy_placed_here(tmp_path):
     assert nginx_path == out / "secproxy.nginx.conf"
     # write_addressing hardcodes the fedora cert dir /etc/secsuite/secproxy
     assert nginx_path.read_text() == wiring.nginx_conf_text(topo, "/etc/secsuite/secproxy")
-    # the nginx conf is the ONLY reverse-proxy artifact written (secproxy runs nginx on both
-    # targets — there is no separate per-target proxy config)
-    assert set(written_core) == {"zone", "env", "egress", "oidc", "nginx_conf"}
+    # the logrotate config for the same nginx logs is written alongside it
+    assert "logrotate_conf" in written_core
+    logrotate_path = Path(written_core["logrotate_conf"])
+    assert logrotate_path == out / "secproxy.logrotate.conf"
+    assert logrotate_path.read_text() == wiring.logrotate_conf_text()
+    assert set(written_core) == {"zone", "env", "egress", "oidc", "nginx_conf", "logrotate_conf"}
 
     written_gpu = wiring.write_addressing(topo, out, "gpu")  # secllm only, not secproxy
     assert "nginx_conf" not in written_gpu
@@ -361,6 +385,20 @@ def test_write_addressing_no_nginx_conf_when_secproxy_not_in_topology(tmp_path):
     written = wiring.write_addressing(topo, out, "core")
     assert "nginx_conf" not in written
     assert not (out / "secproxy.nginx.conf").exists()
+    assert "logrotate_conf" not in written
+    assert not (out / "secproxy.logrotate.conf").exists()
+
+
+# ── error_page_html: the branded 5xx/404 pages nginx_conf_text's error_page directives target ──
+def test_error_page_html_5xx_and_404_are_distinct_self_contained_pages():
+    for kind, must_contain in (("5xx", "didn&#x27;t respond"), ("404", "Nothing is served")):
+        text = wiring.error_page_html(kind)
+        assert "<!doctype html>" in text.lower()
+        assert "<link" not in text and "<script" not in text  # no CDN, no behavior
+        assert "--accent:#4f6a2e" in text  # same field-console tokens as the rest of the suite
+        assert '<span class="sec">SEC</span>PROXY' in text
+        assert must_contain in text
+    assert wiring.error_page_html("5xx") != wiring.error_page_html("404")
 
 
 # ── multi-instance inference: SecRouter's backend pool (SECROUTER_SECLLM_ENDPOINTS) ─────
@@ -626,6 +664,96 @@ def test_secrouter_oidc_config_json_serializable(tmp_path):
     topo = _topo(tmp_path)
     oidc = wiring.secrouter_oidc_config(topo)
     assert json.loads(json.dumps(oidc)) == oidc
+
+
+# ── secrouter_audit_syslog_config: security.audit fragment (AU-3.3.x syslog forwarding) ─────
+def test_secrouter_audit_syslog_config_empty_without_opts():
+    assert wiring.secrouter_audit_syslog_config(None) == {}
+
+
+def test_secrouter_audit_syslog_config_empty_when_syslog_host_unset():
+    from secdeploy.site import AuditOptions
+
+    assert wiring.secrouter_audit_syslog_config(AuditOptions()) == {}
+
+
+def test_secrouter_audit_syslog_config_shape():
+    from secdeploy.site import AuditOptions
+
+    opts = AuditOptions(syslog_host="siem.internal", syslog_port=6514,
+                        syslog_proto="tcp", syslog_format="cef")
+    assert wiring.secrouter_audit_syslog_config(opts) == {
+        "sink": "both",
+        "syslog": {"host": "siem.internal", "port": 6514, "protocol": "tcp", "format": "cef"},
+    }
+
+
+def test_secrouter_audit_syslog_config_json_serializable():
+    from secdeploy.site import AuditOptions
+
+    opts = AuditOptions(syslog_host="siem.internal")
+    fragment = wiring.secrouter_audit_syslog_config(opts)
+    assert json.loads(json.dumps(fragment)) == fragment
+
+
+def test_write_addressing_writes_audit_fragment_when_secrouter_placed_and_syslog_set(tmp_path):
+    from secdeploy.site import AuditOptions
+
+    topo = _topo(tmp_path)  # secrouter is on 'core' (gateway tier)
+    out = tmp_path / "out"
+    opts = AuditOptions(syslog_host="siem.internal")
+    written = wiring.write_addressing(topo, out, "core", audit_opts=opts)
+    assert "audit" in written
+    audit_path = Path(written["audit"])
+    assert audit_path == out / "secrouter-audit.json"
+    assert json.loads(audit_path.read_text()) == wiring.secrouter_audit_syslog_config(opts)
+
+
+def test_write_addressing_no_audit_fragment_without_syslog_host(tmp_path):
+    topo = _topo(tmp_path)
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "core")  # no audit_opts at all
+    assert "audit" not in written
+    assert not (out / "secrouter-audit.json").exists()
+
+
+def test_write_addressing_no_audit_fragment_when_secrouter_not_here(tmp_path):
+    from secdeploy.site import AuditOptions
+
+    topo = _topo(tmp_path)  # 'gpu' hosts only secllm, not secrouter
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "gpu", audit_opts=AuditOptions(syslog_host="siem.internal"))
+    assert "audit" not in written
+
+
+# ── nginx_conf_text: 'secproxy' log_format (log hygiene — AU-3.3.x correlation fields) ──────
+def test_nginx_conf_log_format_and_access_log(tmp_path):
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    assert "log_format secproxy" in text
+    assert "$request_id" in text
+    assert "$request_time" in text
+    assert "$upstream_response_time" in text
+    assert "access_log " in text and " secproxy;" in text
+    # the access_log directive actually references the named format, not the stock default
+    assert f"access_log {wiring._NGINX_STATE_DIR}/access.log secproxy;" in text
+
+
+# ── logrotate_conf_text: secproxy nginx access/error log rotation (fedora-fips only) ────────
+def test_logrotate_conf_text_default_paths_and_service():
+    text = wiring.logrotate_conf_text()
+    assert f"{wiring._NGINX_STATE_DIR}/access.log {wiring._NGINX_STATE_DIR}/error.log {{" in text
+    assert "daily" in text
+    assert "rotate 14" in text
+    assert "systemctl reload secproxy.service" in text
+    assert "create 0640 secsuite-secproxy secsuite-secproxy" in text
+
+
+def test_logrotate_conf_text_custom_state_dir_and_service():
+    text = wiring.logrotate_conf_text("/opt/secproxy", service_name="secproxy2", owner="svc-proxy")
+    assert "/opt/secproxy/access.log /opt/secproxy/error.log {" in text
+    assert "systemctl reload secproxy2.service" in text
+    assert "create 0640 svc-proxy svc-proxy" in text
 
 
 # ── secagent_pi_models_json: adapt the example for pi's service (api-key) auth mode ─────

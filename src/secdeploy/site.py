@@ -117,6 +117,13 @@ SECCHAT_VOICE_KEYS = {
     "max_legs_per_session",
 }
 
+# The top-level [audit] table — optional syslog/SIEM forwarding for SecRouter's audit log
+# (AU-3.3.x; see docs/compliance.md). Mirrors AuditOptions' fields exactly. Suite-wide (not
+# per-resource) like [deploy] — there is one audit posture for the deployment, not one per host.
+AUDIT_TABLE_KEYS = {"syslog_host", "syslog_port", "syslog_proto", "syslog_format"}
+AUDIT_VALID_PROTOS = {"udp", "tcp"}
+AUDIT_VALID_FORMATS = {"json", "cef"}
+
 
 @dataclass
 class DeployOptions:
@@ -310,6 +317,25 @@ class VoiceOptions:
 
 
 @dataclass
+class AuditOptions:
+    """Optional syslog/SIEM forwarding for SecRouter's audit log (secsite.toml's top-level
+    ``[audit]`` table — AU-3.3.x; see docs/compliance.md). Matches SecRouter's own
+    ``security.audit.syslog`` shape (``secrouter/src/security/types.ts``'s ``SecurityConfig``)
+    field-for-field, so :func:`secdeploy.wiring.secrouter_audit_syslog_config` can hand the
+    fragment straight through with no translation.
+
+    All optional; ``syslog_host`` empty (the default) means no syslog sink at all — SecRouter's
+    audit log stays SQLite-only, byte-for-byte the pre-existing behavior. Setting ``syslog_host``
+    is what turns it on; ``syslog_port``/``syslog_proto``/``syslog_format`` only matter once it is.
+    """
+
+    syslog_host: str = ""
+    syslog_port: int = 514
+    syslog_proto: str = "udp"
+    syslog_format: str = "json"
+
+
+@dataclass
 class SiteConfig:
     """The whole site: WHERE things run (a :class:`Topology`) + how ``deploy`` should run them.
 
@@ -330,6 +356,7 @@ class SiteConfig:
     users: list[UserSpec] = field(default_factory=list)
     secchat_pool: PoolOptions = field(default_factory=PoolOptions)
     secchat_voice: VoiceOptions = field(default_factory=VoiceOptions)
+    audit: AuditOptions = field(default_factory=AuditOptions)
     builds: list[BuildSpec] = field(default_factory=list)
     path: Path | None = None
 
@@ -553,6 +580,40 @@ class SiteConfig:
                 "leave it empty (plan §2.5 point 4)."
             )
 
+        # Optional top-level [audit] — syslog/SIEM forwarding for SecRouter's audit log (AU
+        # 3.3.x; see docs/compliance.md). Additive (silently ignored before this parser existed),
+        # same fail-loud unknown-key/value discipline as every other optional table above.
+        audit_table = data.get("audit") or {}
+        if not isinstance(audit_table, dict):
+            errors.append("[audit] must be a table")
+            audit_table = {}
+        unknown_audit = sorted(k for k in audit_table if k not in AUDIT_TABLE_KEYS)
+        if unknown_audit:
+            errors.append(
+                f"[audit]: unknown key(s) {', '.join(unknown_audit)} "
+                f"(expected: {', '.join(sorted(AUDIT_TABLE_KEYS))})"
+            )
+        audit_opts = AuditOptions(
+            syslog_host=str(audit_table.get("syslog_host", "")).strip(),
+            syslog_port=int(audit_table.get("syslog_port", 514)),
+            syslog_proto=str(audit_table.get("syslog_proto", "udp")).strip().lower(),
+            syslog_format=str(audit_table.get("syslog_format", "json")).strip().lower(),
+        )
+        if audit_opts.syslog_proto not in AUDIT_VALID_PROTOS:
+            errors.append(
+                f"[audit]: syslog_proto {audit_opts.syslog_proto!r} must be one of: "
+                f"{', '.join(sorted(AUDIT_VALID_PROTOS))}"
+            )
+        if audit_opts.syslog_format not in AUDIT_VALID_FORMATS:
+            errors.append(
+                f"[audit]: syslog_format {audit_opts.syslog_format!r} must be one of: "
+                f"{', '.join(sorted(AUDIT_VALID_FORMATS))}"
+            )
+        if audit_opts.syslog_host and not (1 <= audit_opts.syslog_port <= 65535):
+            errors.append(
+                f"[audit]: syslog_port {audit_opts.syslog_port} must be between 1 and 65535"
+            )
+
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
         # rather than one tangled into the other (see validate() below).
@@ -560,7 +621,7 @@ class SiteConfig:
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
             deploy_options=deploy_options, users=users, secchat_pool=secchat_pool,
-            secchat_voice=secchat_voice, builds=builds, path=path,
+            secchat_voice=secchat_voice, audit=audit_opts, builds=builds, path=path,
         )
         site.validate()
         if errors:
@@ -747,5 +808,15 @@ class SiteConfig:
             out.append(f"media_port = {voice.media_port}")
             out.append(f"control_port = {voice.control_port}")
             out.append(f"max_legs_per_session = {voice.max_legs_per_session}")
+            out.append("")
+        aud = self.audit
+        if aud.syslog_host:
+            out.append("# Optional syslog/SIEM forwarding for SecRouter's audit log (AU-3.3.x) —")
+            out.append("# see docs/compliance.md. Absent/empty syslog_host = no syslog sink (default).")
+            out.append("[audit]")
+            out.append(f'syslog_host = "{aud.syslog_host}"')
+            out.append(f"syslog_port = {aud.syslog_port}")
+            out.append(f'syslog_proto = "{aud.syslog_proto}"')
+            out.append(f'syslog_format = "{aud.syslog_format}"')
             out.append("")
         return "\n".join(out).rstrip() + "\n"
