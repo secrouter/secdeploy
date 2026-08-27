@@ -416,6 +416,43 @@ def test_secllm_endpoints_multi_instance(tmp_path):
     ]
 
 
+def test_secllm_endpoints_replicated_single_host(tmp_path):
+    # [groups.inference] instances = 2 on ONE resource: one endpoint per replica, consecutive
+    # ports, first replica's URL byte-identical to the pre-replica single-instance form.
+    p = tmp_path / "topology.toml"
+    p.write_text(GPU_SPLIT.replace(
+        '[groups.inference]\nresource = "gpu"',
+        '[groups.inference]\nresource = "gpu"\ninstances = 2'))
+    topo = Topology.load(p, Manifest.load(ROOT / "suite.toml"))
+    assert wiring.secllm_endpoints(topo) == [
+        "http://secllm.sec.internal:11400/v1",
+        "http://secllm-2.sec.internal:11401/v1",
+    ]
+    # the egress rule authorizes every replica's host:port
+    rules = wiring.secrouter_egress_rules(topo)
+    assert rules[0]["allowedHost"] == [
+        "secllm.sec.internal:11400", "secllm-2.sec.internal:11401"]
+
+
+def test_secllm_container_endpoints_readdress_local_and_remote(tmp_path):
+    # The containerized macOS SecRouter's view of the pool: local instances via
+    # host.docker.internal (suite DNS is host-only), remote ones via their raw address.
+    p = tmp_path / "topology.toml"
+    p.write_text(GPU_SPLIT.replace(
+        '[groups.inference]\nresource = "gpu"',
+        '[groups.inference]\nresources = ["core", "gpu"]\ninstances = 2'))
+    topo = Topology.load(p, Manifest.load(ROOT / "suite.toml"))
+    assert wiring.secllm_container_endpoints(topo, "core") == [
+        "http://host.docker.internal:11400/v1",
+        "http://host.docker.internal:11401/v1",
+        "http://10.0.0.6:11400/v1",
+        "http://10.0.0.6:11401/v1",
+    ]
+    # same order as the FQDN form — SecRouter's round-robin cursor is positional
+    assert len(wiring.secllm_container_endpoints(topo, "core")) == \
+        len(wiring.secllm_endpoints(topo))
+
+
 def test_env_for_secrouter_gets_secllm_endpoints_pool(tmp_path):
     topo = _multi_topo(tmp_path)
     env = topo.env_for("secrouter")

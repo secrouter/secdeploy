@@ -166,8 +166,8 @@ def fronted_instances(
             continue
         if not c.port or not topology.is_fronted(name):
             continue
-        for instance_name, _res, addr in topology.instances(name):
-            result.append((topology.fqdn(instance_name), addr, c.port))
+        for instance_name, _res, addr, port in topology.instances(name):
+            result.append((topology.fqdn(instance_name), addr, port))
     return result
 
 
@@ -197,13 +197,13 @@ def landing_page_html(
         # analysis, driven by CLI/CI, 404 at "/") — see the GitHub footer below instead.
         if name in ("secproxy", "secdns", "secagent") or not c.port:
             continue
-        for instance_name, _res, _addr in topology.instances(name):
+        for instance_name, _res, _addr, iport in topology.instances(name):
             fqdn = topology.fqdn(instance_name)
             if name == "secllm":
                 # Never fronted (inference dials direct, see fronted_instances) — plain HTTP,
-                # its own port, no secproxy/edge TLS in front of it. /admin is its model console
-                # (load/switch models) — nothing useful at "/" itself.
-                services.append((f"http://{fqdn}:{c.port}/admin", fqdn, c.role))
+                # its own (per-replica) port, no secproxy/edge TLS in front of it. /admin is its
+                # model console (load/switch models) — nothing useful at "/" itself.
+                services.append((f"http://{fqdn}:{iport}/admin", fqdn, c.role))
             elif topology.is_fronted(name):
                 # secrouter has no useful landing page of its own at "/" — its actual UI is
                 # the admin console at /admin.
@@ -724,8 +724,34 @@ def secllm_endpoints(topology: Topology, without: list[str] | None = None) -> li
     """Every SecLLM instance's OpenAI-compatible base URL (``https://<fqdn>:<port>/v1``) — the
     backend pool SecRouter reads as ``SECROUTER_SECLLM_ENDPOINTS`` (also set automatically in
     ``env_for("secrouter")``/``env_text``). SecLLM is stateless, so N instances need no
-    coordination — one URL per resource the inference tier is placed on."""
+    coordination — one URL per resource the inference tier is placed on, times the tier's
+    per-resource replica count (each replica on its own port — see ``Topology.instances``)."""
     return topology.instance_urls("secllm", without, path="/v1")
+
+
+def secllm_container_endpoints(
+    topology: Topology, resource: str, without: list[str] | None = None,
+) -> list[str]:
+    """The SecLLM pool as seen from INSIDE a Docker container running on ``resource`` — the
+    macOS compose SecRouter's view (deploy/macos/compose.yaml). :func:`secllm_endpoints`'s
+    FQDN form only resolves via the HOST's resolver (macOS ``/etc/resolver``, served by
+    SecDNS), which a container can't see, so each instance is re-addressed:
+
+    * an instance on ``resource`` itself → ``http://host.docker.internal:<port>/v1`` (Docker's
+      own host alias — SecLLM always runs natively on macOS, never containerized);
+    * an instance on any OTHER resource → ``http://<that resource's raw address>:<port>/v1``
+      (an IP or externally-resolvable name from topology.toml — no suite-DNS dependency).
+
+    Same order as :func:`secllm_endpoints` (SecRouter's round-robin cursor is positional).
+    Empty exactly when :func:`secllm_endpoints` is."""
+    if "secllm" not in topology.manifest.select(without):
+        return []
+    return [
+        ("http://host.docker.internal:{p}/v1" if res == resource
+         else "http://{a}:{p}/v1").format(p=port, a=addr)
+        for _name, res, addr, port in topology.instances("secllm")
+        if port
+    ]
 
 
 def secrouter_egress_rules(

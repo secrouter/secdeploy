@@ -155,6 +155,14 @@ is host-side, so the **containers** (SecCert/SecRouter) still resolve peers thro
 issue on macOS (see [TLS on macOS](#tls-on-macos-the-same-eval-limitation-as-secrecorder)). For
 real inference and a FIPS crypto boundary, use `fedora-fips`.
 
+**Multiple SecLLM instances on this one Mac** — `[groups.inference] instances = N` in
+`topology.toml`/`secsite.toml` installs one launchd service per replica (`secllm` on 11400,
+`secllm-2` on 11401, …), all sharing the backend/admin-token/autostart config, and the deploy
+rewrites the compose SecRouter's `SECROUTER_SECLLM_ENDPOINTS` to the container-effective pool
+(`host.docker.internal:<port>` per local replica) so it round-robins across them —
+breaker-aware, with per-replica `/v1/models` health probes. See
+[topology.md § Per-resource replicas](topology.md#per-resource-replicas-instances--n).
+
 SecRecorder is installed and started as a launchd daemon too. For a one-off foreground run
 instead (e.g. `--no-native-services`, or to watch its output):
 

@@ -68,6 +68,17 @@ resource = "gpu"
 # Standing up each instance's secllm service is opt-in: `secdeploy deploy fedora-fips
 # --resource gpu --with-inference` (off by default — it's a heavyweight GPU service; without
 # the flag, secdeploy still generates the DNS + env wiring above for an externally-run SecLLM).
+#
+# PER-RESOURCE replicas — several SecLLM instances on ONE host (parallel capacity on a single
+# box; SecRouter round-robins across them, breaker- and health-aware). Add `instances = N` to
+# the group: each resource then runs N replicas on consecutive ports (11400, 11401, ...),
+# named secllm, secllm-2, ... (or secllm-<res>, secllm-<res>-2, ... when the tier also spans
+# several resources). Only the stateless inference tier accepts N > 1. Automated on the macOS
+# target (one launchd service per replica); fedora-fips still brings up only the first.
+#
+#   [groups.inference]
+#   resource = "gpu"
+#   instances = 2
 
 # ── Single-host variant ──────────────────────────────────────────────────────────────
 # For one machine, define a single resource and point every tier at it:
