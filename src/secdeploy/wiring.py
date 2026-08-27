@@ -377,7 +377,14 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
       :func:`fronted_instances`), proxying straight to its real ``host:port`` so nginx's upstream
       dial bypasses DNS/itself rather than looping back through the very front door it's serving.
       Each carries the standard ``X-Forwarded-*``/``X-Real-IP``/``Host`` reverse-proxy headers and
-      the WebSocket ``Upgrade``/``Connection`` pair.
+      the WebSocket ``Upgrade``/``Connection`` pair;
+    * on the **SecSSO** server block only, a root ``/.well-known/openid-configuration`` alias:
+      the suite's verifiers pin the bare-root issuer (``issuer_mode: global`` — see
+      :func:`secrouter_oidc_config`), but Authentik serves discovery docs only under
+      ``/application/o/<slug>/``, so standard discovery against the root (e.g. SecRouter's
+      admin-ui login) would 404 without it. It serves the canonical ``secrouter`` provider's
+      doc, whose ``issuer`` field IS the root (``secsso/blueprints/secrouter-oidc.yaml`` pins
+      that provider ``issuer_mode: global`` for exactly this).
 
     Deterministic manifest order, so the output is stable/testable.
 
@@ -467,6 +474,12 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             "\t}",
             "",
         ]
+    # SecSSO's fronted names — its server block additionally aliases the root OIDC discovery
+    # path (see the docstring bullet). Instance-name based, same as fronted_instances' fqdns.
+    secsso_fqdns = (
+        {topology.fqdn(iname) for iname, _res, _addr in topology.instances("secsso")}
+        if "secsso" in topology.manifest.select(without) else set()
+    )
     for fqdn, addr, port in fronted:
         lines += [
             "\tserver {",
@@ -477,6 +490,26 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             f"\t\tssl_certificate {cert_dir}/fullchain.pem;",
             f"\t\tssl_certificate_key {cert_dir}/privkey.pem;",
             "",
+        ]
+        if fqdn in secsso_fqdns:
+            lines += [
+                "\t\t# Root OIDC discovery: the suite's verifiers pin the bare-root issuer",
+                "\t\t# (issuer_mode: global), but Authentik only serves discovery docs under",
+                "\t\t# /application/o/<slug>/ — so serve the canonical `secrouter` provider's doc",
+                "\t\t# (its issuer field IS this root; secsso/blueprints/secrouter-oidc.yaml) at",
+                "\t\t# the root path, for standard discovery like SecRouter's admin-ui login.",
+                "\t\tlocation = /.well-known/openid-configuration {",
+                f"\t\t\tproxy_pass http://{addr}:{port}"
+                "/application/o/secrouter/.well-known/openid-configuration;",
+                "\t\t\tproxy_http_version 1.1;",
+                "\t\t\tproxy_set_header Host $host;",
+                "\t\t\tproxy_set_header X-Real-IP $remote_addr;",
+                "\t\t\tproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+                "\t\t\tproxy_set_header X-Forwarded-Proto $scheme;",
+                "\t\t}",
+                "",
+            ]
+        lines += [
             "\t\tlocation / {",
             f"\t\t\tproxy_pass http://{addr}:{port};",
             "\t\t\tproxy_http_version 1.1;",

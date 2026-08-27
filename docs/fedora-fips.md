@@ -253,6 +253,12 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
 These values match `secsso.sh`'s own `oidc-config`/`secagent-config` output exactly (both
 derive from the same SecSSO external URL), so the two never disagree.
 
+The bare-root issuer serves a real discovery document too: Authentik only publishes
+`/.well-known/openid-configuration` under `/application/o/<slug>/`, so the generated secproxy
+nginx config aliases the root path on SecSSO's vhost to the canonical `secrouter` provider's
+doc (whose `issuer` field is this root — `issuer_mode: global`). SecRouter's admin-console
+login discovers its endpoints through exactly this alias.
+
 ### Native SecChat turnkey env
 
 The native **SecChat** (the canonical `secchat` stack — SSO login, tamper-evident audit,

@@ -30,12 +30,12 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 
 [components.secsso]
 repo = "secrouter/secsso"
-# Pinned at the exact-sub service-identity branch (svc-secagent/svc-secchat app-password
-# grants + SECAGENT_SVC_APP_PASSWORD/SECCHAT_SVC_APP_PASSWORD env — this repo's
-# wiring.sync_secagent_service_secret/sync_secchat_env composites depend on those blueprints).
-# Repin to main once secrouter/secsso's feat/service-subject-subs merges, then to a release tag
-# at the next suite release.
-ref = "feat/service-subject-subs"
+# Pinned at the global-issuer-anchor branch (secsso PR #10): the secrouter provider's
+# issuer_mode: global, which the root well-known alias in this repo's generated secproxy nginx
+# conf serves as the bare-root issuer's discovery doc (see wiring.nginx_conf_text). The
+# exact-sub service-identity work (feat/service-subject-subs) is already on main. Repin to
+# main once PR #10 merges, then to a release tag at the next suite release.
+ref = "feat/global-issuer-anchor"
 kind = "stack"
 tier = "identity"
 port = 9000

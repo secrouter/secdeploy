@@ -263,10 +263,28 @@ def test_nginx_conf_text_websocket_map_and_upgrade_headers(tmp_path):
     assert "map $http_upgrade $connection_upgrade {" in text
     assert "proxy_set_header Upgrade $http_upgrade;" in text
     assert "proxy_set_header Connection $connection_upgrade;" in text
-    # standard reverse-proxy headers on every fronted block
-    assert text.count("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;") == len(FRONTED)
-    assert text.count("proxy_set_header X-Forwarded-Proto $scheme;") == len(FRONTED)
-    assert text.count("proxy_set_header Host $host;") == len(FRONTED)
+    # standard reverse-proxy headers on every fronted block, plus once more in secsso's extra
+    # root-discovery location (see test_nginx_conf_text_secsso_root_oidc_discovery)
+    assert text.count("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;") == len(FRONTED) + 1
+    assert text.count("proxy_set_header X-Forwarded-Proto $scheme;") == len(FRONTED) + 1
+    assert text.count("proxy_set_header Host $host;") == len(FRONTED) + 1
+
+
+def test_nginx_conf_text_secsso_root_oidc_discovery(tmp_path):
+    # SecSSO's server block (and ONLY its block) aliases the bare-root OIDC discovery path to
+    # the canonical `secrouter` provider's doc — the suite's verifiers pin the root issuer
+    # (issuer_mode: global) but Authentik serves discovery only under /application/o/<slug>/.
+    topo = _edge_topo(tmp_path)
+    text = wiring.nginx_conf_text(topo, CERT_DIR)
+    assert text.count("location = /.well-known/openid-configuration {") == 1
+    assert ("proxy_pass http://10.0.0.5:9000"
+            "/application/o/secrouter/.well-known/openid-configuration;") in text
+    # inside the secsso server block, before any other fronted block
+    secsso_block = text.split("server_name secsso.sec.internal;")[1].split("server {")[0]
+    assert "location = /.well-known/openid-configuration {" in secsso_block
+    # dropping secsso drops the alias with it
+    without = wiring.nginx_conf_text(topo, CERT_DIR, ["secsso"])
+    assert "openid-configuration" not in without
 
 
 def test_nginx_conf_text_port_80_acme_webroot_and_redirect(tmp_path):
