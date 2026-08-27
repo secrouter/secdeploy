@@ -1432,3 +1432,136 @@ def test_sync_secchat_env_adds_pool_keys_when_configured(tmp_path):
     assert vals["SECCHAT_POOL_IMAGE"] == "reg/secchat-runnerd:1"
     assert vals["SECCHAT_SESSION_SECRET"] == "keep"  # non-managed still untouched
     assert "SECCHAT_POOL_IMAGE" in written
+
+
+# ── secchat_voice_env / sync_secchat_env(voice=)/mediad_compose_override/secchat_compose_override:
+#    the 1:1 voice-call media relay (secchat-mediad) — plan §2.5/§3.5, docs/voice.md. ──────────────
+from secdeploy.site import VoiceOptions  # noqa: E402
+
+
+def _voice(**kw) -> VoiceOptions:
+    base = dict(enabled=True, advertise_addr="192.168.5.1")
+    base.update(kw)
+    return VoiceOptions(**base)
+
+
+def test_secchat_voice_env_disabled_is_empty(tmp_path):
+    assert wiring.secchat_voice_env(VoiceOptions(), _topo(tmp_path)) == {}
+
+
+def test_secchat_voice_env_carries_transcribe_url_mediad_url_and_stun(tmp_path):
+    env = wiring.secchat_voice_env(_voice(), _topo(tmp_path))
+    # SecRecorder is placed (collab tier) in GPU_SPLIT ⇒ a real topology URL, not a stub.
+    assert env["SECCHAT_TRANSCRIBE_URL"] == "http://secrecorder.sec.internal:47003"
+    assert env["SECCHAT_MEDIAD_URL"] == "http://mediad:47021"
+    assert env["SECCHAT_MEDIAD_ADVERTISE_ADDR"] == "192.168.5.1"
+    # STUN default is empty — never a public server (CUI/air-gap posture, plan §2.5 point 4).
+    assert env["SECCHAT_CALL_STUN"] == ""
+    assert env["SECCHAT_MEDIAD_TOKEN"]  # generated, non-empty
+
+
+def test_secchat_voice_env_omits_transcribe_url_when_secrecorder_withheld(tmp_path):
+    env = wiring.secchat_voice_env(_voice(), _topo(tmp_path), without=["secrecorder"])
+    assert "SECCHAT_TRANSCRIBE_URL" not in env
+    # Everything else voice still needs is unaffected by secrecorder being withheld.
+    assert env["SECCHAT_MEDIAD_URL"] == "http://mediad:47021"
+
+
+def test_secchat_voice_env_uses_configured_control_port_and_stun(tmp_path):
+    env = wiring.secchat_voice_env(_voice(control_port=48000, stun="stun.internal:3478"), _topo(tmp_path))
+    assert env["SECCHAT_MEDIAD_URL"] == "http://mediad:48000"
+    assert env["SECCHAT_CALL_STUN"] == "stun.internal:3478"
+
+
+def test_secchat_voice_env_token_idempotent_across_calls(tmp_path):
+    # No operator-set token, nothing existing yet ⇒ a fresh one is minted.
+    topo = _topo(tmp_path)
+    first = wiring.secchat_voice_env(_voice(), topo)
+    # A second call with the FIRST call's env as `existing` (redeploy shape) must keep it —
+    # a live mediad's bearer must never rotate out from under it on a routine redeploy.
+    second = wiring.secchat_voice_env(_voice(), topo, existing=first)
+    assert second["SECCHAT_MEDIAD_TOKEN"] == first["SECCHAT_MEDIAD_TOKEN"]
+    # An operator-set token always wins over both the existing value and generation.
+    explicit = wiring.secchat_voice_env(_voice(token="operator-set-token"), topo, existing=first)
+    assert explicit["SECCHAT_MEDIAD_TOKEN"] == "operator-set-token"
+
+
+def test_sync_secchat_env_adds_voice_keys_and_keeps_token_stable_across_redeploys(tmp_path):
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n")
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_OIDC_CLIENT_SECRET=SEED\nSECCHAT_SESSION_SECRET=keep\n")
+    first = wiring.sync_secchat_env(secsso_env, secchat_env, topo, voice=_voice())
+    vals1 = _env_dict(secchat_env)
+    assert vals1["SECCHAT_MEDIAD_ADVERTISE_ADDR"] == "192.168.5.1"
+    assert vals1["SECCHAT_TRANSCRIBE_URL"] == "http://secrecorder.sec.internal:47003"
+    assert "SECCHAT_MEDIAD_TOKEN" in first
+    token1 = vals1["SECCHAT_MEDIAD_TOKEN"]
+    # Redeploy: the token already on disk must survive, not rotate.
+    wiring.sync_secchat_env(secsso_env, secchat_env, topo, voice=_voice())
+    vals2 = _env_dict(secchat_env)
+    assert vals2["SECCHAT_MEDIAD_TOKEN"] == token1
+    assert vals2["SECCHAT_SESSION_SECRET"] == "keep"  # non-managed still untouched
+
+
+def test_mediad_compose_override_shape():
+    override = wiring.mediad_compose_override(_voice())
+    assert "  mediad:\n" in override
+    assert "image: secchat-mediad:local\n" in override
+    assert '"47020:47020/udp"' in override and '"47020:47020/tcp"' in override
+    assert "MEDIAD_TOKEN: ${SECCHAT_MEDIAD_TOKEN}" in override
+    assert "MEDIAD_ADVERTISE_ADDR: ${SECCHAT_MEDIAD_ADVERTISE_ADDR}" in override
+    # mediad's config.go reads *_ADDR (":<port>"), not *_PORT — these must match or the
+    # container binds the defaults while the compose ports/env silently disagree.
+    assert 'MEDIAD_MEDIA_ADDR: ":47020"' in override
+    assert 'MEDIAD_CONTROL_ADDR: ":47021"' in override
+    assert 'MEDIAD_MAX_LEGS_PER_SESSION: "8"' in override  # mediad's own default, emitted explicitly
+    # The control API (:47021) is never PUBLISHED (no "47021:..." port mapping) — it's
+    # compose-internal only, reached via SECCHAT_MEDIAD_URL, not a host port.
+    assert '"47021:' not in override
+    assert "recordings:/var/lib/mediad/recordings" in override
+    assert "recordings:/var/lib/secchat/recordings" in override
+    assert "recordings: {}" in override
+
+
+def test_mediad_compose_override_custom_ports_match_published_ports():
+    # An operator-configured voice.media_port/control_port must reach mediad's actual bind addrs
+    # (MEDIAD_MEDIA_ADDR/MEDIAD_CONTROL_ADDR), not silently diverge from the published ports.
+    override = wiring.mediad_compose_override(_voice(media_port=48000, control_port=48001))
+    assert 'MEDIAD_MEDIA_ADDR: ":48000"' in override
+    assert 'MEDIAD_CONTROL_ADDR: ":48001"' in override
+    assert '"48000:48000/udp"' in override and '"48000:48000/tcp"' in override
+    assert '"47020:' not in override
+
+
+def test_mediad_compose_override_carries_configured_max_legs():
+    # A larger group-call cap must reach mediad's MEDIAD_MAX_LEGS_PER_SESSION, not stay at 8.
+    override = wiring.mediad_compose_override(_voice(max_legs_per_session=16))
+    assert 'MEDIAD_MAX_LEGS_PER_SESSION: "16"' in override
+
+
+def test_secchat_compose_override_empty_when_neither_active():
+    assert wiring.secchat_compose_override(None, None) == ""
+    assert wiring.secchat_compose_override(_pool(), VoiceOptions()) == ""  # pool w/o create_service_account
+
+
+def test_secchat_compose_override_pool_only_matches_pool_compose_override():
+    p = _pool(create_service_account=True)
+    combined = wiring.secchat_compose_override(p, None)
+    assert "./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro" in combined
+    assert "mediad:" not in combined
+    assert "recordings" not in combined
+
+
+def test_secchat_compose_override_merges_pool_and_voice_into_one_file():
+    # Compose only auto-merges ONE compose.override.yaml — both features' content must coexist
+    # in a single `services:`/`volumes:` document, not clobber one another.
+    p = _pool(create_service_account=True)
+    v = _voice()
+    combined = wiring.secchat_compose_override(p, v)
+    assert "  mediad:\n" in combined
+    assert "./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro" in combined
+    assert "recordings:/var/lib/secchat/recordings" in combined
+    assert combined.count("services:") == 1
+    assert combined.count("secchat:") == 1  # ONE secchat entry carrying both volume sets

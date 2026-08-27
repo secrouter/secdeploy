@@ -192,6 +192,23 @@ When enabled, `deploy` does two things at the SecChat wiring step:
    tighten it with real `to:` ipBlocks for your cluster. See
    [secchat's docs/agent-pool.md](https://github.com/secrouter/secchat/blob/main/docs/agent-pool.md).
 
+## Optional: 1:1 voice calls (secchat-mediad + SecRecorder)
+
+A `[secchat.voice]` table turns on SecChat's **1:1 voice calls** — a `mediad` compose service
+(server-side WebRTC media relay + recorder) alongside SecChat, plus the env that points SecChat at
+it and at SecRecorder for per-leg transcription. Off unless you add the section.
+
+```toml
+[secchat.voice]
+enabled = true
+advertise_addr = "192.168.5.1"   # REQUIRED — the suite host's cross-host-reachable address
+```
+
+`secrecorder` must also **not** be in `[deploy].without` — voice transcription is one more caller
+of its `/v1/audio/transcriptions` endpoint. See [voice.md](voice.md) for the full picture: the new
+`recordings` volume, the `:47020` UDP+TCP media port and its colima caveat, why the control API is
+never published, and why `stun` must stay suite-local/empty (never a public STUN server).
+
 ## Precedence and back-compat
 
 `secdeploy verify` / `plan` / `deploy` / `bundle` all resolve the active site config the same

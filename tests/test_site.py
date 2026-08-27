@@ -501,3 +501,84 @@ def test_secchat_pool_round_trips_through_to_toml(tmp_path):
 def test_bare_config_emits_no_pool_section(tmp_path):
     # A pool-less site never writes a [secchat.pool] block (keeps bare configs clean).
     assert "[secchat.pool]" not in _site(tmp_path, BARE).to_toml()
+
+
+# ── [secchat.voice] — the 1:1 voice-call media relay (secchat-mediad). Mirrors the [secchat.pool]
+#    coverage above: defaults, full-field parse, required-field/unknown-key rejection, round-trip,
+#    bare-config cleanliness. See docs/voice.md / docs/plans/voice-calls-plan.md §2.5. ────────────
+SITE_VOICE = BARE + """
+[secchat.voice]
+enabled = true
+image = "registry.internal/secchat-mediad:1.0.0"
+token = "shared-bearer"
+stun = "stun.internal:3478"
+advertise_addr = "192.168.5.1"
+media_port = 48020
+control_port = 48021
+max_legs_per_session = 12
+"""
+
+
+def test_secchat_voice_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.secchat_voice.enabled is False
+    assert site.secchat_voice.advertise_addr == ""
+    assert site.secchat_voice.image == "secchat-mediad:local"  # the default
+    assert site.secchat_voice.media_port == 47020
+    assert site.secchat_voice.control_port == 47021
+    assert site.secchat_voice.max_legs_per_session == 8  # mediad's own default
+
+
+def test_secchat_voice_parses_all_fields(tmp_path):
+    voice = _site(tmp_path, SITE_VOICE).secchat_voice
+    assert voice.enabled is True
+    assert voice.image == "registry.internal/secchat-mediad:1.0.0"
+    assert voice.token == "shared-bearer"
+    assert voice.stun == "stun.internal:3478"
+    assert voice.advertise_addr == "192.168.5.1"
+    assert voice.media_port == 48020
+    assert voice.control_port == 48021
+    assert voice.max_legs_per_session == 12
+
+
+def test_secchat_voice_enabled_without_advertise_addr_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="advertise_addr is required"):
+        _site(tmp_path, BARE + "\n[secchat.voice]\nenabled = true\n")
+
+
+def test_secchat_voice_rejects_max_legs_below_two(tmp_path):
+    # A cap below 2 rejects even a 1:1 call (caller + callee = two legs) at mediad — catch it at
+    # config-load time rather than letting every call fail at runtime.
+    with pytest.raises(ValueError, match="max_legs_per_session must be >= 2"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n'
+                               'max_legs_per_session = 1\n')
+
+
+def test_secchat_voice_rejects_a_public_stun_default(tmp_path):
+    # A public STUN server leaks call metadata + client IPs off-suite — the v3.1 REQUIRED default
+    # (plan §2.5 point 4). Must be rejected, not silently accepted.
+    with pytest.raises(ValueError, match="looks like a public STUN server"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n'
+                               'stun = "stun.l.google.com:19302"\n')
+
+
+def test_secchat_voice_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secchat.voice\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nbogus = 1\n')
+
+
+def test_secchat_voice_round_trips_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_VOICE)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.secchat_voice == site.secchat_voice
+
+
+def test_bare_config_emits_no_voice_section(tmp_path):
+    assert "[secchat.voice]" not in _site(tmp_path, BARE).to_toml()
+
+
+def test_secchat_pool_and_voice_can_coexist(tmp_path):
+    # [secchat] carries both sub-tables at once without either rejecting the other.
+    site = _site(tmp_path, SITE_POOL + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n')
+    assert site.secchat_pool.enabled is True
+    assert site.secchat_voice.enabled is True

@@ -190,14 +190,20 @@ def build_push_runnerd_image(pool, work: Path) -> str | None:
     return dig or image_ref
 
 
-def provision_pool_credentials(pool, secchat_dir: Path) -> bool:
+def provision_pool_credentials(pool, secchat_dir: Path, voice=None) -> bool:
     """(``[secchat.pool].create_service_account``) Extract the pool ServiceAccount's token + the
     cluster CA from the token Secret the manifests created, write them (0600) to
     ``<secchat_dir>/pool-sa/``, and drop a ``compose.override.yaml`` that mounts them into the
     SecChat container at the standard in-cluster credential paths. Returns whether the credential
     was provisioned. Retries briefly — the token controller populates the Secret asynchronously.
     Best-effort like the other pool steps: a failure warns with what to run by hand and never
-    aborts the deploy."""
+    aborts the deploy.
+
+    ``voice`` (the optional ``[secchat.voice]`` media relay) is folded into the SAME
+    ``compose.override.yaml`` via :func:`wiring.secchat_compose_override` when given/enabled —
+    Compose only auto-merges ONE override file, so this is also the place that writes it when
+    BOTH features are active (see :func:`write_mediad_compose`, this module's voice-only
+    counterpart, for the no-pool-credential case)."""
     import base64
     import time
 
@@ -226,10 +232,22 @@ def provision_pool_credentials(pool, secchat_dir: Path) -> bool:
         path = sa_dir / name
         path.write_bytes(data)
         path.chmod(0o600)
-    (secchat_dir / "compose.override.yaml").write_text(wiring.pool_compose_override(pool))
+    (secchat_dir / "compose.override.yaml").write_text(wiring.secchat_compose_override(pool, voice))
     P.log("pool: extracted the ServiceAccount credential → work/secchat/pool-sa/ and wrote "
-          "compose.override.yaml (mounted into SecChat at the in-cluster paths)")
+          "compose.override.yaml (mounted into SecChat at the in-cluster paths"
+          + (" + the mediad voice service" if voice is not None and voice.enabled else "") + ")")
     return True
+
+
+def write_mediad_compose(voice, secchat_dir: Path) -> None:
+    """(``[secchat.voice].enabled``, no pool ServiceAccount credential) Drop
+    ``compose.override.yaml`` adding the ``mediad`` media-relay service + the new ``recordings``
+    volume (:func:`wiring.mediad_compose_override`). The pool-credential counterpart
+    (:func:`provision_pool_credentials`) writes the SAME file when a pool ServiceAccount is ALSO
+    being provisioned — call exactly one of the two per deploy (never both), since either would
+    otherwise clobber the other's compose.override.yaml (Compose auto-merges only one)."""
+    (secchat_dir / "compose.override.yaml").write_text(wiring.mediad_compose_override(voice))
+    P.log("voice: wrote compose.override.yaml (mediad media relay + the new `recordings` volume)")
 
 
 def apply_pool_manifests(pool, pool_path: str) -> None:

@@ -849,6 +849,7 @@ def deploy(
     inference_backend: str = "auto",
     users=None,
     secchat_pool=None,
+    secchat_voice=None,
     site_builds=None,
 ) -> None:
     without = without or []
@@ -1071,12 +1072,14 @@ def deploy(
         # NB: a distinct name — NOT `written` — so this doesn't clobber the addressing dict from
         # write_addressing() above, which the deploy-audit call below still needs as `addressing=`.
         written_secchat = wiring.sync_secchat_env(
-            work / "secsso" / ".env", work / "secchat" / ".env", topology, without, pool=secchat_pool)
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without,
+            pool=secchat_pool, voice=secchat_voice)
         if written_secchat:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(written_secchat)} keys)")
         # Optional Kubernetes agent pool: emit the cluster manifests, and (when apply is set) apply
         # them for the operator instead of leaving them as inert JSON.
+        pool_sa_provisioned = False
         if secchat_pool is not None and secchat_pool.enabled:
             pool_path = wiring.write_pool_manifests(secchat_pool, base_out / "addressing")
             if pool_path:
@@ -1086,9 +1089,19 @@ def deploy(
                     common.apply_pool_manifests(secchat_pool, pool_path)
                 # Out-of-cluster SecChat: extract the SA token + CA and mount them into the compose
                 # service (compose.override.yaml) — BEFORE the stacks bring-up below, so the secchat
-                # container starts with its cluster credential in place.
+                # container starts with its cluster credential in place. Folds the voice media
+                # relay's mediad service into the SAME compose.override.yaml when also enabled
+                # (Compose auto-merges only one override file — see provision_pool_credentials).
                 if secchat_pool.apply and secchat_pool.create_service_account:
-                    common.provision_pool_credentials(secchat_pool, work / "secchat")
+                    pool_sa_provisioned = common.provision_pool_credentials(
+                        secchat_pool, work / "secchat", voice=secchat_voice)
+        # Voice media relay (secchat-mediad), when enabled and NOT already folded into the pool's
+        # compose.override.yaml above (either no pool SA credential is being provisioned, or that
+        # step failed) — writes mediad's own compose.override.yaml with just the media-relay
+        # service + the new `recordings` volume. BEFORE the stacks bring-up below, same as the
+        # pool credential mount, so `mediad` exists in the compose project from the first `up`.
+        if secchat_voice is not None and secchat_voice.enabled and not pool_sa_provisioned:
+            common.write_mediad_compose(secchat_voice, work / "secchat")
 
     # SecRecorder (a NATIVE service, not a stack) turnkey SSO. Same early-seed + SecSSO-co-placement
     # requirement as the SecChat block above, but adapted to a native service: there's no stack .env

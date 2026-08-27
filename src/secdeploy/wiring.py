@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .manifest import Manifest
-from .site import PoolOptions, SiteConfig, UserSpec
+from .site import PoolOptions, SiteConfig, UserSpec, VoiceOptions
 from .topology import Topology
 
 # The default `authorizedClassifications` for the SecRouter egress rules secrouter_egress_rules()
@@ -839,6 +839,64 @@ def secchat_pool_env(
     return env
 
 
+def secchat_voice_env(
+    voice: VoiceOptions, topology: Topology, existing: dict[str, str] | None = None,
+    without: list[str] | None = None, scheme: str = "https",
+) -> dict[str, str]:
+    """The ``SECCHAT_*`` env for the optional 1:1 voice-call media relay (secsite.toml's
+    ``[secchat.voice]``) — see ``docs/plans/voice-calls-plan.md`` §2.5/§3.5 (secchat repo).
+    Empty when voice is disabled, exactly like :func:`secchat_pool_env`.
+
+    - ``SECCHAT_TRANSCRIBE_URL``: SecRecorder's own topology URL (:meth:`Topology.urls`) — unset
+      (not an empty string) when SecRecorder isn't placed/is withheld, so the backend's own
+      "transcription unavailable" fallback decides what to do, rather than secdeploy asserting
+      an empty-string URL is meaningful.
+    - ``SECCHAT_MEDIAD_URL``: mediad's compose-internal control-API base URL — fixed
+      ``http://mediad:<control_port>`` (the compose service name IS the DNS name on the stack's
+      own network; never published, see :func:`mediad_compose_override`).
+    - ``SECCHAT_MEDIAD_TOKEN``: the shared control-API bearer. **Idempotent-once-set**, the same
+      discipline ``common.ensure_stack_secrets`` uses for the stack's other generated secrets —
+      an operator-set ``[secchat.voice].token`` wins, else a value ALREADY in secchat's ``.env``
+      (``existing``) is kept so redeploys never rotate a live mediad's bearer out from under it,
+      else a fresh :func:`secrets.token_urlsafe` is minted. The mediad compose service reads the
+      SAME key via compose's automatic ``.env`` interpolation (:func:`mediad_compose_override`)
+      — one value, one file, no second secret store.
+    - ``SECCHAT_CALL_STUN``: ``voice.stun`` verbatim — empty by default (suite-local/none, NEVER
+      a public STUN server; see :class:`~secdeploy.site.VoiceOptions` / plan §2.5 point 4 — the
+      CUI/air-gap posture this default protects). Written even when empty so an operator's
+      earlier non-empty value is explicitly cleared, not left stale, if they blank it out.
+    - ``SECCHAT_MEDIAD_ADVERTISE_ADDR``: ``voice.advertise_addr`` — required by
+      :meth:`SiteConfig.load`'s validation whenever ``voice.enabled``, so this is always
+      non-empty here; also consumed by mediad itself via compose ``.env`` interpolation.
+    - ``SECCHAT_MEDIAD_RECORDINGS_DIR``: fixed ``/var/lib/secchat/recordings`` — the secchat
+      CONTAINER's mount path for the shared ``recordings`` volume (:func:`mediad_compose_override`'s
+      ``"      - recordings:/var/lib/secchat/recordings\\n"`` line; mediad's own mount path differs,
+      ``/var/lib/mediad/recordings`` — only the volume identity has to match, not the path, same
+      "NAMED volume, legitimately different mount paths" note as ``uploads``). Without this the
+      secchat backend has a volume mounted but no configured path to read it from: a recorded
+      call's mixed file is never ingested as an attachment and no leg can be read for transcription
+      (secchat repo's calls/registry.ts `CallRegistryDeps.recordingsDir`) — this is what makes the P2
+      exit test (a transcript message landing in the DM) actually pass end-to-end. Not derived from
+      any ``VoiceOptions`` field — it's a fixed container-internal path, same instinct as
+      ``SECCHAT_MEDIAD_URL``'s fixed ``http://mediad:<port>``.
+    """
+    if not voice.enabled:
+        return {}
+    existing = existing or {}
+    env: dict[str, str] = {}
+    transcribe_url = (topology.urls(without, scheme).get("SECRECORDER", "") or "").rstrip("/")
+    if transcribe_url:
+        env["SECCHAT_TRANSCRIBE_URL"] = transcribe_url
+    env["SECCHAT_MEDIAD_URL"] = f"http://mediad:{voice.control_port}"
+    env["SECCHAT_MEDIAD_TOKEN"] = (
+        voice.token or existing.get("SECCHAT_MEDIAD_TOKEN") or secrets.token_urlsafe(32)
+    )
+    env["SECCHAT_CALL_STUN"] = voice.stun
+    env["SECCHAT_MEDIAD_ADVERTISE_ADDR"] = voice.advertise_addr
+    env["SECCHAT_MEDIAD_RECORDINGS_DIR"] = "/var/lib/secchat/recordings"
+    return env
+
+
 def k8s_pool_manifests(pool: PoolOptions) -> dict[str, object]:
     """The Kubernetes manifests SecDeploy emits for an enabled agent pool, as a ``v1/List`` object
     (``kubectl apply -f`` applies every item). Namespace + a Role granting SecChat's ServiceAccount
@@ -989,6 +1047,81 @@ def pool_compose_override(pool: PoolOptions) -> str:
     )
 
 
+def mediad_compose_override(voice: VoiceOptions) -> str:
+    """The ``mediad``-only slice of ``compose.override.yaml`` — the media-relay compose service
+    plus the NEW ``recordings`` volume (distinct from ``uploads``, which mounts to ``secchat``
+    only today) mounted rw on both ``mediad`` and ``secchat``. Plan §2.5/§3.5 (secchat repo).
+
+    ``mediad``'s ``MEDIAD_TOKEN``/``MEDIAD_ADVERTISE_ADDR`` are NOT hardcoded here — they're
+    ``${SECCHAT_MEDIAD_TOKEN}``/``${SECCHAT_MEDIAD_ADVERTISE_ADDR}`` compose-variable
+    interpolations, resolved from the stack's OWN ``.env`` (Compose reads the project directory's
+    ``.env`` for substitution automatically, the same file :func:`sync_secchat_env` writes those
+    two keys into via ``voice=``) — one value, one file, no second secret store to keep in sync.
+    The control API (``:47021``) is deliberately NEVER published — compose-internal network only,
+    reachable solely from the ``secchat`` container, per the plan's control-API isolation
+    requirement. Media (``:47020``) publishes BOTH ``udp`` and ``tcp`` on the SAME port number
+    (Pion ``ICEUDPMux`` + ``SetICETCPMux`` fallback) — see the colima UDP caveat below.
+
+    Standalone: when ``[secchat.pool].create_service_account`` is ALSO enabled, don't write this
+    directly to ``compose.override.yaml`` — call :func:`secchat_compose_override` (which this
+    delegates to, with ``pool=None``) instead, passing both, so they merge into ONE file (Compose
+    merges exactly one ``compose.override.yaml`` automatically; a second file would silently
+    clobber it, not add to it)."""
+    return secchat_compose_override(None, voice)
+
+
+def secchat_compose_override(pool: PoolOptions | None, voice: VoiceOptions | None) -> str:
+    """The FULL ``compose.override.yaml`` body for however many of the pool-SA-mount
+    (:func:`pool_compose_override`) and mediad (:func:`mediad_compose_override`) features are
+    active — Compose auto-merges exactly ONE ``compose.override.yaml``, so both must land in the
+    same file rather than each writer clobbering the other's. Returns ``""`` when neither applies
+    (nothing to write — callers should skip writing the file, not write an empty/inert one)."""
+    pool_active = pool is not None and pool.create_service_account
+    voice_active = voice is not None and voice.enabled
+    if not pool_active and not voice_active:
+        return ""
+    header = "# GENERATED by secdeploy ([secchat.pool]/[secchat.voice]) — do not edit.\n"
+    secchat_volumes: list[str] = []
+    body_lines: list[str] = [header, "services:\n"]
+    if voice_active:
+        body_lines += [
+            "  mediad:\n",
+            f"    image: {voice.image}\n",
+            # mediad writes recordings that the secchat backend (a DIFFERENT uid) ingests,
+            # transcribes, and deletes on the SHARED `recordings` volume. Run mediad with secchat's
+            # GID (the node base image's 1000) so its group-rwx session dirs (mediad/manager.go's
+            # 0770) are readable + cleanable by secchat — without this the backend hits EACCES on
+            # every recording. mediad keeps its own uid (999) so it still owns the volume root.
+            '    user: "999:1000"\n',
+            "    environment:\n",
+            "      MEDIAD_TOKEN: ${SECCHAT_MEDIAD_TOKEN}\n",
+            "      MEDIAD_ADVERTISE_ADDR: ${SECCHAT_MEDIAD_ADVERTISE_ADDR}\n",
+            f"      MEDIAD_MEDIA_ADDR: \":{voice.media_port}\"\n",
+            f"      MEDIAD_CONTROL_ADDR: \":{voice.control_port}\"\n",
+            # Participant cap per call. Emitted as a literal (like the ports above), not a .env
+            # interpolation — it's non-secret site config, one value, resolved at write time.
+            f'      MEDIAD_MAX_LEGS_PER_SESSION: "{voice.max_legs_per_session}"\n',
+            "    ports:\n",
+            "      # colima UDP forwarding is not at parity with the TCP publish — see docs/voice.md\n",
+            f'      - "{voice.media_port}:{voice.media_port}/udp"\n',
+            f'      - "{voice.media_port}:{voice.media_port}/tcp"\n',
+            "    volumes:\n",
+            "      - recordings:/var/lib/mediad/recordings\n",
+            "    restart: unless-stopped\n",
+        ]
+        secchat_volumes.append("      - recordings:/var/lib/secchat/recordings\n")
+    if pool_active:
+        secchat_volumes += [
+            "      - ./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro\n",
+            "      - ./pool-sa/ca.crt:/var/run/secrets/kubernetes.io/serviceaccount/ca.crt:ro\n",
+            "      - ./pool-sa/namespace:/var/run/secrets/kubernetes.io/serviceaccount/namespace:ro\n",
+        ]
+    body_lines += ["  secchat:\n", "    volumes:\n", *secchat_volumes]
+    if voice_active:
+        body_lines += ["volumes:\n", "  recordings: {}\n"]
+    return "".join(body_lines)
+
+
 def image_build_argv(context_dir: str | Path, dockerfile: str | Path, ref: str,
                      platform: str = "") -> list[str]:
     """Generic ``docker build`` argv for a site ``[[builds]]`` entry: dockerfile + tag + optional
@@ -1034,7 +1167,7 @@ def kubectl_apply_argv(manifest_path: str | Path, context: str = "") -> list[str
 def sync_secchat_env(
     secsso_env_path: str | Path, secchat_env_path: str | Path,
     topology: Topology, without: list[str] | None = None, scheme: str = "https",
-    pool: PoolOptions | None = None,
+    pool: PoolOptions | None = None, voice: VoiceOptions | None = None,
 ) -> list[str] | None:
     """Make the native SecChat's stack ``.env`` turnkey: mirror the OIDC login-client secret SecSSO
     generated and write the topology-derived OIDC/gateway env into ``work/secchat/.env``.
@@ -1050,6 +1183,13 @@ def sync_secchat_env(
     mirror), plus the ``env_for("secchat")`` topology values (issuer, audience, client id, SecChat's
     own public URL, SecRouter's URL). ``SECCHAT_SESSION_SECRET`` (the session-cookie signing key) is
     deliberately NOT managed here — it stays blank for ``deploy_stacks``' generic seed to fill.
+
+    ``voice`` (:class:`~secdeploy.site.VoiceOptions`, the optional 1:1 voice-call media relay)
+    adds ``SECCHAT_TRANSCRIBE_URL``/``SECCHAT_MEDIAD_URL``/``SECCHAT_MEDIAD_TOKEN``/
+    ``SECCHAT_CALL_STUN``/``SECCHAT_MEDIAD_ADVERTISE_ADDR``/``SECCHAT_MEDIAD_RECORDINGS_DIR`` — same
+    OUTSIDE-the-managed-key-filter treatment as ``pool``'s ``SECCHAT_POOL_*`` env
+    (:func:`secchat_voice_env`); absent/disabled ⇒ no keys added, so the existing behavior (and its
+    test) is unchanged.
 
     Returns the sorted list of keys written, or ``None`` if either file is missing or SecSSO
     hasn't generated the secret yet (stack never seeded).
@@ -1069,6 +1209,12 @@ def sync_secchat_env(
     # so the existing managed-only behavior (and its test) is unchanged.
     if pool is not None:
         to_write.update(secchat_pool_env(pool, topology, without, scheme))
+    # The optional voice media relay's env (SECCHAT_TRANSCRIBE_URL/SECCHAT_MEDIAD_*/
+    # SECCHAT_CALL_STUN) — same treatment, and reads the file's OWN current values first so a
+    # once-generated SECCHAT_MEDIAD_TOKEN survives redeploys instead of rotating (see
+    # secchat_voice_env's docstring).
+    if voice is not None:
+        to_write.update(secchat_voice_env(voice, topology, _read_env_values(secchat_env_path), without, scheme))
     _set_env_keys(secchat_env_path, to_write)
     return sorted(to_write)
 

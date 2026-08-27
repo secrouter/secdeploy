@@ -29,10 +29,13 @@ def test_kinds_and_optional_flags():
     assert m.components["secsso"].kind == "stack"
     assert m.components["secchat"].kind == "stack"
     assert m.components["secrouter"].kind == "service"
-    assert m.optionals() == ["seccert", "secsso", "secdns", "secproxy"]
+    assert m.optionals() == ["seccert", "secsso", "secdns", "secrecorder", "secproxy"]
     assert m.components["seccert"].optional and m.components["secsso"].optional
     assert m.components["secdns"].optional and m.components["secdns"].kind == "service"
     assert not m.components["secrouter"].optional
+    # SecRecorder is optional infra (an eval instance can drop it via [deploy].without when
+    # voice calls aren't in scope) but fronted like every other collab-tier service.
+    assert m.components["secrecorder"].optional and m.components["secrecorder"].fronted
     assert m.components["secproxy"].optional and m.components["secproxy"].kind == "service"
     # SecChat (the native rebuild) is a required collab-tier stack, fronted at :443.
     assert not m.components["secchat"].optional
