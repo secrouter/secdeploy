@@ -876,29 +876,32 @@ def deploy(
                     P.log(f"secllm autostart: {', '.join(autostart_models)} — downloaded (if not "
                           "already cached) and loaded the moment the service starts")
 
-    # SecSSO's SECAGENT_SERVICE_CLIENT_SECRET (secsso/blueprints/secagent-service.yaml's
-    # client_credentials provider) must exist BEFORE secagent's own block below can mirror it
-    # into SECAGENT_CLIENT_SECRET — seed it here rather than waiting for the stacks bring-up
-    # later in this function (too late for THIS deploy's secagent env), using the same
-    # generate-if-blank pass deploy_stacks itself uses (so a fresh deploy's first run already
-    # has the matching secret, not just a redeploy's second pass).
+    # SecSSO's SECAGENT_SVC_APP_PASSWORD (secsso/blueprints/secagent-service.yaml's
+    # svc-secagent service-account app-password) must exist BEFORE secagent's own block below
+    # can derive SECAGENT_CLIENT_SECRET from it — seed it here rather than waiting for the
+    # stacks bring-up later in this function (too late for THIS deploy's secagent env), using
+    # the same generate-if-blank pass deploy_stacks itself uses (so a fresh deploy's first run
+    # already has the matching secret, not just a redeploy's second pass).
     if not dry_run and with_agent and placed and "secsso" in placed and "secsso" not in without:
         common.ensure_stack_secrets(work, ["secsso"])
         secrets_path = root / "deploy" / "macos" / "secrets.env"
         synced = wiring.sync_secagent_service_secret(work / "secsso" / ".env", secrets_path)
         if synced:
-            P.log(f"secagent: SECAGENT_CLIENT_SECRET synced from SecSSO's generated service "
-                  f"client secret → {secrets_path}")
+            P.log(f"secagent: SECAGENT_CLIENT_SECRET derived from SecSSO's svc-secagent "
+                  f"app-password (sub=svc-secagent composite) → {secrets_path}")
         elif secrets_path.exists():
             current = _parse_env_file(secrets_path).get("SECAGENT_CLIENT_SECRET", "")
-            provisioned = _parse_env_file(work / "secsso" / ".env").get(
-                "SECAGENT_SERVICE_CLIENT_SECRET", "")
-            if current and provisioned and current != provisioned:
+            app_password = _parse_env_file(work / "secsso" / ".env").get(
+                "SECAGENT_SVC_APP_PASSWORD", "")
+            expected = (wiring.service_client_secret("svc-secagent", app_password)
+                        if app_password else "")
+            if current and expected and current != expected:
                 P.warn(f"secagent: {secrets_path}'s SECAGENT_CLIENT_SECRET doesn't match "
-                       "SecSSO's provisioned secagent client secret — `secagent token` will "
-                       "fail with invalid_client. Blank the line to auto-sync on the next "
-                       "deploy, or set it to match work/secsso/.env's "
-                       "SECAGENT_SERVICE_CLIENT_SECRET yourself.")
+                       "SecSSO's provisioned svc-secagent app-password composite — `secagent "
+                       "token` will fail with invalid_client (or authenticate with a stale "
+                       "identity whose sub isn't svc-secagent). Blank the line to auto-sync on "
+                       "the next deploy, or run work/secsso's `./bootstrap/secsso.sh "
+                       "secagent-config` and set it to the printed value yourself.")
 
     # Native SecChat (a compose stack) turnkey env: mirror SecSSO's generated OIDC login-client
     # secret and write the topology-derived OIDC/gateway env into work/secchat/.env BEFORE the

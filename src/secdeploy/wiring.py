@@ -15,6 +15,7 @@ synthesis, so everything documented above still holds.
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import secrets
@@ -572,14 +573,23 @@ def secrouter_oidc_config(
     is meant to be read and merged into ``security.oidc`` there by the operator (see
     :func:`write_addressing`, which writes it to ``secrouter-oidc.json`` for exactly that).
 
-    Values mirror secsso's own ``bootstrap/secsso.sh oidc-config``/``secagent-config`` output
-    exactly, so the two never disagree: ``issuer``/``jwksUri`` are derived from SecSSO's
+    Values mirror secsso's own ``bootstrap/secsso.sh oidc-config``/``secagent-config`` output,
+    so the two never disagree: ``issuer``/``jwksUri`` are derived from SecSSO's
     topology address (``https://secsso.<domain>:<port>/`` — same base :func:`secllm_endpoints`-
     style derivation every other cross-component URL in this module uses; if your SecSSO's own
     external URL differs from that convention, e.g. a reverse proxy on a different port, adjust
-    accordingly). ``audience`` is the SecRouter client id (``"secrouter"``). ``serviceSubjects``
-    always includes ``"svc-secagent"`` — SecAgent's non-interactive service account, which
-    otherwise trips ``requireMfa`` (client_credentials tokens can't carry an MFA assertion).
+    accordingly). ``audience`` is the SecRouter client id (``"secrouter"``).
+
+    ``serviceSubjects`` names the suite's non-interactive service accounts, which otherwise
+    trip ``requireMfa`` (client_credentials tokens can't carry an MFA assertion): always
+    ``"svc-secagent"``, plus ``"svc-secchat"`` when SecChat is placed in this topology. These
+    are the EXACT ``sub`` claims the secsso blueprints issue — each service authenticates via
+    Authentik's creds-path grant against a pre-provisioned service account with
+    ``sub_mode: user_username`` (see ``secsso/blueprints/secagent-service.yaml`` /
+    ``secchat-service.yaml``), so the names here are what live tokens actually carry, not
+    aspirations. ``svc-secchat`` is additionally a ``delegatingSubjects`` member: SecChat
+    forwards the acting end-user via ``X-Sec-Acting-User`` so SecRouter attributes
+    policy/budget/audit to that user.
 
     Empty when SecSSO isn't in this topology at all (nothing to configure).
     """
@@ -589,12 +599,22 @@ def secrouter_oidc_config(
         return {}
     issuer = f"{secsso_url}/"
     service_subjects = ["svc-secagent"]
+    delegating_subjects: list[str] = []
+    if urls.get("SECCHAT"):
+        # SecChat's shared service identity (secsso/blueprints/secchat-service.yaml) — one
+        # client_credentials identity for the assistant path + pi. It forwards the acting
+        # end-user via X-Sec-Acting-User (secchat's src/secrouter/client.ts), so it must be a
+        # delegator too — see secrouter's security/types.ts OidcConfig.delegatingSubjects.
+        service_subjects.append("svc-secchat")
+        delegating_subjects.append("svc-secchat")
     fragment: dict[str, object] = {
         "issuer": issuer,
         "audience": "secrouter",
         "jwksUri": f"{issuer}application/o/secrouter/jwks/",
         "serviceSubjects": service_subjects,
     }
+    if delegating_subjects:
+        fragment["delegatingSubjects"] = delegating_subjects
     return fragment
 
 
@@ -625,41 +645,52 @@ def secagent_pi_models_json(
     return result
 
 
+def service_client_secret(svc_username: str, app_password: str) -> str:
+    """The composite ``client_secret`` Authentik's creds-path client_credentials grant expects
+    for a pre-provisioned service account: ``base64("<username>:<app-password>")``. Presenting
+    this — rather than the provider's own stored ``client_secret`` — routes the grant onto
+    ``TokenView.__post_init_client_credentials_creds``, and with ``sub_mode: user_username``
+    the issued ``sub`` is exactly ``svc_username`` (the literal secrouter's
+    ``security.oidc.serviceSubjects``/``delegatingSubjects`` name). See
+    ``secsso/blueprints/secchat-service.yaml``'s header for the full mechanism.
+    """
+    return base64.b64encode(f"{svc_username}:{app_password}".encode()).decode()
+
+
 def sync_secagent_service_secret(
     secsso_env_path: str | Path, secrets_env_path: str | Path,
 ) -> str | None:
-    """Mirror SecSSO's auto-generated ``SECAGENT_SERVICE_CLIENT_SECRET`` (in ``secsso/.env`` —
-    seeded by ``targets/common.ensure_stack_secrets``, read by
-    ``secsso/blueprints/secagent-service.yaml``'s ``!Env`` to provision the confidential
-    ``secagent`` client_credentials provider) into SecAgent's own ``SECAGENT_CLIENT_SECRET``
-    (``deploy/macos/secrets.env`` or the fedora-fips equivalent). The two must be the IDENTICAL
-    value — ``secagent token``'s client_credentials grant authenticates by comparing its
-    ``client_secret`` against exactly what SecSSO's provider was given.
+    """Derive SecAgent's ``SECAGENT_CLIENT_SECRET`` (``deploy/macos/secrets.env`` or the
+    fedora-fips equivalent) from SecSSO's auto-generated ``SECAGENT_SVC_APP_PASSWORD`` (in
+    ``secsso/.env`` — seeded by ``targets/common.ensure_stack_secrets``, read by
+    ``secsso/blueprints/secagent-service.yaml``'s ``!Env`` to provision the pre-provisioned
+    ``svc-secagent`` service account's app-password Token). The written value is
+    :func:`service_client_secret`'s composite ``base64("svc-secagent:<app-password>")`` — NOT
+    the raw password — so ``secagent token``'s client_credentials grant resolves to
+    ``sub="svc-secagent"``, the exact subject ``secrouter_oidc_config``'s ``serviceSubjects``
+    names (same value ``./bootstrap/secsso.sh secagent-config`` prints for a manual hand-off).
 
     Only fills a BLANK ``SECAGENT_CLIENT_SECRET=`` line — the same "blank key = fill me"
     convention :func:`~secdeploy.targets.common._seed_env_secrets` uses for the stacks' own
     secrets — so a value an operator (or an earlier sync) already set is never silently
     overwritten. Returns the synced value, or ``None`` if nothing changed: either file is
-    missing, SecSSO hasn't generated its secret yet (stack never deployed), or SecAgent's own
-    value is already non-blank (including a stale/mismatched one — see the caller's warning).
+    missing, SecSSO hasn't generated its app-password yet (stack never deployed), or SecAgent's
+    own value is already non-blank (including a stale/mismatched one — see the caller's warning).
     """
     secsso_env_path, secrets_env_path = Path(secsso_env_path), Path(secrets_env_path)
     if not secsso_env_path.exists() or not secrets_env_path.exists():
         return None
-    secsso_secret = ""
-    for line in secsso_env_path.read_text().splitlines():
-        if line.strip().startswith("SECAGENT_SERVICE_CLIENT_SECRET="):
-            secsso_secret = line.split("=", 1)[1].strip()
-            break
-    if not secsso_secret:
+    app_password = _read_env_values(secsso_env_path).get("SECAGENT_SVC_APP_PASSWORD", "")
+    if not app_password:
         return None
+    composite = service_client_secret("svc-secagent", app_password)
     lines = secrets_env_path.read_text().splitlines()
     for i, line in enumerate(lines):
         if line.strip() == "SECAGENT_CLIENT_SECRET=":
-            lines[i] = f"SECAGENT_CLIENT_SECRET={secsso_secret}"
+            lines[i] = f"SECAGENT_CLIENT_SECRET={composite}"
             secrets_env_path.write_text("\n".join(lines) + "\n")
             secrets_env_path.chmod(0o600)
-            return secsso_secret
+            return composite
     return None
 
 
@@ -691,13 +722,15 @@ def _set_env_keys(env_path: Path, values: dict[str, str]) -> None:
     env_path.chmod(0o600)
 
 
-# The MANAGED keys secdeploy owns in SecChat's stack .env — mirrored secret from SecSSO +
-# topology-derived OIDC/gateway env. Everything else (SECCHAT_SESSION_SECRET, DATABASE_URL's
-# own PG_PASSWORD, ...) stays blank/untouched for deploy_stacks' generic seed to fill — see
-# secchat's own .env.example.
+# The MANAGED keys secdeploy owns in SecChat's stack .env — mirrored/derived secrets from
+# SecSSO + topology-derived OIDC/gateway env. Everything else (SECCHAT_SESSION_SECRET,
+# DATABASE_URL's own PG_PASSWORD, ...) stays blank/untouched for deploy_stacks' generic seed to
+# fill — see secchat's own .env.example.
 _SECCHAT_MANAGED_KEYS = frozenset({
     "SECCHAT_OIDC_CLIENT_SECRET", "SECCHAT_OIDC_ISSUER", "SECCHAT_OIDC_AUDIENCE",
     "SECCHAT_OIDC_CLIENT_ID", "SECCHAT_PUBLIC_URL", "SECROUTER_URL",
+    "SECCHAT_SECROUTER_TOKEN_URL", "SECCHAT_SECROUTER_CLIENT_ID",
+    "SECCHAT_SECROUTER_CLIENT_SECRET",
 })
 
 
@@ -715,13 +748,25 @@ def sync_secchat_env(
     client secret. So after the early seed we overwrite: ``SECCHAT_OIDC_CLIENT_SECRET`` ← SecSSO's
     ``SECCHATNG_OIDC_CLIENT_SECRET`` (SecChat's confidential login client — its Authentik client id
     stays ``secchatng`` from the rebuild's transitional phase; the backend runs the Authorization
-    Code + PKCE dance itself, server-side, so there's no second client_credentials service secret to
-    mirror), plus the ``env_for("secchat")`` topology values (issuer, audience, client id, SecChat's
-    own public URL, SecRouter's URL). ``SECCHAT_SESSION_SECRET`` (the session-cookie signing key) is
-    deliberately NOT managed here — it stays blank for ``deploy_stacks``' generic seed to fill.
+    Code + PKCE dance itself, server-side), plus the ``env_for("secchat")`` topology values
+    (issuer, audience, client id, SecChat's own public URL, SecRouter's URL).
+    ``SECCHAT_SESSION_SECRET`` (the session-cookie signing key) is deliberately NOT managed
+    here — it stays blank for ``deploy_stacks``' generic seed to fill.
+
+    Also wires SecChat's SecRouter SERVICE identity (its second, client_credentials credential
+    — distinct from the login client above): when SecSSO's ``.env`` carries
+    ``SECCHAT_SVC_APP_PASSWORD`` (read by ``secsso/blueprints/secchat-service.yaml`` to
+    provision the ``svc-secchat`` service account's app-password Token), this writes
+    ``SECCHAT_SECROUTER_TOKEN_URL`` (SecSSO's token endpoint), ``SECCHAT_SECROUTER_CLIENT_ID``
+    (``secchat-service``) and ``SECCHAT_SECROUTER_CLIENT_SECRET`` —
+    :func:`service_client_secret`'s composite ``base64("svc-secchat:<app-password>")``, NOT a
+    random value — so SecChat's grant resolves to ``sub="svc-secchat"``, the exact subject
+    ``secrouter_oidc_config``'s ``serviceSubjects``/``delegatingSubjects`` name. An older
+    SecSSO ``.env`` without the app-password simply skips these three keys (login sync
+    unaffected).
 
     Returns the sorted list of keys written, or ``None`` if either file is missing or SecSSO
-    hasn't generated the secret yet (stack never seeded).
+    hasn't generated the login secret yet (stack never seeded).
     """
     secsso_env_path, secchat_env_path = Path(secsso_env_path), Path(secchat_env_path)
     if not secsso_env_path.exists() or not secchat_env_path.exists():
@@ -732,6 +777,13 @@ def sync_secchat_env(
         return None
     managed = dict(topology.env_for("secchat", without, scheme))
     managed["SECCHAT_OIDC_CLIENT_SECRET"] = client_secret
+    svc_app_password = secsso.get("SECCHAT_SVC_APP_PASSWORD", "")
+    secsso_url = topology.urls(without, scheme).get("SECSSO")
+    if svc_app_password and secsso_url:
+        managed["SECCHAT_SECROUTER_TOKEN_URL"] = f"{secsso_url}/application/o/token/"
+        managed["SECCHAT_SECROUTER_CLIENT_ID"] = "secchat-service"
+        managed["SECCHAT_SECROUTER_CLIENT_SECRET"] = service_client_secret(
+            "svc-secchat", svc_app_password)
     to_write = {k: v for k, v in managed.items() if k in _SECCHAT_MANAGED_KEYS}
     _set_env_keys(secchat_env_path, to_write)
     return sorted(to_write)

@@ -564,16 +564,47 @@ def test_write_addressing_secrouter_egress_path_override(tmp_path):
 
 # ── secrouter_oidc_config: security.oidc fragment for SecSSO issuer_mode: global ────────
 def test_secrouter_oidc_config_shape(tmp_path):
-    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier)
+    topo = _topo(tmp_path)  # secsso is on 'core' (identity tier); secchat on 'core' (collab)
     oidc = wiring.secrouter_oidc_config(topo)
     assert oidc == {
         "issuer": "http://secsso.sec.internal:9000/",
         "audience": "secrouter",
         "jwksUri": "http://secsso.sec.internal:9000/application/o/secrouter/jwks/",
-        # svc-secagent is SecAgent's non-interactive service account (client_credentials tokens
-        # can't carry an MFA assertion, so it's trusted to skip requireMfa).
-        "serviceSubjects": ["svc-secagent"],
+        # The suite's non-interactive service accounts (client_credentials tokens can't carry
+        # an MFA assertion, so they're trusted to skip requireMfa). These are the exact subs
+        # the secsso blueprints' creds-path grants issue (sub_mode: user_username against the
+        # pre-provisioned svc-* users) — svc-secchat only when secchat is in the topology.
+        "serviceSubjects": ["svc-secagent", "svc-secchat"],
+        # SecChat forwards the acting end-user via X-Sec-Acting-User, so it is also a delegator.
+        "delegatingSubjects": ["svc-secchat"],
     }
+
+
+def test_secrouter_oidc_config_without_secchat_has_no_delegators(tmp_path):
+    # A crafted manifest with no secchat at all (it's required in the real suite, so it can't
+    # be dropped via --without): the fragment names only svc-secagent, and no delegators.
+    crafted = (
+        'suite = "1"\n'
+        '[components.secrouter]\nrepo = "o/secrouter"\nref = "v1"\ntier = "gateway"\nport = 47002\n'
+        '[components.secsso]\nrepo = "o/secsso"\nref = "v1"\ntier = "identity"\nport = 9000\n'
+        'optional = true\n'
+        '[targets.fedora-fips]\nkind = "systemd-native"\n'
+    )
+    mpath = tmp_path / "suite.toml"
+    mpath.write_text(crafted)
+    m = Manifest.load(mpath)
+    topo_text = (
+        'domain = "sec.internal"\n'
+        '[resources.core]\ntarget = "fedora-fips"\naddress = "10.0.0.5"\n'
+        '[groups.gateway]\nresource = "core"\n'
+        '[groups.identity]\nresource = "core"\n'
+    )
+    tp = tmp_path / "topology.toml"
+    tp.write_text(topo_text)
+    topo = Topology.load(tp, m)
+    oidc = wiring.secrouter_oidc_config(topo)
+    assert oidc["serviceSubjects"] == ["svc-secagent"]
+    assert "delegatingSubjects" not in oidc
 
 
 def test_secrouter_oidc_config_empty_without_secsso(tmp_path):
@@ -660,21 +691,30 @@ def test_secagent_pi_models_json_against_real_shipped_example():
     assert "kimi" not in {k.lower() for k in result.get("providers", {})}
 
 
-# ── sync_secagent_service_secret: mirrors SecSSO's generated secret into secagent's env ──
+# ── sync_secagent_service_secret: derives secagent's composite client_secret from SecSSO's
+#    svc-secagent app-password (base64("svc-secagent:<pw>") — the creds-path grant that makes
+#    the issued sub exactly "svc-secagent"; see secsso/blueprints/secagent-service.yaml). ──
+def test_service_client_secret_is_the_authentik_creds_composite():
+    import base64
+    composite = wiring.service_client_secret("svc-secagent", "pw123")
+    assert base64.b64decode(composite).decode() == "svc-secagent:pw123"
+
+
 def test_sync_secagent_service_secret_fills_blank_value(tmp_path):
     secsso_env = tmp_path / "secsso.env"
-    secsso_env.write_text("SECAGENT_SERVICE_CLIENT_SECRET=abc123\nOTHER=x\n")
+    secsso_env.write_text("SECAGENT_SVC_APP_PASSWORD=abc123\nOTHER=x\n")
     secrets_env = tmp_path / "secrets.env"
     secrets_env.write_text("SECAGENT_CLIENT_SECRET=\nOTHER_KEY=y\n")
     synced = wiring.sync_secagent_service_secret(secsso_env, secrets_env)
-    assert synced == "abc123"
-    assert "SECAGENT_CLIENT_SECRET=abc123" in secrets_env.read_text()
+    expected = wiring.service_client_secret("svc-secagent", "abc123")
+    assert synced == expected
+    assert f"SECAGENT_CLIENT_SECRET={expected}" in secrets_env.read_text()
     assert "OTHER_KEY=y" in secrets_env.read_text()  # untouched lines survive
 
 
 def test_sync_secagent_service_secret_never_overwrites_non_blank_value(tmp_path):
     secsso_env = tmp_path / "secsso.env"
-    secsso_env.write_text("SECAGENT_SERVICE_CLIENT_SECRET=abc123\n")
+    secsso_env.write_text("SECAGENT_SVC_APP_PASSWORD=abc123\n")
     secrets_env = tmp_path / "secrets.env"
     secrets_env.write_text("SECAGENT_CLIENT_SECRET=already-set\n")
     synced = wiring.sync_secagent_service_secret(secsso_env, secrets_env)
@@ -684,7 +724,7 @@ def test_sync_secagent_service_secret_never_overwrites_non_blank_value(tmp_path)
 
 def test_sync_secagent_service_secret_missing_secsso_secret_is_a_noop(tmp_path):
     secsso_env = tmp_path / "secsso.env"
-    secsso_env.write_text("OTHER=x\n")  # no SECAGENT_SERVICE_CLIENT_SECRET line at all
+    secsso_env.write_text("OTHER=x\n")  # no SECAGENT_SVC_APP_PASSWORD line at all
     secrets_env = tmp_path / "secrets.env"
     secrets_env.write_text("SECAGENT_CLIENT_SECRET=\n")
     assert wiring.sync_secagent_service_secret(secsso_env, secrets_env) is None
@@ -719,7 +759,10 @@ def test_sync_secchat_env_mirrors_secret_and_writes_topology(tmp_path):
     secsso_env = tmp_path / "secsso.env"
     # SecSSO keeps the retained secchatng-named client secret (its Authentik client id stays
     # secchatng even though the app is now "SecChat").
-    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n")
+    secsso_env.write_text(
+        "SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n"
+        "SECCHAT_SVC_APP_PASSWORD=svcpw\n"
+    )
     # As the stack .env looks right after the generic seed randomized the blank mirror-target; a
     # topology key still at its .env.example placeholder; a per-instance secret to preserve.
     secchat_env = tmp_path / "secchat.env"
@@ -740,8 +783,29 @@ def test_sync_secchat_env_mirrors_secret_and_writes_topology(tmp_path):
     assert vals["SECCHAT_OIDC_CLIENT_ID"] == "secchatng"
     assert vals["SECCHAT_PUBLIC_URL"] == "http://secchat.sec.internal:47010"
     assert vals["SECROUTER_URL"] == "http://secrouter.sec.internal:47002"
+    # the SecRouter service identity (client_credentials): token endpoint + the svc-secchat
+    # creds-path composite — never the raw app-password (see secchat-service.yaml's header)
+    assert vals["SECCHAT_SECROUTER_TOKEN_URL"] == \
+        "http://secsso.sec.internal:9000/application/o/token/"
+    assert vals["SECCHAT_SECROUTER_CLIENT_ID"] == "secchat-service"
+    assert vals["SECCHAT_SECROUTER_CLIENT_SECRET"] == \
+        wiring.service_client_secret("svc-secchat", "svcpw")
     # non-managed keys survive untouched
     assert vals["SECCHAT_SESSION_SECRET"] == "keep-me"
+
+
+def test_sync_secchat_env_older_secsso_env_skips_service_identity(tmp_path):
+    # A SecSSO .env from before secchat-service.yaml existed has no SECCHAT_SVC_APP_PASSWORD —
+    # the login sync must still run, just without the three SECCHAT_SECROUTER_* keys.
+    topo = _topo(tmp_path)
+    secsso_env = tmp_path / "secsso.env"
+    secsso_env.write_text("SECCHATNG_OIDC_CLIENT_SECRET=login-abc\n")
+    secchat_env = tmp_path / "secchat.env"
+    secchat_env.write_text("SECCHAT_OIDC_CLIENT_SECRET=\n")
+    written = wiring.sync_secchat_env(secsso_env, secchat_env, topo)
+    assert written is not None and "SECCHAT_OIDC_CLIENT_SECRET" in written
+    assert not any(k.startswith("SECCHAT_SECROUTER_") for k in written)
+    assert "SECCHAT_SECROUTER_CLIENT_SECRET" not in _env_dict(secchat_env)
 
 
 def test_sync_secchat_env_noop_without_secsso_secret(tmp_path):

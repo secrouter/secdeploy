@@ -214,10 +214,12 @@ For the non-interactive (service / CI) path, `/etc/secsuite/secagent.env` (seede
 hand it across:
 
 ```bash
-# On the SecSSO host — confirms the client secret SecSSO's own operator already set in ITS
-# .env (SecSSO provisions this value; secdeploy doesn't mint it):
+# On the SecSSO host — prints the composite base64("svc-secagent:" + SECAGENT_SVC_APP_PASSWORD)
+# derived from the app-password SecSSO's .env provisions (secdeploy doesn't mint it here).
+# Presenting the composite routes the grant onto Authentik's creds path, so the issued token's
+# sub is exactly "svc-secagent" — the subject serviceSubjects below names:
 ./bootstrap/secsso.sh secagent-config
-# → paste the SAME value into SECAGENT_CLIENT_SECRET on the SecAgent host's secagent.env
+# → paste the printed value into SECAGENT_CLIENT_SECRET on the SecAgent host's secagent.env
 ```
 
 Interactive `secagent login` needs no secret here at all — the device-code flow authenticates the
@@ -226,9 +228,14 @@ developer directly.
 ### SecRouter OIDC config fragment
 
 SecSSO's `issuer_mode: global` means every client shares one issuer, so SecRouter needs
-`jwksUri` set explicitly (auto-discovery from `issuer` alone won't resolve) and SecAgent's
-non-interactive service account added to `serviceSubjects` (client_credentials tokens carry no
-MFA assertion, so `svc-secagent` would otherwise trip `requireMfa`). Unlike
+`jwksUri` set explicitly (auto-discovery from `issuer` alone won't resolve) and the suite's
+non-interactive service accounts added to `serviceSubjects` (client_credentials tokens carry no
+MFA assertion, so `svc-secagent`/`svc-secchat` would otherwise trip `requireMfa`). These are
+the EXACT `sub` claims the secsso blueprints issue — each service authenticates via Authentik's
+creds-path grant against a pre-provisioned service account with `sub_mode: user_username` (see
+`secsso/blueprints/secagent-service.yaml` / `secchat-service.yaml`). `svc-secchat` is also a
+`delegatingSubjects` member: SecChat forwards the acting end-user via `X-Sec-Acting-User` so
+SecRouter attributes policy/budget/audit to that user. Unlike
 `SECROUTER_EGRESS_FILE`, this ISN'T env-var-driven — SecRouter's `FREEROUTER_CONFIG` is a
 hand-authored JSON file — so `deploy --with-agent` writes a documented fragment,
 `out/addressing/secrouter-oidc.json`, for you to merge into `security.oidc` by hand:
@@ -238,7 +245,8 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
   "issuer": "https://secsso.<domain>/",
   "audience": "secrouter",
   "jwksUri": "https://secsso.<domain>/application/o/secrouter/jwks/",
-  "serviceSubjects": ["svc-secagent"]
+  "serviceSubjects": ["svc-secagent", "svc-secchat"],
+  "delegatingSubjects": ["svc-secchat"]
 }
 ```
 
@@ -253,9 +261,13 @@ reconciliation. The deploy mirrors SecSSO's generated `SECCHATNG_OIDC_CLIENT_SEC
 `work/secchat/.env`'s `SECCHAT_OIDC_CLIENT_SECRET` and writes the topology-derived
 `SECCHAT_OIDC_ISSUER` / `_AUDIENCE` / `_CLIENT_ID` / `SECCHAT_PUBLIC_URL` / `SECROUTER_URL` there
 too (see `wiring.sync_secchat_env`). SecChat's backend runs the OIDC Authorization Code + PKCE
-exchange itself (a BFF — the browser only ever gets an httpOnly session cookie), so there's no
-second, client_credentials service secret to mirror, and no `svc-secchat` entry in the OIDC
-fragment above. Its SSO client id stays `secchatng` (the retained Authentik client — users only
+exchange itself (a BFF — the browser only ever gets an httpOnly session cookie). The same sync
+also wires SecChat's second, client_credentials SERVICE identity for its SecRouter calls
+(assistant path + pi): `SECCHAT_SECROUTER_TOKEN_URL` / `_CLIENT_ID` (`secchat-service`) /
+`_CLIENT_SECRET` — the latter the composite `base64("svc-secchat:" + SECCHAT_SVC_APP_PASSWORD)`
+derived from SecSSO's `.env`, so SecChat's tokens carry `sub="svc-secchat"`, the OIDC
+fragment's `serviceSubjects`/`delegatingSubjects` entry above. Its SSO client id stays
+`secchatng` (the retained Authentik client — users only
 ever see "SecChat"), so the SecSSO-side env var names (`SECCHATNG_OIDC_CLIENT_SECRET`,
 `SECCHATNG_REDIRECT_URI`, `SECCHATNG_LAUNCH_URL`) keep that slug. `SECCHAT_SESSION_SECRET` (the
 session-cookie signing key) is untouched by this sync — it's seeded blank-to-random the same way

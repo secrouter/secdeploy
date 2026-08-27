@@ -49,8 +49,8 @@ def ensure_stack_secrets(work: Path, stacks: list[str]) -> None:
     """Ensure each stack's ``.env`` exists (from ``.env.example``) and every blank required
     secret in it is filled — the seeding half of :func:`deploy_stacks`, split out so a caller
     that needs a stack's generated secret BEFORE that stack's own bring-up runs later in the
-    same deploy (e.g. SecAgent reading SecSSO's generated ``SECAGENT_SERVICE_CLIENT_SECRET`` to
-    mirror into its own env — see targets/macos.py/fedora_fips.py) can seed it early without
+    same deploy (e.g. SecAgent deriving its client secret from SecSSO's generated
+    ``SECAGENT_SVC_APP_PASSWORD`` — see targets/macos.py/fedora_fips.py) can seed it early without
     duplicating :func:`deploy_stacks`'s secret-generation logic. :func:`deploy_stacks` calls
     this too, so its own seeding pass is then just a no-op (values are already non-blank) —
     every value still originates from exactly one place.

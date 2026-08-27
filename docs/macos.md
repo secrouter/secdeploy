@@ -112,7 +112,9 @@ suppress). See SecAgent's `docs/leanctx.md` for the full security posture.
 
 The native **SecChat** (the canonical `secchat` stack) deploys with the suite — no flag — and its
 env is fully turnkey: when SecSSO is also placed, the deploy mirrors SecSSO's generated OIDC
-login-client secret and writes the topology issuer/audience/client-id/public-url/SecRouter env into
+login-client secret, wires SecChat's `svc-secchat` SecRouter service identity (the
+`SECCHAT_SECROUTER_*` client_credentials env, derived from SecSSO's `SECCHAT_SVC_APP_PASSWORD`),
+and writes the topology issuer/audience/client-id/public-url/SecRouter env into
 `work/secchat/.env` (nothing to reconcile by hand; its SSO client id stays `secchatng`, the retained
 Authentik client — users only ever see "SecChat"). And a `[[users]]` list in your `secsite.toml`
 provisions those accounts in SecSSO with random, must-reset-on-first-login passwords (printed once at
