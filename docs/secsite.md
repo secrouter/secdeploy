@@ -209,6 +209,31 @@ of its `/v1/audio/transcriptions` endpoint. See [voice.md](voice.md) for the ful
 `recordings` volume, the `:47020` UDP+TCP media port and its colima caveat, why the control API is
 never published, and why `stun` must stay suite-local/empty (never a public STUN server).
 
+## Optional: audit syslog forwarding — `[audit]`
+
+A top-level `[audit]` table turns on **syslog/SIEM forwarding** of SecRouter's audit log
+(AU-3.3.x/800-172 SOC integration — see [compliance.md](compliance.md)), in *addition* to its own
+tamper-evident SQLite chain — never a replacement for it. Suite-wide like `[deploy]`, not
+per-resource: there is one audit posture for the deployment.
+
+```toml
+[audit]
+syslog_host = "siem.sec.internal"
+# syslog_port = 514        # default
+# syslog_proto = "udp"     # "udp" or "tcp"
+# syslog_format = "json"   # "json" or "cef"
+```
+
+Absent, or present with an empty `syslog_host`, means no syslog sink at all — the default,
+unchanged behavior. `syslog_proto`/`syslog_format` are validated fail-loud against SecRouter's own
+`SyslogConfig` shape (`udp`/`tcp`, `json`/`cef`).
+
+SecRouter's `SECROUTER_CONFIG` is hand-authored JSON with no env-var turnkey for
+`security.audit` (unlike, say, `SECROUTER_SECLLM_ENDPOINTS`), so `deploy` writes this as a
+documented fragment — `secrouter-audit.json`, alongside the addressing artifacts, printed as
+"merge into security.audit" — for you to fold into SecRouter's config by hand, same treatment as
+its OIDC fragment.
+
 ## Precedence and back-compat
 
 `secdeploy verify` / `plan` / `deploy` / `bundle` all resolve the active site config the same

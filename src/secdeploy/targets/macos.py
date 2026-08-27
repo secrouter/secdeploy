@@ -851,6 +851,7 @@ def deploy(
     secchat_pool=None,
     secchat_voice=None,
     site_builds=None,
+    audit_opts=None,
 ) -> None:
     without = without or []
     users = users or []
@@ -906,7 +907,8 @@ def deploy(
     P.log(f"deploy {NAME} — suite {manifest.suite} (SECSUITE_VERSION passed to compose)")
     written: dict[str, object] | None = None
     if topology is not None and not dry_run and out is not None:
-        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
+        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without,
+                                          audit_opts=audit_opts)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     if dry_run and topology is not None:
         here = ", ".join(services) or "(none)"
@@ -1321,6 +1323,12 @@ def deploy(
                 sp_conf.write_text(wiring.nginx_conf_text(
                     topology, str(sp_cert), without, state_dir=str(sp_state),
                     user=_nginx_conf_user(user)))
+                # No logrotate config is installed here — macOS is a launchd host with no
+                # cron/logrotate by default (unlike fedora-fips, which installs
+                # wiring.logrotate_conf_text()'s output to /etc/logrotate.d/secproxy; see
+                # targets/fedora_fips.py). The macOS-native equivalent is `newsyslog`
+                # (/etc/newsyslog.d/*.conf, driven by periodic(8) — see `man newsyslog.conf`);
+                # wiring it up is left to the operator for this eval target (see docs/macos.md).
                 # Cert BEFORE the checklist/landing page below, so they reflect what actually
                 # landed: certbot's cross-boundary ACME issuance usually can't complete on macOS
                 # (see _issue_secproxy_cert), leaving a self-signed fallback that --trust-ca's
@@ -1339,6 +1347,11 @@ def deploy(
                 )
                 (sp_state / "www" / "index.html").write_text(wiring.landing_page_html(
                     topology, without, setup_actions=setup_actions))
+                # Branded 502/503/504/404 pages (see wiring.error_page_html) — nginx_conf_text's
+                # generated server blocks error_page-route to these, alongside the landing page,
+                # in the same www root.
+                (sp_state / "www" / "5xx.html").write_text(wiring.error_page_html("5xx"))
+                (sp_state / "www" / "404.html").write_text(wiring.error_page_html("404"))
                 secproxy = launchd.LaunchdService(
                     name="secproxy",
                     program_args=[nginx, "-c", str(sp_conf), "-g", "daemon off;"],

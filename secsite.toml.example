@@ -189,6 +189,19 @@ resource = "core"
 # # max_legs_per_session = 8            # MEDIAD_MAX_LEGS_PER_SESSION — participants per call;
 #                                        # raise for larger group calls, must be >= 2
 
+# ── Audit syslog forwarding (optional) ─────────────────────────────────────────────────
+# Suite-wide (like [deploy] above, not per-resource): forwards SecRouter's tamper-evident audit
+# log to a syslog/SIEM sink in ADDITION to its own SQLite chain (AU-3.3.x/800-172 — see
+# docs/compliance.md). Written as a documented `security.audit` fragment (secrouter-audit.json)
+# for you to merge into SecRouter's SECROUTER_CONFIG — not env-var-driven, same as its OIDC
+# fragment. Absent/empty syslog_host = no syslog sink at all (default; unchanged behavior).
+#
+# [audit]
+# syslog_host = "siem.sec.internal"
+# # syslog_port = 514                   # default
+# # syslog_proto = "udp"                # "udp" or "tcp"
+# # syslog_format = "json"              # "json" or "cef"
+
 # ── Container builds (optional) ────────────────────────────────────────────────────────
 # Images the deploy builds from fetched component checkouts (docker layer cache makes re-runs
 # cheap; local-only by default — right for colima/k3s shared runtimes; push = true needs registry).

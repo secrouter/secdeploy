@@ -161,25 +161,52 @@ def _dataclass_fields(obj, section: str, prefix: str, skip: set[str] | None = No
 
 CSS = """
 :root {
-  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  /* "Field console" theme — same tokens as SecRouter's admin-ui.ts and the suite landing page
+     (wiring.landing_page_html). Ship the FULL canonical set (not just what this page currently
+     uses) so a future addition (a pill, a warn banner, ...) doesn't have to invent a color. */
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --bg:#e7e3d8; --panel:#f3f0e8; --panel2:#fbfaf4; --fg:#211f18; --muted:#6c6552;
-  --accent:#4f6a2e; --accent-ink:#f6f3ea; --border:#cdc6b2; --rule:#dad4c2;
-  --shadow:2px 2px 0 rgba(33,31,24,.06); --bad:#8a3b2e; --bad-bg:#f2e2de;
+  --accent:#4f6a2e; --accent-ink:#f6f3ea; --accent-soft:rgba(79,106,46,.18);
+  --ok:#2f5a22; --warn:#8a5a12; --bad:#8a2b1d;
+  --border:#cdc6b2; --rule:#dad4c2; --shadow:2px 2px 0 rgba(33,31,24,.06);
+  --pill-bg:#e2ddcd; --pill-ok-bg:#e3ebd7; --pill-ok-bd:#b9c9a8;
+  --pill-bad-bg:#f0ddd7; --pill-bad-bd:#d8b3aa; --pill-warn-bg:#efe6cf; --pill-warn-bd:#d8c69a;
+  --code-bg:#e2ddcd;
 }
-@media (prefers-color-scheme: dark) { :root {
+:root[data-theme="dark"] {
   --bg:#171511; --panel:#201e17; --panel2:#29271e; --fg:#e8e3d3; --muted:#9a9077;
-  --accent:#94ad50; --accent-ink:#16140e; --border:#3a3730; --rule:#272520;
-  --shadow:2px 2px 0 rgba(0,0,0,.30); --bad:#c96a5a; --bad-bg:#33211d;
-}}
+  --accent:#94ad50; --accent-ink:#16140e; --accent-soft:rgba(148,173,80,.26);
+  --ok:#86b257; --warn:#cb9c3e; --bad:#d4634c;
+  --border:#3a3730; --rule:#272520; --shadow:2px 2px 0 rgba(0,0,0,.30);
+  --pill-bg:#2b2920; --pill-ok-bg:#26331c; --pill-ok-bd:#3f5230;
+  --pill-bad-bg:#37201a; --pill-bad-bd:#5c2f25; --pill-warn-bg:#332a17; --pill-warn-bd:#544321;
+  --code-bg:#2b2920;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#171511; --panel:#201e17; --panel2:#29271e; --fg:#e8e3d3; --muted:#9a9077;
+    --accent:#94ad50; --accent-ink:#16140e; --accent-soft:rgba(148,173,80,.26);
+    --ok:#86b257; --warn:#cb9c3e; --bad:#d4634c;
+    --border:#3a3730; --rule:#272520; --shadow:2px 2px 0 rgba(0,0,0,.30);
+    --pill-bg:#2b2920; --pill-ok-bg:#26331c; --pill-ok-bd:#3f5230;
+    --pill-bad-bg:#37201a; --pill-bad-bd:#5c2f25; --pill-warn-bg:#332a17; --pill-warn-bd:#544321;
+    --code-bg:#2b2920;
+  }
+}
 * { box-sizing:border-box; }
 body { margin:0; font:14px/1.55 var(--sans); background:var(--bg); color:var(--fg);
        background-image:linear-gradient(var(--rule) 1px, transparent 1px);
        background-size:100% 28px; background-attachment:fixed; }
-header { display:flex; align-items:baseline; gap:12px; padding:14px 22px; background:var(--panel);
-         border-bottom:1px solid var(--border); position:sticky; top:0; z-index:2; }
-header h1 { margin:0; font:700 16px var(--mono); }
-header .sub { color:var(--muted); font:12px var(--mono); }
+header { display:flex; align-items:center; gap:12px; padding:14px 22px; background:var(--panel);
+         border-bottom:1px solid var(--border); border-top:3px solid var(--accent);
+         position:sticky; top:0; z-index:2; }
+header .mark { color:var(--fg); flex-shrink:0; }
+header h1 { margin:0; font:700 16px var(--mono); text-transform:uppercase; letter-spacing:.06em; }
+header h1 .sec { color:var(--accent); }
+header .sub { color:var(--muted); font:12px var(--mono); margin-left:auto; }
+.btn.ghost { background:var(--panel2); color:var(--fg); border:1px solid var(--border); }
+.theme-toggle { padding:5px 11px; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }
 main { max-width: 880px; margin: 24px auto 80px; padding: 0 18px; }
 section.card { background:var(--panel); border:1px solid var(--border); border-radius:2px;
                box-shadow:var(--shadow); margin-bottom:22px; padding:16px 18px; }
@@ -201,7 +228,7 @@ button, .btn { font:600 13px var(--sans); padding:8px 14px; border-radius:2px; c
                border:1px solid var(--border); background:var(--panel2); color:var(--fg); }
 button.primary { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
 button.small { padding:3px 9px; font-size:12px; }
-.errors { background:var(--bad-bg); border:1px solid var(--bad); color:var(--bad);
+.errors { background:var(--pill-bad-bg); border:1px solid var(--bad); color:var(--bad);
           border-radius:2px; padding:10px 14px; margin-bottom:18px; font:12.5px var(--mono);
           white-space:pre-wrap; }
 .saved { background:var(--panel); border:1px solid var(--accent); color:var(--accent);
@@ -223,6 +250,22 @@ function addRow(listId, tplId) {
   list.appendChild(div);
 }
 function rmRow(btn) { btn.closest('.row').remove(); }
+
+// Theme (light / dark, follows OS by default, choice persisted) — same frozen contract as
+// wiring.landing_page_html / secrouter's admin-ui.ts: data-theme attr + 'secrouter-theme' key.
+function effectiveTheme() {
+  var a = document.documentElement.getAttribute('data-theme');
+  if (a === 'dark' || a === 'light') return a;
+  return (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+}
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('secrouter-theme', t); } catch (e) {}
+  var b = document.querySelector('.theme-toggle');
+  if (b) b.textContent = effectiveTheme() === 'dark' ? 'LIGHT' : 'DARK';
+}
+function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
+setTheme(effectiveTheme());
 """
 
 
@@ -339,9 +382,27 @@ def render_form(site: SiteConfig, manifest: Manifest, dest: str,
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>secdeploy configure</title><style>{CSS}</style></head>
+<title>secdeploy configure</title><style>{CSS}</style>
+<script>
+/* Apply the saved theme before first paint (no flash). Default = follow OS. Same frozen
+   contract as wiring.landing_page_html / secrouter's admin-ui.ts. */
+(function(){{ try {{ var t = localStorage.getItem('secrouter-theme');
+  if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t); }} catch (e) {{}} }})();
+</script>
+</head>
 <body>
-<header><h1>secdeploy configure</h1><span class="sub">SecRouter Suite — site configuration</span></header>
+<header>
+  <svg class="mark" width="22" height="25" viewBox="0 0 48 56" aria-hidden="true">
+    <polygon points="24,2 44,13 44,37 24,54 4,37 4,13" fill="none" stroke="currentColor"
+             stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M24 28 L24 14 M24 28 L14 38 M24 28 L34 38" stroke="currentColor" stroke-width="2.2"/>
+    <circle cx="24" cy="28" r="5" fill="var(--accent)"/>
+  </svg>
+  <h1><span class="sec">SEC</span>DEPLOY · configure</h1>
+  <span class="sub">SecRouter Suite — site configuration</span>
+  <button class="btn ghost theme-toggle" type="button" title="Toggle light / dark"
+          onclick="toggleTheme()">DARK</button>
+</header>
 <main>
 {banner}
 <form method="post" action="/save">

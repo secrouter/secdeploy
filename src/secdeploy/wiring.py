@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .manifest import Manifest
-from .site import PoolOptions, SiteConfig, UserSpec, VoiceOptions
+from .site import AuditOptions, PoolOptions, SiteConfig, UserSpec, VoiceOptions
 from .topology import Topology
 
 # The default `authorizedClassifications` for the SecRouter egress rules secrouter_egress_rules()
@@ -343,6 +343,70 @@ def landing_page_html(
 """
 
 
+def error_page_html(kind: str) -> str:
+    """A tiny SecRouter-styled error page for nginx's ``error_page`` directive (see
+    :func:`nginx_conf_text`) — so a fronted service that's down, or a path nginx itself can't
+    route, still lands on something that reads as part of the suite rather than nginx's stock
+    white-on-grey default (previously the ONLY unbranded surface on the fronted HTTPS path).
+
+    ``kind`` is ``"5xx"`` (the nginx-ORIGINATED gateway failures — connection refused/timeout;
+    see :func:`nginx_conf_text`'s ``proxy_intercept_errors`` comment for why this deliberately
+    does NOT also catch an upstream's own error responses) or ``"404"``.
+
+    Same "field console" tokens/mono as :func:`landing_page_html`, deliberately NOT reusing its
+    full markup — this is a terse bounce page (wordmark + one-line message), no services table,
+    no theme toggle worth the extra weight — so it stays a tiny, self-contained file (no shared
+    asset path across nginx server blocks/targets, same reasoning as the landing page). OS-only
+    dark mode (``prefers-color-scheme``, no persisted toggle) is enough for a page nobody spends
+    time on.
+    """
+    title, message = {
+        "5xx": ("upstream unavailable", "The service behind this address didn't respond. Try again shortly."),
+        "404": ("not found", "Nothing is served at this address."),
+    }[kind]
+    esc_title = html.escape(title)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+\t<meta charset="utf-8">
+\t<meta name="viewport" content="width=device-width, initial-scale=1">
+\t<title>{esc_title} — SecRouter Suite</title>
+\t<style>
+\t\t:root {{
+\t\t\t--mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+\t\t\t--sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+\t\t\t--bg:#e7e3d8; --panel:#f3f0e8; --fg:#211f18; --muted:#6c6552;
+\t\t\t--accent:#4f6a2e; --border:#cdc6b2; --shadow:2px 2px 0 rgba(33,31,24,.06);
+\t\t}}
+\t\t@media (prefers-color-scheme: dark) {{
+\t\t\t:root {{
+\t\t\t\t--bg:#171511; --panel:#201e17; --fg:#e8e3d3; --muted:#9a9077;
+\t\t\t\t--accent:#94ad50; --border:#3a3730; --shadow:2px 2px 0 rgba(0,0,0,.30);
+\t\t\t}}
+\t\t}}
+\t\t* {{ box-sizing:border-box; }}
+\t\tbody {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+\t\t       font:14px/1.55 var(--sans); background:var(--bg); color:var(--fg); }}
+\t\t.card {{ background:var(--panel); border:1px solid var(--border); border-radius:2px;
+\t\t         box-shadow:var(--shadow); padding:28px 34px; text-align:center; max-width:420px; }}
+\t\t.wordmark {{ font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.14em;
+\t\t             color:var(--muted); margin-bottom:14px; }}
+\t\t.wordmark .sec {{ color:var(--accent); }}
+\t\th1 {{ margin:0 0 8px; font:700 20px var(--mono); text-transform:uppercase; letter-spacing:.04em; }}
+\t\tp {{ margin:0; color:var(--muted); }}
+\t</style>
+</head>
+<body>
+\t<div class="card">
+\t\t<div class="wordmark"><span class="sec">SEC</span>PROXY</div>
+\t\t<h1>{esc_title}</h1>
+\t\t<p>{html.escape(message)}</p>
+\t</div>
+</body>
+</html>
+"""
+
+
 # nginx runs its writable state (pid, logs, temp dirs, the ACME webroot) out of this dir, which
 # the fedora-fips secproxy.service grants via ReadWritePaths under ProtectSystem=strict — so no
 # default nginx path (/var/log/nginx, /var/lib/nginx, /run) is ever touched. This is the
@@ -350,6 +414,36 @@ def landing_page_html(
 # nginx natively too (see targets/macos.py + docs/macos.md) — hardcoding it here is fine, only
 # cert_dir varies.
 _NGINX_STATE_DIR = "/var/lib/secsuite/secproxy"
+
+
+def _error_page_lines(state_dir: str) -> list[str]:
+    """``error_page``/internal-``location`` lines for the branded 5xx/404 pages (see
+    :func:`error_page_html`), repeated verbatim into EVERY server block below (both the landing
+    page's and each fronted proxy's) — nginx resolves an ``error_page`` target URI within the
+    SAME server block that generated the error, so there is no http-level location that could
+    cover all of them from one place.
+
+    Deliberately no ``proxy_intercept_errors on;`` anywhere in this file: that directive is what
+    makes nginx replace an UPSTREAM-generated 4xx/5xx response (e.g. secchat's own JSON error
+    body) with the error_page target too. Left at its default (off), ``error_page`` only ever
+    fires for responses NGINX ITSELF invents — 502 (connection refused), 504 (upstream timeout),
+    503, and a 404 with no matching location/file — never a status code the proxied application
+    chose on purpose. That's exactly the split we want: brand "the upstream didn't answer", never
+    mask a legitimate API error body. The ``location`` blocks are ``internal`` so the pages are
+    only reachable via the error_page rewrite, never dialed directly.
+    """
+    return [
+        "\t\terror_page 502 503 504 /5xx.html;",
+        "\t\terror_page 404 /404.html;",
+        "\t\tlocation = /5xx.html {",
+        "\t\t\tinternal;",
+        f"\t\t\troot {state_dir}/www;",
+        "\t\t}",
+        "\t\tlocation = /404.html {",
+        "\t\t\tinternal;",
+        f"\t\t\troot {state_dir}/www;",
+        "\t\t}",
+    ]
 
 
 def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None = None,
@@ -386,6 +480,10 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
       the root issuer would otherwise 404, since Authentik only ever serves that document under
       ``/application/o/<slug>/...`` (see the loop body for the full explanation; this is what
       unblocks ``secrouter``'s ``admin-ui.ts`` ``login()``).
+    * every server block (landing page + each fronted proxy) also gets branded 502/503/504/404
+      error pages (:func:`error_page_html`, via :func:`_error_page_lines`) instead of nginx's
+      stock pages — see that helper's docstring for why ``proxy_intercept_errors`` is deliberately
+      left off (upstream JSON error bodies must pass through untouched).
 
     Deterministic manifest order, so the output is stable/testable.
 
@@ -420,7 +518,17 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
         "\t# ProtectSystem=strict makes nginx's default /var/log/nginx, /var/lib/nginx and /run",
         "\t# paths read-only — keep every writable path inside the service state dir (granted by",
         "\t# secproxy.service's ReadWritePaths), so no default nginx temp/log/pid path is touched.",
-        f"\taccess_log {state_dir}/access.log;",
+        "\t#",
+        "\t# 'secproxy' log format: nginx's stock 'combined' plus $request_id (correlate a",
+        "\t# request across secproxy + the fronted backend's own logs), $request_time (total",
+        "\t# time nginx spent on the request) and $upstream_response_time (time the upstream",
+        "\t# backend took) — log HYGIENE only; retention/integrity/forwarding is downstream/",
+        "\t# environment-owned (see docs/compliance.md), not something this config enforces.",
+        "\tlog_format secproxy '$remote_addr - $remote_user [$time_local] '",
+        "\t                    '\"$request\" $status $body_bytes_sent '",
+        "\t                    '\"$http_referer\" \"$http_user_agent\" '",
+        "\t                    'rid=$request_id rt=$request_time urt=$upstream_response_time';",
+        f"\taccess_log {state_dir}/access.log secproxy;",
         f"\tclient_body_temp_path {state_dir}/tmp/client_body;",
         f"\tproxy_temp_path {state_dir}/tmp/proxy;",
         f"\tfastcgi_temp_path {state_dir}/tmp/fastcgi;",
@@ -476,6 +584,7 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             "",
             f"\t\troot {state_dir}/www;",
             "\t\tindex index.html;",
+            *_error_page_lines(state_dir),
             "\t}",
             "",
         ]
@@ -524,11 +633,50 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             "\t\t\tproxy_set_header Upgrade $http_upgrade;",
             "\t\t\tproxy_set_header Connection $connection_upgrade;",
             "\t\t}",
+            *_error_page_lines(state_dir),
             "\t}",
             "",
         ]
     lines.append("}")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def logrotate_conf_text(
+    state_dir: str = _NGINX_STATE_DIR, *, service_name: str = "secproxy",
+    owner: str = "secsuite-secproxy",
+) -> str:
+    """logrotate config for secproxy's nginx access/error logs (see :func:`nginx_conf_text`) —
+    fedora-fips installs this to ``/etc/logrotate.d/secproxy`` (systemd hosts run ``logrotate``
+    via a stock ``logrotate.timer``); macOS is a launchd host with no ``cron``/``logrotate`` by
+    default, so ``targets/macos.py`` deliberately skips installing this and only notes the
+    ``newsyslog`` alternative (``/etc/newsyslog.d/``) in a comment instead — see that module.
+
+    ``postrotate`` reloads the service (``systemctl reload <service_name>``, which runs nginx's
+    own ``ExecReload=... nginx -s reload`` — see ``deploy/fedora-fips/systemd/secproxy.service``)
+    so nginx re-opens fresh log files instead of continuing to write to the now-rotated-away
+    ones. A modest, deliberately unopinionated default (daily, 14 rotations, compressed) — actual
+    RETENTION policy and log INTEGRITY/forwarding are downstream/environment-owned (e.g. this
+    suite's own ``[audit]`` syslog sink, or a SIEM tailing these files), not something secdeploy
+    enforces; see docs/compliance.md.
+    """
+    return "\n".join([
+        "# secproxy nginx logs — generated by secdeploy (see wiring.nginx_conf_text). Rotation",
+        "# only: retention policy + log integrity/forwarding are downstream/environment-owned",
+        "# (see docs/compliance.md), not enforced here.",
+        f"{state_dir}/access.log {state_dir}/error.log {{",
+        "\tdaily",
+        "\trotate 14",
+        "\tmissingok",
+        "\tnotifempty",
+        "\tcompress",
+        "\tdelaycompress",
+        f"\tcreate 0640 {owner} {owner}",
+        "\tsharedscripts",
+        "\tpostrotate",
+        f"\t\tsystemctl reload {service_name}.service >/dev/null 2>&1 || true",
+        "\tendscript",
+        "}",
+    ]) + "\n"
 
 
 def env_text(
@@ -636,6 +784,35 @@ def secrouter_oidc_config(
         "serviceSubjects": service_subjects,
     }
     return fragment
+
+
+def secrouter_audit_syslog_config(audit_opts: "AuditOptions | None") -> dict[str, object]:
+    """The ``security.audit`` fragment enabling syslog/SIEM forwarding of SecRouter's audit log
+    (secsite.toml's top-level ``[audit]`` table — AU-3.3.x/800-172 SOC integration; see
+    docs/compliance.md) — matches ``secrouter/src/security/types.ts``'s ``SecurityConfig``
+    ``audit`` shape exactly (``sink``, ``syslog.{host,port,protocol,format}``).
+
+    Same reasoning as :func:`secrouter_oidc_config`: NOT env-var-driven (SecRouter has no
+    turnkey intake for ``security.audit``, unlike ``SECROUTER_SECLLM_ENDPOINTS``/
+    ``SECROUTER_EGRESS_FILE``) — SecRouter's ``SECROUTER_CONFIG`` is hand-authored JSON, so
+    :func:`write_addressing` writes this as a documented fragment (``secrouter-audit.json``) for
+    the operator to merge into ``security.audit``, rather than installing it anywhere.
+
+    Empty when ``audit_opts`` is unset or its ``syslog_host`` is empty — the default, meaning no
+    ``[audit]`` table (or one with no ``syslog_host``) generates nothing, and SecRouter's audit
+    log stays SQLite-only exactly as it always has (``sink`` defaults ``"sqlite"`` there too).
+    """
+    if audit_opts is None or not audit_opts.syslog_host:
+        return {}
+    return {
+        "sink": "both",
+        "syslog": {
+            "host": audit_opts.syslog_host,
+            "port": audit_opts.syslog_port,
+            "protocol": audit_opts.syslog_proto,
+            "format": audit_opts.syslog_format,
+        },
+    }
 
 
 def secagent_pi_models_json(
@@ -1629,6 +1806,7 @@ def write_addressing(
     without: list[str] | None = None,
     *,
     secrouter_egress_path: str | None = None,
+    audit_opts: "AuditOptions | None" = None,
 ) -> dict[str, object]:
     """Write the addressing artifacts for ``resource`` into ``out_dir``.
 
@@ -1644,13 +1822,18 @@ def write_addressing(
     long as they share the same ``--out``). When SecRouter is placed on ``resource`` and SecSSO
     is anywhere in the topology, also writes ``<out_dir>/secrouter-oidc.json`` (see
     :func:`secrouter_oidc_config`) — a documented fragment for the operator to merge, not an
-    installed/consumed file (SecRouter has no env-var turnkey for OIDC). When secproxy is
-    placed on ``resource``, also writes ``<out_dir>/secproxy.nginx.conf`` (see
+    installed/consumed file (SecRouter has no env-var turnkey for OIDC). When SecRouter is
+    placed on ``resource`` and ``audit_opts`` carries a ``syslog_host`` (secsite.toml's
+    ``[audit]`` table), also writes ``<out_dir>/secrouter-audit.json`` (see
+    :func:`secrouter_audit_syslog_config`) — the same documented-fragment-for-the-operator-to-
+    merge treatment as the OIDC fragment, for the identical reason (no env-var turnkey). When
+    secproxy is placed on ``resource``, also writes ``<out_dir>/secproxy.nginx.conf`` (see
     :func:`nginx_conf_text`, cert dir ``/etc/secsuite/secproxy``) — secproxy's reverse-proxy
     config for the topology's fronted services (installed on fedora-fips, pointed at natively on
-    macOS; both targets run nginx). It is resource-specific like the egress/OIDC files above
-    (only the resource secproxy itself runs on needs it), unlike the suite-wide zone. Returns the
-    written paths — note that these last are
+    macOS; both targets run nginx) — plus ``<out_dir>/secproxy.logrotate.conf`` (see
+    :func:`logrotate_conf_text`) for its access/error logs. Both are resource-specific like the
+    egress/OIDC/audit files above (only the resource secproxy itself runs on needs them), unlike
+    the suite-wide zone. Returns the written paths — note that these last are
     generated purely from topology PLACEMENT, the same as everything else here, independent of
     whether a target's ``--with-inference``/``--with-agent`` flag actually installs the
     corresponding service (see ``targets/fedora_fips.py``).
@@ -1665,6 +1848,7 @@ def write_addressing(
 
     egress_path: Path | None = None
     oidc_path: Path | None = None
+    audit_path: Path | None = None
     if "secrouter" in placed:
         rules = secrouter_egress_rules(topology, without)
         if rules:
@@ -1674,13 +1858,20 @@ def write_addressing(
         if oidc:
             oidc_path = rdir / "secrouter-oidc.json"
             oidc_path.write_text(json.dumps(oidc, indent=2) + "\n")
+        audit_fragment = secrouter_audit_syslog_config(audit_opts)
+        if audit_fragment:
+            audit_path = rdir / "secrouter-audit.json"
+            audit_path.write_text(json.dumps(audit_fragment, indent=2) + "\n")
 
     nginx_conf_path: Path | None = None
+    logrotate_conf_path: Path | None = None
     if "secproxy" in placed:
         # secproxy's generated nginx config for the topology's fronted services — installed on
         # fedora-fips, and pointed at natively on macOS (both targets run nginx; see targets/).
         nginx_conf_path = rdir / "secproxy.nginx.conf"
         nginx_conf_path.write_text(nginx_conf_text(topology, "/etc/secsuite/secproxy", without))
+        logrotate_conf_path = rdir / "secproxy.logrotate.conf"
+        logrotate_conf_path.write_text(logrotate_conf_text())
 
     env_paths: dict[str, Path] = {}
     for name in placed:
@@ -1699,6 +1890,10 @@ def write_addressing(
         result["egress"] = egress_path
     if oidc_path is not None:
         result["oidc"] = oidc_path
+    if audit_path is not None:
+        result["audit"] = audit_path
     if nginx_conf_path is not None:
         result["nginx_conf"] = nginx_conf_path
+    if logrotate_conf_path is not None:
+        result["logrotate_conf"] = logrotate_conf_path
     return result

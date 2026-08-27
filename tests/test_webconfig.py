@@ -68,6 +68,26 @@ def test_render_form_contains_every_section_and_help(tmp_path):
     assert "--accent:#4f6a2e" in html and "<link" not in html
 
 
+def test_render_form_matches_the_frozen_theme_contract():
+    html = webconfig.render_form(_single_host_site(), _manifest(), "secsite.toml")
+    # Canonical tokens (spec-a-design.md) — the corrected --bad plus the previously-missing
+    # --ok/--warn and pill tokens, in both light (root) and dark (`[data-theme="dark"]`) form.
+    assert "--bad:#8a2b1d;" in html and "--bad:#d4634c;" in html
+    assert "--ok:#2f5a22;" in html and "--warn:#8a5a12;" in html
+    assert "--pill-ok-bg:#e3ebd7;" in html and "--pill-bad-bg:#f0ddd7;" in html and "--pill-warn-bg:#efe6cf;" in html
+    # Frozen theme mechanics: data-theme override, OS-media fallback guarded to not[data-theme=light],
+    # the pre-paint localStorage read (no flash), and a visible toggle wired to the same key/attr
+    # secrouter's admin-ui.ts / the landing page use.
+    assert ':root[data-theme="dark"]' in html
+    assert ':root:not([data-theme="light"])' in html
+    assert "localStorage.getItem('secrouter-theme')" in html
+    assert 'class="btn ghost theme-toggle"' in html
+    assert "localStorage.setItem('secrouter-theme'" in html
+    # Wordmark + inline hexagon logo (CSS theme-swap via currentColor/var(--accent), no asset files).
+    assert '<span class="sec">SEC</span>DEPLOY' in html
+    assert "polygon points=\"24,2 44,13 44,37 24,54 4,37 4,13\"" in html
+
+
 def test_form_round_trips_to_a_valid_site(tmp_path):
     site, text, errors = webconfig.validate_form(_form(), _manifest(), tmp_path)
     assert errors == []

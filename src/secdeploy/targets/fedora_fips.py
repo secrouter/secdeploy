@@ -31,6 +31,7 @@ from .. import backup as backup_mod
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
+from ..site import AuditOptions
 
 NAME = "fedora-fips"
 KIND = "systemd-native"
@@ -76,6 +77,10 @@ SECRECORDER_ADDRESSING_ENV = ETC / "secrecorder-addressing.env"
 # guarded. nginx links the system OpenSSL — FIPS-validated in FIPS mode — which is why the suite
 # standardized on it for the edge TLS termination (macOS runs the same nginx for its eval).
 SECPROXY_NGINX_CONF = ETC / "nginx-secproxy.conf"
+# secproxy's log-rotation config (see wiring.logrotate_conf_text) — installed to the standard
+# logrotate drop-in dir; systemd's own logrotate.timer picks it up (no separate cron needed).
+# No secret in it either, so it's refreshed unconditionally, same as the nginx conf itself.
+SECPROXY_LOGROTATE = Path("/etc/logrotate.d") / "secproxy"
 # The SAN cert nginx serves — issued from SecCert by certbot at deploy time (see
 # _issue_secproxy_cert), covering all fronted FQDNs; nginx_conf_text points every :443 server
 # block's ssl_certificate/ssl_certificate_key here. Key lands 0600, owned by secsuite-secproxy.
@@ -402,6 +407,14 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              str(addr_dir / "secproxy.nginx.conf"), str(SECPROXY_NGINX_CONF)],
             f"install generated nginx config → {SECPROXY_NGINX_CONF}",
         ))
+        # logrotate config for secproxy's access/error logs (see wiring.logrotate_conf_text) —
+        # no secret, refreshed unconditionally like the nginx conf itself. macOS has no
+        # logrotate/cron by default (launchd host) — see targets/macos.py's own secproxy block
+        # for the newsyslog alternative it documents instead of installing this.
+        steps.append((
+            ["install", "-m", "644", str(addr_dir / "secproxy.logrotate.conf"), str(SECPROXY_LOGROTATE)],
+            f"install secproxy logrotate config → {SECPROXY_LOGROTATE}",
+        ))
         # Landing page (see wiring.landing_page_html) — generated + written to addr_dir alongside
         # the nginx config in deploy(), same pattern as everything else staged there.
         steps.append((
@@ -409,6 +422,14 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              str(addr_dir / "secproxy-index.html"), str(VAR / "secproxy" / "www" / "index.html")],
             f"install landing page → {VAR / 'secproxy' / 'www' / 'index.html'}",
         ))
+        # Branded 502/503/504/404 pages (see wiring.error_page_html) — nginx_conf_text's server
+        # blocks error_page-route to these, alongside the landing page, in the same www root.
+        for kind, fname in (("5xx", "5xx.html"), ("404", "404.html")):
+            steps.append((
+                ["install", "-m", "644", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
+                 str(addr_dir / f"secproxy-{fname}"), str(VAR / "secproxy" / "www" / fname)],
+                f"install {kind} error page → {VAR / 'secproxy' / 'www' / fname}",
+            ))
         if topology is not None:
             steps += _issue_secproxy_cert(topology, without)
     # units — only the selected services, plus the suite target. secagent is skipped: it's an
@@ -458,6 +479,7 @@ def deploy(
     secchat_pool=None,
     secchat_voice=None,
     site_builds=None,
+    audit_opts: AuditOptions | None = None,
 ) -> None:
     users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
@@ -532,6 +554,16 @@ def deploy(
     # authorizing svc-secagent and would be noise otherwise.
     oidc_preview = wiring.secrouter_oidc_config(topology, without) if topology is not None else {}
 
+    # SecRouter's audit-syslog config fragment (security.audit.sink/syslog — secsite.toml's
+    # [audit] table) — same "hand-authored JSON, not env-var turnkey" reasoning as the OIDC
+    # fragment above, so write_addressing() writes it the same way (secrouter-audit.json, for
+    # the operator to merge). Unlike OIDC (only surfaced with --with-agent, since it's about
+    # authorizing svc-secagent specifically), this is surfaced whenever it's actually generated —
+    # syslog forwarding isn't gated behind any deploy flag, only the site config.
+    audit_syslog_preview = (
+        wiring.secrouter_audit_syslog_config(audit_opts) if topology is not None else {}
+    )
+
     # Optional: point this host's resolver at secdns for the internal domain.
     resolver_configured = False
     if configure_resolver and topology is not None:
@@ -566,6 +598,12 @@ def deploy(
             print(f"  · SecRouter OIDC config fragment (merge into security.oidc) would be "
                   f"written → {oidc_path}: issuer={oidc_preview['issuer']!r}, "
                   f"serviceSubjects={oidc_preview['serviceSubjects']!r}")
+        if audit_syslog_preview:
+            audit_syslog_path = (addr_dir / "secrouter-audit.json") if addr_dir else None
+            print(f"  · SecRouter audit syslog config fragment (merge into security.audit) would "
+                  f"be written → {audit_syslog_path}: "
+                  f"{audit_syslog_preview['syslog']['host']}:{audit_syslog_preview['syslog']['port']} "
+                  f"({audit_syslog_preview['syslog']['protocol']}/{audit_syslog_preview['syslog']['format']})")
         if out is not None:
             note = audit.dry_run_note(
                 out, NAME, resource, component_count=len(services) + len(stacks),
@@ -588,7 +626,8 @@ def deploy(
     written: dict[str, object] | None = None
     if addr_dir is not None:
         written = wiring.write_addressing(topology, addr_dir, resource, without,
-                                          secrouter_egress_path=str(SECROUTER_EGRESS_FILE))
+                                          secrouter_egress_path=str(SECROUTER_EGRESS_FILE),
+                                          audit_opts=audit_opts)
         if "secproxy" in services and topology is not None:
             # Landing page (see wiring.landing_page_html) — staged here alongside the nginx
             # config write_addressing just produced; _deploy_steps installs it from this path.
@@ -598,6 +637,10 @@ def deploy(
             (addr_dir / "secproxy-index.html").write_text(
                 wiring.landing_page_html(topology, without, setup_actions=actions)
             )
+            # Branded 502/503/504/404 pages (see wiring.error_page_html) — staged here alongside
+            # the landing page; _deploy_steps installs both into the same www root.
+            (addr_dir / "secproxy-5xx.html").write_text(wiring.error_page_html("5xx"))
+            (addr_dir / "secproxy-404.html").write_text(wiring.error_page_html("404"))
         if "secdns" in services:
             (addr_dir / "secdns.env").write_text(wiring.secdns_env_text(topology, str(SECDNS_ZONE)))
         if "secllm" in services:
@@ -612,6 +655,9 @@ def deploy(
         if secagent_enabled and written.get("oidc"):
             P.log(f"SecRouter OIDC config fragment written → {written['oidc']} "
                   "(merge into security.oidc — see docs/fedora-fips.md)")
+        if written.get("audit"):
+            P.log(f"SecRouter audit syslog config fragment written → {written['audit']} "
+                  "(merge into security.audit — see docs/compliance.md)")
         # SecRecorder (a NATIVE service, not a stack) turnkey SSO — mirror SecSSO's generated OIDC
         # login-client secret into the just-written env/secrecorder.env, and point SecSSO's
         # SecRecorder redirect at this topology's callback. This must run HERE, before the install
