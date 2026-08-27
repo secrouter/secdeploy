@@ -384,7 +384,7 @@ class Topology:
         (client_id ``"secagent"``, ``SECAGENT_LLM__API_KEY="!secagent token"`` — never a secret, a
         resolved-at-request-time command, ``SECAGENT_LLM__MODEL="auto"`` — SecRouter's own catalog,
         NOT one of SecLLM's model ids (a different namespace; confirmed live that SecRouter 502s a
-        SecLLM-style id like "balanced" as an unrecognized/misrouted provider), audit enabled).
+        SecLLM-style id like "gemma-4-26B-A4B-it" as an unrecognized/misrouted provider), audit enabled).
         """
         c = self.manifest.components[component]
         env: dict[str, str] = {"SEC_DOMAIN": self.domain, "SELF_FQDN": self.fqdn(component)}
@@ -412,10 +412,10 @@ class Topology:
                 env["SECAGENT_SECSSO__TOKEN_URL"] = f"{secsso_url}/application/o/token/"
             env["SECAGENT_SECSSO__CLIENT_ID"] = "secagent"
             env["SECAGENT_LLM__API_KEY"] = "!secagent token"
-            # "auto" (SecRouter's own routing policy picks the backend) — NOT "balanced", a
+            # "auto" (SecRouter's own routing policy picks the backend) — NOT "gemma-4-26B-A4B-it", a
             # SecLLM catalog id from a different namespace that doesn't exist in SecRouter's
             # own model catalog. Confirmed live: SecRouter 502s "Unsupported provider:
-            # anthropic" for "balanced" (it apparently treats any unrecognized, unprefixed
+            # anthropic" for "gemma-4-26B-A4B-it" (it apparently treats any unrecognized, unprefixed
             # model id as an Anthropic model name and tries to route it there — a provider
             # this SecRouter has no credentials for, only Bedrock's "bedrock/..." ids show up
             # in its real /v1/models).

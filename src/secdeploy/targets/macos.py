@@ -1448,7 +1448,7 @@ def _secproxy_setup_actions(
             "REQUESTS_CA_BUNDLE=$PWD/out/seccert-root.pem</code> first. Then authenticate as "
             "yourself: <code>work/secagent/.venv/bin/secagent login</code> (prints a device-code "
             "URL to approve in a browser) — then <code>pi --provider secrouter --model "
-            "balanced</code>, and to load secagent's own tools, <code>pi --extension "
+            "gemma-4-26B-A4B-it</code>, and to load secagent's own tools, <code>pi --extension "
             "work/secagent/pi/extensions/secagent.ts</code>."
         )
     return actions
