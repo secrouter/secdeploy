@@ -236,7 +236,7 @@ creds-path grant against a pre-provisioned service account with `sub_mode: user_
 `secsso/blueprints/secagent-service.yaml` / `secchat-service.yaml`). `svc-secchat` is also a
 `delegatingSubjects` member: SecChat forwards the acting end-user via `X-Sec-Acting-User` so
 SecRouter attributes policy/budget/audit to that user. Unlike
-`SECROUTER_EGRESS_FILE`, this ISN'T env-var-driven — SecRouter's `FREEROUTER_CONFIG` is a
+`SECROUTER_EGRESS_FILE`, this ISN'T env-var-driven — SecRouter's `SECROUTER_CONFIG` is a
 hand-authored JSON file — so `deploy --with-agent` writes a documented fragment,
 `out/addressing/secrouter-oidc.json`, for you to merge into `security.oidc` by hand:
 
@@ -255,9 +255,27 @@ derive from the same SecSSO external URL), so the two never disagree.
 
 The bare-root issuer serves a real discovery document too: Authentik only publishes
 `/.well-known/openid-configuration` under `/application/o/<slug>/`, so the generated secproxy
-nginx config aliases the root path on SecSSO's vhost to the canonical `secrouter` provider's
-doc (whose `issuer` field is this root — `issuer_mode: global`). SecRouter's admin-console
-login discovers its endpoints through exactly this alias.
+nginx config aliases the root path on SecSSO's vhost to the `secrouter-admin-console`
+provider's doc (whose `issuer` field is this root — `issuer_mode: global`). SecRouter's
+admin-console login discovers its endpoints through exactly this alias.
+
+### SecRouter audit syslog config fragment
+
+When `secsite.toml`'s `[audit]` table sets `syslog_host` (see
+[secsite.md](secsite.md)'s `[audit]` table), `deploy` writes the same kind
+of documented fragment as the OIDC one above — `security.audit` isn't env-var-driven either —
+to `out/addressing/secrouter-audit.json`, for you to merge into SecRouter's `SECROUTER_CONFIG`:
+
+```json
+{
+  "sink": "both",
+  "syslog": {"host": "siem.internal", "port": 514, "protocol": "udp", "format": "json"}
+}
+```
+
+`sink: "both"` keeps SecRouter's own tamper-evident SQLite audit chain as the authoritative
+record and additionally forwards each event to the syslog sink — see
+[compliance.md](compliance.md) for the full posture.
 
 ### Native SecChat turnkey env
 
@@ -382,6 +400,20 @@ the installed file — a redeploy overwrites it. Change `topology.toml` and rede
 [secproxy's own `nginx-secproxy.conf.example`](https://github.com/secrouter/secproxy) for the
 exact shape the generator emits.
 
+The config also defines a named `secproxy` log format (nginx's stock `combined` fields plus
+`$request_id`/`$request_time`/`$upstream_response_time`, for correlating a request across
+secproxy and the fronted backend's own logs) and points `access_log` at it. A generated
+logrotate config (`wiring.logrotate_conf_text()`) is installed alongside it to:
+
+```
+/etc/logrotate.d/secproxy
+```
+
+— daily rotation, 14 generations, compressed, reloading nginx (`systemctl reload secproxy`) via
+`postrotate` so it reopens fresh log files. This is log **hygiene** only: retention policy, log
+**integrity**, and forwarding to a durable/tamper-evident store are downstream/environment-owned
+(see [compliance.md](compliance.md)), not something secdeploy enforces.
+
 ### TLS via SecCert (the deploy-time SAN cert)
 
 Unlike a self-ACME proxy, nginx does **not** run an ACME client. SecDeploy issues **one SAN
@@ -469,20 +501,20 @@ Edit the env files the installer dropped (they don't overwrite existing ones):
 
 ```bash
 sudoedit /etc/secsuite/seccert.env      # set SECCERT_ADMIN_TOKEN, SECCERT_CA_PASSPHRASE, external URL
-sudoedit /etc/secsuite/secrouter.env    # point FREEROUTER_CONFIG at a hardened config
+sudoedit /etc/secsuite/secrouter.env    # point SECROUTER_CONFIG at a hardened config
 sudoedit /etc/secsuite/secrecorder.env  # or: sudo systemctl mask secrecorder.service to skip it
 sudoedit /etc/secsuite/secagent.env     # --with-agent only: SECAGENT_CLIENT_SECRET (service/CI auth)
 sudo systemctl restart secsuite.target
 ```
 
 SecRouter's config must enable the security block and `tls.mode: frontend|native`; it fails
-closed if FIPS is required but unavailable. Start from `freerouter.config.hardened.example.json`
+closed if FIPS is required but unavailable. Start from `secrouter.config.hardened.example.json`
 in the SecRouter checkout.
 
 > **Filling these in *before* the first deploy.** `secdeploy configure`'s optional secret-
 > seeding step (asked right after it writes `secsite.toml`) can pre-fill these same values —
 > `SECCERT_ADMIN_TOKEN`/`SECCERT_CA_PASSPHRASE`, `SECAGENT_CLIENT_SECRET`,
-> `HF_TOKEN`, `FREEROUTER_CONFIG` — into the checkout's own
+> `HF_TOKEN`, `SECROUTER_CONFIG` — into the checkout's own
 > `deploy/fedora-fips/<svc>.env` (gitignored, `0600`), which `deploy` then installs to
 > `/etc/secsuite/<svc>.env` on first run **in place of** the blank `.env.example` (the
 > `test -f … || install …` non-clobber guard still applies — an already-seeded target host is

@@ -53,6 +53,7 @@ RESOURCE_PLACEMENT_KEYS = {"target", "address", "ssh", "capabilities"}
 RESOURCE_DEPLOY_KEYS = {
     "with_inference", "with_agent", "configure_resolver",
     "tls", "configure_hosts", "trust_ca", "model_dir", "autostart_models",
+    "inference_backend",
 }
 
 # The suite-wide [deploy] table's keys. Mirrors SiteConfig's own without/ssh fields exactly.
@@ -60,6 +61,68 @@ DEPLOY_TABLE_KEYS = {"without", "ssh"}
 
 # The top-level [[users]] array-of-tables — declared accounts SecDeploy provisions in SecSSO.
 USER_KEYS = {"username", "email", "name", "groups"}
+
+# Named site profiles: `secdeploy configure --name <profile>` saves to sites/<profile>.toml, and
+# every `--site` flag accepts either a path OR a saved profile NAME (resolved via
+# resolve_site_ref). Gitignored like secsite.toml — site configs are site-specific.
+SITES_DIR = "sites"
+
+
+def site_profile_path(name: str, root: Path | None = None) -> Path:
+    """The file a named profile lives at: ``<root>/sites/<name>.toml`` (root defaults to cwd)."""
+    return (root or Path.cwd()) / SITES_DIR / f"{name}.toml"
+
+
+def list_site_profiles(root: Path | None = None) -> list[str]:
+    """The saved profile names (sorted), from ``<root>/sites/*.toml``."""
+    d = (root or Path.cwd()) / SITES_DIR
+    return sorted(p.stem for p in d.glob("*.toml")) if d.is_dir() else []
+
+
+def resolve_site_ref(value: str | None, root: Path | None = None) -> str | None:
+    """Resolve a ``--site`` argument that may be a PATH or a saved profile NAME.
+
+    A value that exists as a file is used as-is (paths always win). Otherwise, a bare name (no
+    path separators) matching a saved profile resolves to ``sites/<name>.toml``. Anything else is
+    returned unchanged so the downstream loader produces its normal missing-file error naming what
+    the caller actually typed."""
+    if value is None:
+        return None
+    if Path(value).exists():
+        return value
+    if "/" not in value and not value.endswith(".toml"):
+        candidate = site_profile_path(value, root)
+        if candidate.exists():
+            return str(candidate)
+    return value
+
+
+# The top-level [[builds]] array-of-tables — optional container-image builds run at deploy.
+BUILD_KEYS = {"name", "component", "dockerfile", "tag", "context", "push", "registry", "platform"}
+
+# The [secchat.pool] sub-table — the optional Kubernetes agent pool. Mirrors PoolOptions' fields.
+SECCHAT_POOL_KEYS = {
+    "enabled", "image", "namespace", "service_account", "service_account_namespace",
+    "git_host", "secchat_url", "cpu", "memory", "max_pods", "max_per_owner", "ttl_seconds",
+    "build_image", "registry", "apply", "kube_context", "api_server", "create_service_account",
+    "analysis_images", "task_image",
+}
+
+# The [secchat.voice] sub-table — the optional 1:1 voice-call media relay (secchat-mediad).
+# Mirrors VoiceOptions' fields. See docs/plans/voice-calls-plan.md §2.5/§3.5 (secchat repo) —
+# secdeploy's own half is: the mediad compose service, a new `recordings` volume, and the
+# SECCHAT_TRANSCRIBE_URL/SECCHAT_MEDIAD_*/SECCHAT_CALL_STUN env in secchat's stack .env.
+SECCHAT_VOICE_KEYS = {
+    "enabled", "image", "token", "stun", "advertise_addr", "media_port", "control_port",
+    "max_legs_per_session",
+}
+
+# The top-level [audit] table — optional syslog/SIEM forwarding for SecRouter's audit log
+# (AU-3.3.x; see docs/compliance.md). Mirrors AuditOptions' fields exactly. Suite-wide (not
+# per-resource) like [deploy] — there is one audit posture for the deployment, not one per host.
+AUDIT_TABLE_KEYS = {"syslog_host", "syslog_port", "syslog_proto", "syslog_format"}
+AUDIT_VALID_PROTOS = {"udp", "tcp"}
+AUDIT_VALID_FORMATS = {"json", "cef"}
 
 
 @dataclass
@@ -85,6 +148,10 @@ class DeployOptions:
     trust_ca: bool = False
     model_dir: str = ""
     autostart_models: list[str] = field(default_factory=list)
+    # macOS-only: which SecLLM inference backend the launchd daemon runs. "auto" (default) =
+    # mlx if mlx-lm is installed, else mock. "metal" = vLLM-Metal (full vLLM engine on Apple
+    # Silicon; serves archs mlx-lm lacks) from ~/.venv-vllm-metal — see targets/macos.py.
+    inference_backend: str = "auto"
 
 
 @dataclass
@@ -99,6 +166,173 @@ class UserSpec:
     email: str = ""
     name: str = ""
     groups: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BuildSpec:
+    """One optional container-image build (secsite.toml ``[[builds]]``), run at deploy time.
+
+    Generalizes the one-off image builds a suite needs beyond its core services — the pool's
+    runnerd, the secagent analyzer family, any site-specific tooling image — into declarative site
+    config instead of by-hand ``docker build`` invocations:
+
+    .. code-block:: toml
+
+        [[builds]]
+        name = "secagent-analyzer-rust"          # image name (also the local ref's repo)
+        component = "secagent"                    # which fetched checkout is the build context
+        dockerfile = "docker/analyzer-rust.Dockerfile"   # relative to that checkout
+        # tag = "local"                           # default; the built ref is <name>:<tag>
+        # context = "."                           # build context, relative to the checkout
+        # push = false                            # default LOCAL-ONLY (e.g. colima's shared
+        #                                         # docker runtime needs no registry); true
+        #                                         # pushes <registry>/<name>:<tag>
+        # registry = ""                           # required when push = true
+        # platform = ""                           # optional --platform (e.g. linux/arm64)
+
+    Builds are best-effort at deploy (a failure warns with the command to run by hand and never
+    aborts the deploy), and docker's layer cache makes re-runs cheap.
+    """
+
+    name: str = ""
+    component: str = ""
+    dockerfile: str = ""
+    tag: str = "local"
+    context: str = "."
+    push: bool = False
+    registry: str = ""
+    platform: str = ""
+
+    @property
+    def local_ref(self) -> str:
+        """The locally-built image reference, ``<name>:<tag>``."""
+        return f"{self.name}:{self.tag}"
+
+    @property
+    def push_ref(self) -> str:
+        """The pushed reference, ``<registry>/<name>:<tag>`` (only meaningful when ``push``)."""
+        return f"{self.registry.rstrip('/')}/{self.name}:{self.tag}"
+
+
+@dataclass
+class PoolOptions:
+    """The optional Kubernetes agent pool for SecChat coding agents (secsite.toml's
+    ``[secchat.pool]``). When ``enabled``, SecDeploy writes the ``SECCHAT_POOL_*`` env into
+    secchat's ``.env`` and emits Kubernetes manifests (namespace / Role + binding / NetworkPolicy /
+    ResourceQuota) to ``<out>/addressing/secchat-pool.k8s.json``. Off by default — a deployment with
+    no cluster simply omits this section and the pool stays unavailable.
+
+    Turnkey knobs (all default off, so the manifest-only "write it, operator applies it" behaviour is
+    unchanged):
+
+    - ``build_image``: build ``Dockerfile.runnerd`` from the fetched secchat checkout, push it to
+      ``registry``, and set ``image`` to the pushed digest. ``registry`` is then required.
+    - ``apply``: ``kubectl apply`` the emitted manifests (``--context kube_context`` when set) instead
+      of leaving them for the operator.
+
+    ``image`` (the runnerd image) is required when ``enabled`` unless ``build_image`` produces it;
+    ``git_host`` (the enclave git host the pods may reach) scopes the egress NetworkPolicy;
+    ``secchat_url`` is the cluster-internal URL a pod dials back (defaults to SecChat's own address
+    from the topology). ``max_pods``/``max_per_owner`` drive both the ResourceQuota and SecChat's own
+    in-process admission caps (``SECCHAT_POOL_MAX_PODS`` / ``SECCHAT_POOL_MAX_PER_OWNER``)."""
+
+    enabled: bool = False
+    image: str = ""
+    namespace: str = "secchat-pool"
+    service_account: str = "secchat"
+    service_account_namespace: str = "secchat"
+    git_host: str = ""
+    secchat_url: str = ""
+    cpu: str = "1"
+    memory: str = "1Gi"
+    max_pods: int = 20
+    max_per_owner: int = 3
+    ttl_seconds: int = 3600
+    # Turnkey deploy knobs (default off → the historical write-manifests-only behaviour).
+    build_image: bool = False
+    registry: str = ""
+    apply: bool = False
+    kube_context: str = ""
+    # OUT-OF-CLUSTER SecChat support: when SecChat itself runs OUTSIDE the cluster (compose on the
+    # host — this suite's normal shape), it can't use the in-cluster defaults. `api_server` is the
+    # Kubernetes API URL reachable FROM the SecChat container (→ SECCHAT_POOL_APISERVER; e.g. the
+    # colima node IP https://192.168.5.1:6443 — an address in the API cert's SANs). When
+    # `create_service_account` is set, the emitted manifests ALSO create SecChat's ServiceAccount +
+    # a bound token Secret, and the deploy extracts that token + cluster CA and mounts them into the
+    # SecChat container at the standard in-cluster paths (via a compose override) — so the backend's
+    # unmodified in-cluster client just works. Leave both unset for a truly in-cluster SecChat.
+    api_server: str = ""
+    create_service_account: bool = False
+    # Analysis sidecar catalog, name → image (`[secchat.pool.analysis_images]`). Each named
+    # container can be attached to an agent's pod at creation, sharing the pod's /workspace volume
+    # so its tooling operates on the agent's code (→ SECCHAT_POOL_ANALYSIS_IMAGES). Empty = off.
+    analysis_images: dict[str, str] = field(default_factory=dict)
+    # Image for ONE-SHOT POOL TASKS (the secagent agent image): the /pool/tasks API runs
+    # `secagent review mr` / `docs build` / `analyze …` batch jobs in ephemeral pods of this image
+    # (→ SECCHAT_POOL_TASK_IMAGE). Empty = the task API is off.
+    task_image: str = ""
+
+
+@dataclass
+class VoiceOptions:
+    """The optional 1:1 voice-call media relay (secsite.toml's ``[secchat.voice]``) — see
+    ``docs/plans/voice-calls-plan.md`` §2.5/§3.5 (secchat repo) and ``docs/voice.md`` (this
+    repo). When ``enabled``, SecDeploy adds a ``mediad`` compose service (image ``secchat-
+    mediad:local`` by default, built via a site ``[[builds]]`` entry) alongside SecChat, a NEW
+    ``recordings`` named volume distinct from ``uploads`` (mounted rw on both mediad and
+    secchat), and writes ``SECCHAT_TRANSCRIBE_URL``/``SECCHAT_MEDIAD_URL``/
+    ``SECCHAT_MEDIAD_TOKEN``/``SECCHAT_CALL_STUN``/``SECCHAT_MEDIAD_ADVERTISE_ADDR``/
+    ``SECCHAT_MEDIAD_RECORDINGS_DIR`` into secchat's stack ``.env``
+    (:func:`secdeploy.wiring.secchat_voice_env`) — the last of these is the secchat CONTAINER's
+    mount path for the shared ``recordings`` volume (fixed ``/var/lib/secchat/recordings``,
+    distinct from mediad's own ``/var/lib/mediad/recordings`` mount path — only the volume identity
+    has to match), without which the backend can't actually ingest a recording or read a leg for
+    transcription even though the volume is mounted. Off by default — voice stays unavailable and
+    the stack is byte-for-byte what it was before this existed.
+
+    ``token`` (``SECCHAT_MEDIAD_TOKEN``, the shared control-API bearer) is normally left blank —
+    :func:`secdeploy.wiring.secchat_voice_env` generates and PERSISTS a strong random one into
+    secchat's ``.env`` on first deploy (same idempotent-once-set discipline as the stack's own
+    seeded secrets), rather than requiring the operator to mint one by hand. ``stun``
+    (``SECCHAT_CALL_STUN``) defaults EMPTY and must stay suite-local if set — never a public
+    STUN server (e.g. Google's): a public default would leak every unrecorded call's existence
+    and each client's IP to a third party, breaking the suite's CUI/air-gap posture (v3.1
+    review, plan §2.5 point 4). ``advertise_addr`` (``SECCHAT_MEDIAD_ADVERTISE_ADDR``) is
+    REQUIRED when enabled — the suite host's CROSS-HOST-reachable address fed to Pion's
+    ``SetNAT1To1IPs``; get it wrong and relayed calls never connect from a second host (the #1
+    containerized-Pion failure mode — plan §2.2/§2.5/R6). ``media_port``/``control_port`` rarely
+    need changing from mediad's fixed manifest ports (``:47020`` UDP+TCP media,
+    ``:47021`` compose-internal-only control API)."""
+
+    enabled: bool = False
+    image: str = "secchat-mediad:local"
+    token: str = ""
+    stun: str = ""
+    advertise_addr: str = ""
+    media_port: int = 47020
+    control_port: int = 47021
+    # Caps participants per call (MEDIAD_MAX_LEGS_PER_SESSION) — mediad's own default is 8; raise
+    # only for larger group calls. Must stay >= 2 so a normal 1:1 call (two legs) still fits.
+    max_legs_per_session: int = 8
+
+
+@dataclass
+class AuditOptions:
+    """Optional syslog/SIEM forwarding for SecRouter's audit log (secsite.toml's top-level
+    ``[audit]`` table — AU-3.3.x; see docs/compliance.md). Matches SecRouter's own
+    ``security.audit.syslog`` shape (``secrouter/src/security/types.ts``'s ``SecurityConfig``)
+    field-for-field, so :func:`secdeploy.wiring.secrouter_audit_syslog_config` can hand the
+    fragment straight through with no translation.
+
+    All optional; ``syslog_host`` empty (the default) means no syslog sink at all — SecRouter's
+    audit log stays SQLite-only, byte-for-byte the pre-existing behavior. Setting ``syslog_host``
+    is what turns it on; ``syslog_port``/``syslog_proto``/``syslog_format`` only matter once it is.
+    """
+
+    syslog_host: str = ""
+    syslog_port: int = 514
+    syslog_proto: str = "udp"
+    syslog_format: str = "json"
 
 
 @dataclass
@@ -120,6 +354,10 @@ class SiteConfig:
     ssh: bool = False
     deploy_options: dict[str, DeployOptions] = field(default_factory=dict)
     users: list[UserSpec] = field(default_factory=list)
+    secchat_pool: PoolOptions = field(default_factory=PoolOptions)
+    secchat_voice: VoiceOptions = field(default_factory=VoiceOptions)
+    audit: AuditOptions = field(default_factory=AuditOptions)
+    builds: list[BuildSpec] = field(default_factory=list)
     path: Path | None = None
 
     # ── construction ───────────────────────────────────────────────────────────────
@@ -169,6 +407,7 @@ class SiteConfig:
                 trust_ca=bool(rdata.get("trust_ca", False)),
                 model_dir=str(rdata.get("model_dir", "")),
                 autostart_models=[str(m) for m in rdata.get("autostart_models", [])],
+                inference_backend=str(rdata.get("inference_backend", "auto")),
             )
 
         # Declared end-user accounts — a top-level [[users]] array-of-tables. Fail-loud on
@@ -201,13 +440,188 @@ class SiteConfig:
                 groups=[str(g).strip() for g in (u.get("groups") or []) if str(g).strip()],
             ))
 
+        # Optional [[builds]] — container images built at deploy (the pool runnerd, analyzer
+        # tooling, any site image). Same fail-loud unknown-key/required-field discipline; the
+        # component must be a manifest component (its fetched checkout is the build context).
+        builds: list[BuildSpec] = []
+        seen_build_names: set[str] = set()
+        for i, b in enumerate(data.get("builds") or []):
+            if not isinstance(b, dict):
+                errors.append(f"[[builds]][{i}] must be a table")
+                continue
+            unknown_b = sorted(k for k in b if k not in BUILD_KEYS)
+            if unknown_b:
+                errors.append(
+                    f"[[builds]][{i}]: unknown key(s) {', '.join(unknown_b)} "
+                    f"(expected: {', '.join(sorted(BUILD_KEYS))})"
+                )
+            spec = BuildSpec(
+                name=str(b.get("name", "")).strip(),
+                component=str(b.get("component", "")).strip(),
+                dockerfile=str(b.get("dockerfile", "")).strip(),
+                tag=str(b.get("tag", "local")).strip() or "local",
+                context=str(b.get("context", ".")).strip() or ".",
+                push=bool(b.get("push", False)),
+                registry=str(b.get("registry", "")).strip(),
+                platform=str(b.get("platform", "")).strip(),
+            )
+            if not spec.name or not spec.component or not spec.dockerfile:
+                errors.append(f"[[builds]][{i}]: name, component, and dockerfile are required")
+                continue
+            if spec.name in seen_build_names:
+                errors.append(f"[[builds]]: duplicate name {spec.name!r}")
+                continue
+            if spec.component not in manifest.components:
+                errors.append(
+                    f"[[builds]][{i}]: unknown component {spec.component!r} "
+                    f"(expected one of: {', '.join(sorted(manifest.components))})")
+                continue
+            if spec.push and not spec.registry:
+                errors.append(f"[[builds]][{i}] ({spec.name}): registry is required when push = true")
+                continue
+            seen_build_names.add(spec.name)
+            builds.append(spec)
+
+        # Optional [secchat.pool] — the Kubernetes agent pool. Additive top-level table (silently
+        # ignored before this parser existed), with the same fail-loud unknown-key rejection.
+        secchat_table = data.get("secchat") or {}
+        if not isinstance(secchat_table, dict):
+            errors.append("[secchat] must be a table")
+            secchat_table = {}
+        unknown_secchat = sorted(k for k in secchat_table if k not in ("pool", "voice"))
+        if unknown_secchat:
+            errors.append(
+                f"[secchat]: unknown key(s) {', '.join(unknown_secchat)} (expected: pool, voice)")
+        pool_data = secchat_table.get("pool") or {}
+        if not isinstance(pool_data, dict):
+            errors.append("[secchat.pool] must be a table")
+            pool_data = {}
+        unknown_pool = sorted(k for k in pool_data if k not in SECCHAT_POOL_KEYS)
+        if unknown_pool:
+            errors.append(
+                f"[secchat.pool]: unknown key(s) {', '.join(unknown_pool)} "
+                f"(expected: {', '.join(sorted(SECCHAT_POOL_KEYS))})"
+            )
+        secchat_pool = PoolOptions(
+            enabled=bool(pool_data.get("enabled", False)),
+            image=str(pool_data.get("image", "")).strip(),
+            namespace=str(pool_data.get("namespace", "secchat-pool")).strip() or "secchat-pool",
+            service_account=str(pool_data.get("service_account", "secchat")).strip() or "secchat",
+            service_account_namespace=str(pool_data.get("service_account_namespace", "secchat")).strip() or "secchat",
+            git_host=str(pool_data.get("git_host", "")).strip(),
+            secchat_url=str(pool_data.get("secchat_url", "")).strip(),
+            cpu=str(pool_data.get("cpu", "1")).strip() or "1",
+            memory=str(pool_data.get("memory", "1Gi")).strip() or "1Gi",
+            max_pods=int(pool_data.get("max_pods", 20)),
+            max_per_owner=int(pool_data.get("max_per_owner", 3)),
+            ttl_seconds=int(pool_data.get("ttl_seconds", 3600)),
+            build_image=bool(pool_data.get("build_image", False)),
+            registry=str(pool_data.get("registry", "")).strip(),
+            apply=bool(pool_data.get("apply", False)),
+            kube_context=str(pool_data.get("kube_context", "")).strip(),
+            api_server=str(pool_data.get("api_server", "")).strip(),
+            create_service_account=bool(pool_data.get("create_service_account", False)),
+            task_image=str(pool_data.get("task_image", "")).strip(),
+            analysis_images={
+                str(k).strip(): str(v).strip()
+                for k, v in (pool_data.get("analysis_images") or {}).items()
+                if str(k).strip() and str(v).strip()
+            } if isinstance(pool_data.get("analysis_images", {}), dict) else {},
+        )
+        if not isinstance(pool_data.get("analysis_images", {}), dict):
+            errors.append("[secchat.pool]: analysis_images must be a table of name = \"image\"")
+        if secchat_pool.enabled and not secchat_pool.image and not secchat_pool.build_image:
+            errors.append("[secchat.pool]: image is required when enabled = true (or set build_image = true)")
+        if secchat_pool.build_image and not secchat_pool.registry:
+            errors.append("[secchat.pool]: registry is required when build_image = true (where to push the runnerd image)")
+
+        # Optional [secchat.voice] — the 1:1 voice-call media relay (secchat-mediad). Same
+        # additive/fail-loud discipline as [secchat.pool] above.
+        voice_data = secchat_table.get("voice") or {}
+        if not isinstance(voice_data, dict):
+            errors.append("[secchat.voice] must be a table")
+            voice_data = {}
+        unknown_voice = sorted(k for k in voice_data if k not in SECCHAT_VOICE_KEYS)
+        if unknown_voice:
+            errors.append(
+                f"[secchat.voice]: unknown key(s) {', '.join(unknown_voice)} "
+                f"(expected: {', '.join(sorted(SECCHAT_VOICE_KEYS))})"
+            )
+        secchat_voice = VoiceOptions(
+            enabled=bool(voice_data.get("enabled", False)),
+            image=str(voice_data.get("image", "secchat-mediad:local")).strip() or "secchat-mediad:local",
+            token=str(voice_data.get("token", "")).strip(),
+            stun=str(voice_data.get("stun", "")).strip(),
+            advertise_addr=str(voice_data.get("advertise_addr", "")).strip(),
+            media_port=int(voice_data.get("media_port", 47020)),
+            control_port=int(voice_data.get("control_port", 47021)),
+            max_legs_per_session=int(voice_data.get("max_legs_per_session", 8)),
+        )
+        if secchat_voice.enabled and secchat_voice.max_legs_per_session < 2:
+            errors.append(
+                "[secchat.voice]: max_legs_per_session must be >= 2 — a 1:1 call already needs "
+                "two legs (caller + callee); a cap below 2 rejects every real call"
+            )
+        if secchat_voice.enabled and not secchat_voice.advertise_addr:
+            errors.append(
+                "[secchat.voice]: advertise_addr is required when enabled = true — the suite "
+                "host's CROSS-HOST-reachable address (fed to Pion's SetNAT1To1IPs); relayed "
+                "calls silently never connect cross-host without it (plan §2.2/R6)"
+            )
+        # A public STUN server (Google's default et al.) leaks unrecorded-call metadata + client
+        # IPs off-suite and breaks the CUI/air-gap posture — the v3.1 review's REQUIRED default
+        # (plan §2.5 point 4). This is a narrow, deliberately-non-exhaustive guard against the
+        # single most common accidental default, not a full allowlist of "acceptable" STUN hosts.
+        _PUBLIC_STUN_MARKERS = ("google.com", "stun.l.google", "stunprotocol.org", "stun.stunprotocol")
+        if any(m in secchat_voice.stun.lower() for m in _PUBLIC_STUN_MARKERS):
+            errors.append(
+                "[secchat.voice]: stun looks like a public STUN server — leaks call metadata + "
+                "client IPs off-suite (CUI/air-gap posture). Use a suite-local STUN service or "
+                "leave it empty (plan §2.5 point 4)."
+            )
+
+        # Optional top-level [audit] — syslog/SIEM forwarding for SecRouter's audit log (AU
+        # 3.3.x; see docs/compliance.md). Additive (silently ignored before this parser existed),
+        # same fail-loud unknown-key/value discipline as every other optional table above.
+        audit_table = data.get("audit") or {}
+        if not isinstance(audit_table, dict):
+            errors.append("[audit] must be a table")
+            audit_table = {}
+        unknown_audit = sorted(k for k in audit_table if k not in AUDIT_TABLE_KEYS)
+        if unknown_audit:
+            errors.append(
+                f"[audit]: unknown key(s) {', '.join(unknown_audit)} "
+                f"(expected: {', '.join(sorted(AUDIT_TABLE_KEYS))})"
+            )
+        audit_opts = AuditOptions(
+            syslog_host=str(audit_table.get("syslog_host", "")).strip(),
+            syslog_port=int(audit_table.get("syslog_port", 514)),
+            syslog_proto=str(audit_table.get("syslog_proto", "udp")).strip().lower(),
+            syslog_format=str(audit_table.get("syslog_format", "json")).strip().lower(),
+        )
+        if audit_opts.syslog_proto not in AUDIT_VALID_PROTOS:
+            errors.append(
+                f"[audit]: syslog_proto {audit_opts.syslog_proto!r} must be one of: "
+                f"{', '.join(sorted(AUDIT_VALID_PROTOS))}"
+            )
+        if audit_opts.syslog_format not in AUDIT_VALID_FORMATS:
+            errors.append(
+                f"[audit]: syslog_format {audit_opts.syslog_format!r} must be one of: "
+                f"{', '.join(sorted(AUDIT_VALID_FORMATS))}"
+            )
+        if audit_opts.syslog_host and not (1 <= audit_opts.syslog_port <= 65535):
+            errors.append(
+                f"[audit]: syslog_port {audit_opts.syslog_port} must be between 1 and 65535"
+            )
+
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
         # rather than one tangled into the other (see validate() below).
         topology = Topology.from_data(data, manifest, path=path, validate=False)
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
-            deploy_options=deploy_options, users=users, path=path,
+            deploy_options=deploy_options, users=users, secchat_pool=secchat_pool,
+            secchat_voice=secchat_voice, audit=audit_opts, builds=builds, path=path,
         )
         site.validate()
         if errors:
@@ -318,6 +732,7 @@ class SiteConfig:
             out.append(f"trust_ca = {_bool(opts.trust_ca)}")
             out.append(f'model_dir = "{opts.model_dir}"')
             out.append(f"autostart_models = {_arr(opts.autostart_models)}")
+            out.append(f'inference_backend = "{opts.inference_backend}"')
             out.append("")
         for tier, res_list in topo.groups.items():
             out.append(f"[groups.{tier}]")
@@ -337,4 +752,71 @@ class SiteConfig:
                 out.append(f'name = "{u.name}"')
                 out.append(f"groups = {_arr(u.groups)}")
                 out.append("")
+        if self.builds:
+            out.append("# Optional container-image builds, run at deploy (docker layer cache makes")
+            out.append("# re-runs cheap). Each builds from a fetched component checkout.")
+            for b in self.builds:
+                out.append("[[builds]]")
+                out.append(f'name = "{b.name}"')
+                out.append(f'component = "{b.component}"')
+                out.append(f'dockerfile = "{b.dockerfile}"')
+                out.append(f'tag = "{b.tag}"')
+                out.append(f'context = "{b.context}"')
+                out.append(f"push = {_bool(b.push)}")
+                out.append(f'registry = "{b.registry}"')
+                out.append(f'platform = "{b.platform}"')
+                out.append("")
+        pool = self.secchat_pool
+        if pool.enabled:
+            out.append("# Optional Kubernetes agent pool — coding agents run in server-launched pods.")
+            out.append("# SecDeploy emits the K8s manifests to <out>/addressing/secchat-pool.k8s.json.")
+            out.append("[secchat.pool]")
+            out.append(f"enabled = {_bool(pool.enabled)}")
+            out.append(f'image = "{pool.image}"')
+            out.append(f'namespace = "{pool.namespace}"')
+            out.append(f'service_account = "{pool.service_account}"')
+            out.append(f'service_account_namespace = "{pool.service_account_namespace}"')
+            out.append(f'git_host = "{pool.git_host}"')
+            out.append(f'secchat_url = "{pool.secchat_url}"')
+            out.append(f'cpu = "{pool.cpu}"')
+            out.append(f'memory = "{pool.memory}"')
+            out.append(f"max_pods = {pool.max_pods}")
+            out.append(f"max_per_owner = {pool.max_per_owner}")
+            out.append(f"ttl_seconds = {pool.ttl_seconds}")
+            out.append(f"build_image = {_bool(pool.build_image)}")
+            out.append(f'registry = "{pool.registry}"')
+            out.append(f"apply = {_bool(pool.apply)}")
+            out.append(f'kube_context = "{pool.kube_context}"')
+            out.append(f'api_server = "{pool.api_server}"')
+            out.append(f"create_service_account = {_bool(pool.create_service_account)}")
+            out.append(f'task_image = "{pool.task_image}"')
+            if pool.analysis_images:
+                out.append("")
+                out.append("[secchat.pool.analysis_images]")
+                for name in sorted(pool.analysis_images):
+                    out.append(f'{name} = "{pool.analysis_images[name]}"')
+            out.append("")
+        voice = self.secchat_voice
+        if voice.enabled:
+            out.append("# Optional 1:1 voice-call media relay (secchat-mediad) — see docs/voice.md.")
+            out.append("[secchat.voice]")
+            out.append(f"enabled = {_bool(voice.enabled)}")
+            out.append(f'image = "{voice.image}"')
+            out.append(f'token = "{voice.token}"')
+            out.append(f'stun = "{voice.stun}"')
+            out.append(f'advertise_addr = "{voice.advertise_addr}"')
+            out.append(f"media_port = {voice.media_port}")
+            out.append(f"control_port = {voice.control_port}")
+            out.append(f"max_legs_per_session = {voice.max_legs_per_session}")
+            out.append("")
+        aud = self.audit
+        if aud.syslog_host:
+            out.append("# Optional syslog/SIEM forwarding for SecRouter's audit log (AU-3.3.x) —")
+            out.append("# see docs/compliance.md. Absent/empty syslog_host = no syslog sink (default).")
+            out.append("[audit]")
+            out.append(f'syslog_host = "{aud.syslog_host}"')
+            out.append(f"syslog_port = {aud.syslog_port}")
+            out.append(f'syslog_proto = "{aud.syslog_proto}"')
+            out.append(f'syslog_format = "{aud.syslog_format}"')
+            out.append("")
         return "\n".join(out).rstrip() + "\n"

@@ -457,8 +457,9 @@ def test_macos_venv_helpers(tmp_path):
 
 
 def test_deploy_macos_with_agent_installs_leanctx(tmp_path, capsys):
-    """--with-agent on macOS installs the pinned LeanCTX binary + pi extension and wires pi,
-    air-gapped (no update phone-home). secagent v0.3.0 ships LeanCTX on by default."""
+    """--with-agent on macOS installs the pinned LeanCTX binary + pi extension (secagent init does
+    the launch-time, pi-scoped wiring — NOT a global `lean-ctx init`/`harden`), air-gapped (no
+    update phone-home), and un-wraps any prior operator wrap. secagent ships LeanCTX on by default."""
     tp = tmp_path / "t.toml"
     tp.write_text("""
 domain = "sec.internal"
@@ -483,7 +484,59 @@ resource = "mac"
     assert "LeanCTX" in out
     assert "lean-ctx-bin@3.9.17" in out and "pi-lean-ctx@3.9.17" in out
     assert "LEAN_CTX_NO_UPDATE_CHECK=1" in out          # air-gapped: no update phone-home
-    assert "lean-ctx init --agent pi" in out
+    # secdeploy no longer wires pi itself (that's `secagent init`, launch-time + pi-scoped) and
+    # never hardens the operator — instead it un-wraps any prior global wrap.
+    assert "lean-ctx init --agent pi" not in out
+    assert "un-wrap the operator" in out
+
+
+def test_strip_leanctx_zshrc_removes_only_the_marked_blocks():
+    from secdeploy.targets.macos import _strip_leanctx_zshrc
+
+    wrapped = (
+        'export PATH="$PATH:/opt/lms/bin"\n'
+        "# lean-ctx shell hook — begin\n"
+        'if [ -f "$HOME/.config/lean-ctx/shell-hook.zsh" ]; then\n'
+        '. "$HOME/.config/lean-ctx/shell-hook.zsh"\n'
+        "fi\n"
+        "# lean-ctx shell hook — end\n"
+        "\n"
+        "# >>> lean-ctx agent aliases >>>\n"
+        "alias claude='LEAN_CTX_AGENT=1 claude'\n"
+        "alias codex='LEAN_CTX_AGENT=1 codex'\n"
+        "# <<< lean-ctx agent aliases <<<\n"
+    )
+    cleaned = _strip_leanctx_zshrc(wrapped)
+    assert "lean-ctx" not in cleaned and "LEAN_CTX_AGENT" not in cleaned
+    assert 'export PATH="$PATH:/opt/lms/bin"' in cleaned      # unrelated lines survive
+    assert _strip_leanctx_zshrc(cleaned) == cleaned           # idempotent
+
+
+def test_strip_leanctx_claude_drops_hooks_and_allows_keeps_rest(tmp_path):
+    import json as _json
+
+    from secdeploy.targets.macos import _strip_leanctx_claude
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(_json.dumps({
+        "theme": "dark",
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/lean-ctx hook rewrite"}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/my-own-hook"}]},
+            ],
+        },
+        "permissions": {"allow": ["mcp__lean-ctx__ctx_read", "mcp__other__tool"], "deny": ["Grep", "Glob"]},
+    }))
+    assert _strip_leanctx_claude(settings) is True
+    data = _json.loads(settings.read_text())
+    assert data["theme"] == "dark"                            # untouched
+    # lean-ctx hook removed, the operator's own hook kept:
+    cmds = [h["command"] for g in data["hooks"]["PreToolUse"] for h in g["hooks"]]
+    assert cmds == ["/x/my-own-hook"]
+    assert data["permissions"]["allow"] == ["mcp__other__tool"]   # lean-ctx MCP allow dropped
+    assert "deny" not in data["permissions"]                  # Grep/Glob deny fully removed
+    assert _strip_leanctx_claude(settings) is False           # idempotent (nothing left to change)
 
 
 def test_deploy_macos_plain_dry_run_shows_no_secproxy(capsys):
@@ -1004,3 +1057,86 @@ def test_deploy_falls_back_to_example_when_no_seeded_env(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "config /etc/secsuite/seccert.env (from example if absent)" in out
     assert "seeded env" not in out
+
+
+# ── `secdeploy audit verify` — CLI wiring around secdeploy.audit.verify_all ─────────────────
+def test_audit_verify_empty_out_dir_is_ok(tmp_path, capsys):
+    rc = main(["--out", str(tmp_path / "out"), "audit", "verify"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "nothing to verify" in out
+    assert "overall: 0 checked" in out
+
+
+def test_audit_verify_clean_chain_exits_zero(tmp_path, capsys):
+    from datetime import datetime, timezone
+
+    from secdeploy import audit
+    from secdeploy.manifest import Manifest
+    m = Manifest.load(MANIFEST)
+    out_dir = tmp_path / "out"
+    audit.write_deploy_audit(m, None, None, out_dir, target="macos", services=[], shas={},
+                             now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    rc = main(["--out", str(out_dir), "audit", "verify"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "macos-local" in out
+    assert "overall: 1 checked — OK" in out
+
+
+def test_audit_verify_broken_chain_exits_nonzero(tmp_path, capsys):
+    import json
+    from datetime import datetime, timezone
+
+    from secdeploy import audit
+    from secdeploy.manifest import Manifest
+    m = Manifest.load(MANIFEST)
+    out_dir = tmp_path / "out"
+    audit.write_deploy_audit(m, None, None, out_dir, target="macos", services=[], shas={},
+                             now=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    chain_file = next((out_dir / "audit").glob("deploy-macos-local-*.json"))
+    tampered = json.loads(chain_file.read_text())
+    tampered["hash"] = "0" * 64
+    chain_file.write_text(json.dumps(tampered))
+
+    rc = main(["--out", str(out_dir), "audit", "verify"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BROKEN" in out
+
+
+# ── `secdeploy evidence` — CLI wiring around secdeploy.evidence.collect ─────────────────────
+def test_evidence_single_host_mode_all_skipped(tmp_path, capsys, monkeypatch):
+    import urllib.error
+    from datetime import date
+
+    from secdeploy import evidence as evidence_mod
+
+    def refuse(url, token, timeout):
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(evidence_mod, "_http_get", refuse)
+    out_dir = tmp_path / "out"
+    rc = main(["--manifest", MANIFEST, "--out", str(out_dir), "evidence"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "evidence bundle written" in out
+    assert "deploy-audit chain: OK (0 checked)" in out
+    bundle_path = out_dir / "evidence" / f"suite-evidence-{date.today().isoformat()}.json"
+    assert bundle_path.exists()
+
+
+def test_evidence_never_writes_the_token(tmp_path, capsys, monkeypatch):
+    import urllib.error
+
+    from secdeploy import evidence as evidence_mod
+
+    monkeypatch.setattr(
+        evidence_mod, "_http_get",
+        lambda url, token, timeout: (_ for _ in ()).throw(urllib.error.URLError("refused")),
+    )
+    out_dir = tmp_path / "out"
+    rc = main(["--manifest", MANIFEST, "--out", str(out_dir), "evidence", "--token", "super-secret"])
+    assert rc == 0
+    for p in (out_dir / "evidence").glob("*.json"):
+        assert "super-secret" not in p.read_text()

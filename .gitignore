@@ -33,6 +33,7 @@ topology.toml
 # unified site config (placement + deploy options) — operator-specific, like the env files
 # (the .example is tracked)
 secsite.toml
+sites/
 !secsite.toml.example
 
 # Sphinx

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import getpass
 import html
+import json
 import os
 import pwd
 import re
@@ -190,37 +191,145 @@ def _ensure_nginx() -> None:
 
 
 def _wire_leanctx_for_pi(dry_run: bool = False) -> None:
-    """Install the pinned LeanCTX binary + pi extension and wire them into pi on this box —
-    context compression for the developer's pi (secagent v0.3.0 ships LeanCTX on by default; see
-    its docs/leanctx.md). Best-effort + air-gapped: ``LEAN_CTX_NO_UPDATE_CHECK=1`` so it never
-    phones home, and a missing ``npm`` just skips it (secagent degrades gracefully — ``secagent
-    doctor`` reports whether LeanCTX is actually present).
+    """Install the pinned LeanCTX binary + pi extension so ``secagent init`` (run right after) can
+    wire them into pi. The WIRING is secagent's job now, and it is launch-time + pi-scoped:
+    ``secagent init`` installs the pi-lean-ctx extension and DE-REGISTERS it from pi's global
+    settings.json, and ``secagent pi run`` / SecChat's runner load it per-process via ``-e``.
 
-    Scope note: this wires the pi-side compression only. secagent's OWN-CALL compression needs
-    LeanCTX's persistent daemon, which it self-manages (its own LaunchAgents, incl. an
-    auto-updater) — a separate, deliberately-deferred piece to verify live before enabling."""
+    secdeploy no longer runs ``lean-ctx init --agent pi`` (which globally auto-registered the
+    extension for every pi) or ``lean-ctx harden`` (which wrapped the OPERATOR's shell + Claude
+    Code) — LeanCTX rides along only on the pi processes secagent/SecChat actually launch, per
+    "LeanCTX only for pi-with-secagent". :func:`_unwrap_leanctx_operator` cleans up any prior wrap.
+
+    Best-effort + air-gapped (``LEAN_CTX_NO_UPDATE_CHECK=1`` so it never phones home): a missing
+    ``npm`` just skips it — secagent degrades gracefully and ``secagent doctor`` reports whether
+    LeanCTX is present."""
     install = f"npm install -g lean-ctx-bin@{LEANCTX_VERSION} pi-lean-ctx@{LEANCTX_VERSION}"
     if dry_run:
-        print(f"  · (--with-agent) LeanCTX: {install}, then LEAN_CTX_NO_UPDATE_CHECK=1 "
-              "lean-ctx harden && lean-ctx init --agent pi (air-gapped; best-effort)")
+        print(f"  · (--with-agent) LeanCTX: {install} (air-gapped, LEAN_CTX_NO_UPDATE_CHECK=1; pi "
+              "wiring is secagent init's job — launch-time + pi-scoped, no global init/harden)")
         return
     if not P.which("npm"):
         P.warn(f"npm not found — skipping LeanCTX (context compression). Install it, then: {install} "
                "(see secagent docs/leanctx.md)")
         return
     P.log(f"installing LeanCTX (binary + pi extension, pinned {LEANCTX_VERSION})")
+    # --loglevel=error --no-fund: quiet npm's funding spam and the deprecation warnings from
+    # third-party transitives in the pi-coding-agent tree (e.g. node-domexception@1.0.0, dead
+    # weight on Node 17+ but not ours to remove) — nothing here is actionable by us, and real
+    # errors (loglevel=error) still print. LEAN_CTX_NO_UPDATE_CHECK so the install never phones home.
+    env = {**_os_environ(), "LEAN_CTX_NO_UPDATE_CHECK": "1"}
     P.run(["npm", "install", "-g", f"lean-ctx-bin@{LEANCTX_VERSION}",
-           f"pi-lean-ctx@{LEANCTX_VERSION}"], check=False)
+           f"pi-lean-ctx@{LEANCTX_VERSION}", "--loglevel=error", "--no-fund"], check=False, env=env)
     if not P.which("lean-ctx"):
         P.warn("LeanCTX binary not on PATH after install — pi-side compression won't run yet "
                "(re-run once `lean-ctx` is installed; see secagent docs/leanctx.md)")
         return
-    # Air-gapped: never phone home for updates. harden tightens the MCP/shell surface; init --agent
-    # pi writes pi's LeanCTX config. Both best-effort — a failure here never aborts the deploy.
-    env = {**_os_environ(), "LEAN_CTX_NO_UPDATE_CHECK": "1"}
-    P.run(["lean-ctx", "harden"], check=False, env=env)
-    P.run(["lean-ctx", "init", "--agent", "pi"], check=False, env=env)
-    P.log("LeanCTX wired into pi (hardened, update-check disabled)")
+    P.log("LeanCTX binary + pi extension installed — `secagent init` wires pi (launch-time, pi-scoped)")
+
+
+# The marker-bounded blocks `lean-ctx init`/`harden` write into the operator's ~/.zshrc: the shell
+# hook that sources the compression wrapper, and the agent aliases that wrap claude/codex/gemini.
+_LEANCTX_ZSHRC_BLOCKS = (
+    ("# lean-ctx shell hook — begin", "# lean-ctx shell hook — end"),
+    ("# >>> lean-ctx agent aliases >>>", "# <<< lean-ctx agent aliases <<<"),
+)
+
+
+def _strip_leanctx_zshrc(text: str) -> str:
+    """Remove the marker-bounded LeanCTX blocks (:data:`_LEANCTX_ZSHRC_BLOCKS`) from a ~/.zshrc body,
+    collapsing the blank lines left behind. Anything outside those markers is left byte-for-byte
+    as-is. Idempotent — a body with no LeanCTX block is returned unchanged."""
+    for start, end in _LEANCTX_ZSHRC_BLOCKS:
+        text = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"[^\n]*\n?", "",
+                      text, flags=re.DOTALL)
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def _strip_leanctx_claude(path: Path) -> bool:
+    """Drop LeanCTX's hooks + MCP allows + the Grep/Glob deny from a Claude Code ``settings.json``,
+    leaving every other setting untouched. Returns whether anything changed (so the caller only
+    rewrites + logs on a real edit). Any hook whose command mentions ``lean-ctx`` is removed; an
+    event group left empty is dropped."""
+    data = json.loads(path.read_text() or "{}")
+    changed = False
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            groups = hooks[event]
+            if not isinstance(groups, list):
+                continue
+            kept_groups = []
+            for group in groups:
+                cmds = group.get("hooks") if isinstance(group, dict) else None
+                if not isinstance(cmds, list):
+                    kept_groups.append(group)
+                    continue
+                kept = [h for h in cmds
+                        if not (isinstance(h, dict) and "lean-ctx" in str(h.get("command", "")))]
+                if len(kept) != len(cmds):
+                    changed = True
+                if kept:
+                    kept_groups.append({**group, "hooks": kept})
+            if kept_groups:
+                hooks[event] = kept_groups
+            else:
+                del hooks[event]
+                changed = True
+        if not hooks:
+            data.pop("hooks", None)
+    perms = data.get("permissions")
+    if isinstance(perms, dict):
+        allow = perms.get("allow")
+        if isinstance(allow, list):
+            kept = [a for a in allow if not str(a).startswith("mcp__lean-ctx__")]
+            if len(kept) != len(allow):
+                perms["allow"] = kept
+                changed = True
+        deny = perms.get("deny")
+        if isinstance(deny, list):
+            kept = [d for d in deny if d not in ("Grep", "Glob")]
+            if len(kept) != len(deny):
+                perms["deny"] = kept
+                changed = True
+        for key in ("allow", "deny"):
+            if key in perms and not perms[key]:
+                del perms[key]
+        if not perms:
+            data.pop("permissions", None)
+    if changed:
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    return changed
+
+
+def _unwrap_leanctx_operator(dry_run: bool = False) -> None:
+    """Remove any GLOBAL LeanCTX wrap from the operator's shell + Claude Code. LeanCTX must attach
+    only at pi-launch time (secagent's launch contract) — never to the developer's interactive
+    shell or their OTHER agents (claude/codex/gemini). Cleans the marker-bounded block an older
+    ``lean-ctx init``/``harden`` left in ~/.zshrc and drops lean-ctx hooks/allows from
+    ~/.claude/settings.json. Idempotent + best-effort: a box that was never wrapped is a no-op."""
+    _user, home = _native_user()
+    home_path = Path(home)
+    zshrc = home_path / ".zshrc"
+    claude = home_path / ".claude" / "settings.json"
+    if dry_run:
+        print("  · (--with-agent) LeanCTX: un-wrap the operator (~/.zshrc shell hook + agent "
+              "aliases, ~/.claude lean-ctx hooks) — pi-launch-time only, never a host-wide wrap")
+        return
+    try:
+        if zshrc.exists():
+            text = zshrc.read_text()
+            cleaned = _strip_leanctx_zshrc(text)
+            if cleaned != text:
+                zshrc.write_text(cleaned)
+                P.log("un-wrapped LeanCTX from ~/.zshrc (shell hook + agent aliases)")
+    except OSError as exc:
+        P.warn(f"could not un-wrap ~/.zshrc — remove the lean-ctx block by hand: {exc}")
+    try:
+        if claude.exists() and _strip_leanctx_claude(claude):
+            P.log("removed LeanCTX hooks from ~/.claude/settings.json")
+    except (OSError, json.JSONDecodeError) as exc:
+        P.warn(f"could not clean ~/.claude/settings.json — remove lean-ctx hooks by hand: {exc}")
 
 
 def _configure_hosts(assume_yes: bool = False) -> None:
@@ -528,7 +637,11 @@ def build(manifest: Manifest, work: Path, out: Path, root: Path,
     # since pi is only needed for interactive use, never for secagent's own review/MCP servers.
     if "secagent" not in without:
         if P.which("npm"):
-            P.run(["npm", "install", "-g", "@earendil-works/pi-coding-agent"], check=False)
+            # --loglevel=error --no-fund: pi's transitive deps still pull deprecated third-party
+            # packages (node-domexception@1.0.0 &c.) we can't remove — quiet that non-actionable
+            # noise while keeping real errors visible. See install_leanctx for the same rationale.
+            P.run(["npm", "install", "-g", "@earendil-works/pi-coding-agent",
+                   "--loglevel=error", "--no-fund"], check=False)
         else:
             P.warn("npm not found — pi (the agent runtime secagent's tools/skills plug into) "
                    "won't be installed; install Node.js, then `npm install -g "
@@ -607,10 +720,30 @@ def _venv_bin(root: Path, project: str, script: str) -> Path:
     return root / "work" / project / ".venv" / "bin" / script
 
 
-def _secllm_backend(root: Path) -> str:
-    """"mlx" if secllm's venv actually has mlx-lm installed (the real inference engine on Apple
-    Silicon — see build()'s "secllm": ["--extra", "mlx"]), else "mock" with a warning — e.g. an
-    Intel Mac, or a deploy that ran before a `build macos` synced the mlx extra."""
+def _metal_venv() -> Path:
+    """The vLLM-Metal venv secllm's `metal` backend runs `vllm serve` from — mirrors secllm's
+    own ``SECLLM_METAL_VENV`` default (~/.venv-vllm-metal), honoring an override if the operator
+    set one in this deploy's environment."""
+    return Path(os.environ.get("SECLLM_METAL_VENV", "~/.venv-vllm-metal")).expanduser()
+
+
+def _secllm_backend(root: Path, prefer: str = "auto") -> str:
+    """Resolve the SecLLM backend the launchd daemon runs.
+
+    ``prefer`` is the secsite.toml ``inference_backend``: "metal" selects vLLM-Metal iff its venv
+    (``vllm`` present — see :func:`_metal_venv`) is installed, else warns and falls through to
+    auto. "auto"/"mlx" pick "mlx" when secllm's venv has mlx-lm (build()'s ``--extra mlx``), else
+    "mock" with a warning (e.g. an Intel Mac, or a deploy before ``build macos`` synced it).
+    "mock" forces the stub."""
+    if prefer == "metal":
+        if (_metal_venv() / "bin" / "vllm").exists():
+            return "metal"
+        P.warn(f"secllm: inference_backend=metal but no vLLM-Metal venv at {_metal_venv()} "
+               "(install it: curl -fsSL "
+               "https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash) "
+               "— falling back to auto (mlx/mock)")
+    if prefer == "mock":
+        return "mock"
     python = _venv_bin(root, "secllm", "python3")
     if python.exists():
         r = P.run([str(python), "-c", "import mlx_lm"], check=False)
@@ -713,10 +846,19 @@ def deploy(
     with_agent: bool = False,
     native_services: bool = True,
     autostart_models: list[str] | None = None,
+    inference_backend: str = "auto",
     users=None,
+    secchat_pool=None,
+    secchat_voice=None,
+    site_builds=None,
+    audit_opts=None,
 ) -> None:
     without = without or []
     users = users or []
+    # Optional site container builds ([[builds]] in secsite.toml) — run FIRST so every image a
+    # later step references (the pool runnerd, analyzer sidecars, tooling) exists by the time the
+    # pool spec / catalog needs it. Best-effort; docker's cache makes repeat deploys cheap.
+    common.run_site_builds(site_builds or [], work, dry_run)
     # Topology placement: only bring up the components placed on `resource` (single-host
     # synthesis places everything here, so this is a no-op without a topology.toml).
     placed = set(topology.components_on(resource, without)) if topology is not None else None
@@ -765,7 +907,8 @@ def deploy(
     P.log(f"deploy {NAME} — suite {manifest.suite} (SECSUITE_VERSION passed to compose)")
     written: dict[str, object] | None = None
     if topology is not None and not dry_run and out is not None:
-        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without)
+        written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without,
+                                          audit_opts=audit_opts)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
     if dry_run and topology is not None:
         here = ", ".join(services) or "(none)"
@@ -849,7 +992,10 @@ def deploy(
     # installed (see _secllm_backend). Runs as the user (high port).
     if with_inference and topology is not None and _here("secllm"):
         port = manifest.components["secllm"].port
-        backend = _secllm_backend(root)
+        backend = _secllm_backend(root, inference_backend)
+        # The metal backend runs `vllm serve` from an external venv — tell secllm where it is
+        # (its own default is the same path, but be explicit so an operator override flows through).
+        metal_env = {"SECLLM_METAL_VENV": str(_metal_venv())} if backend == "metal" else {}
         fallback = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND={backend} "
                     f"uv run --project work/secllm secllm serve")
         if not dry_run and native_services and not _ensure_native_venv(root, "secllm"):
@@ -863,9 +1009,14 @@ def deploy(
                 name="secllm",
                 program_args=[str(_venv_bin(root, "secllm", "secllm")), "serve"],
                 log_dir=log_dir,
+                # SECLLM_MAX_LOADED unset → secllm's default 0 = "models coexist, no eviction"
+                # (its concurrent multi-model serving). On macOS/MLX there's no GPU inventory to
+                # pack against, so workers just launch and share unified memory — both autostart
+                # models stay resident. (Set >0 only to restore the old hard ceiling / switch
+                # semantics, e.g. 1 = loading a new model evicts the oldest.)
                 env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(port),
                      "SECLLM_BACKEND": backend, "SECLLM_ADMIN_TOKEN": admin_token,
-                     "SECLLM_AUTOSTART": ",".join(autostart_models or [])},
+                     "SECLLM_AUTOSTART": ",".join(autostart_models or []), **metal_env},
                 working_dir=str(root), user=user,
             )
             _install_or_note(secllm, staging_dir, native_services=native_services,
@@ -916,13 +1067,46 @@ def deploy(
         if redir:
             P.log("secsso: pointed the SecChat OIDC client at its topology callback "
                   "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+        # Optional agent pool: when build_image is set, build+push the runnerd image FIRST so the
+        # .env sync + manifests below reference the pushed (digest-pinned) image. Mutates the in-memory
+        # PoolOptions.image; best-effort (a build/push failure leaves image as-is and warns).
+        if secchat_pool is not None and secchat_pool.enabled and secchat_pool.build_image:
+            built = common.build_push_runnerd_image(secchat_pool, work)
+            if built:
+                secchat_pool.image = built
         # NB: a distinct name — NOT `written` — so this doesn't clobber the addressing dict from
         # write_addressing() above, which the deploy-audit call below still needs as `addressing=`.
         written_secchat = wiring.sync_secchat_env(
-            work / "secsso" / ".env", work / "secchat" / ".env", topology, without)
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without,
+            pool=secchat_pool, voice=secchat_voice)
         if written_secchat:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(written_secchat)} keys)")
+        # Optional Kubernetes agent pool: emit the cluster manifests, and (when apply is set) apply
+        # them for the operator instead of leaving them as inert JSON.
+        pool_sa_provisioned = False
+        if secchat_pool is not None and secchat_pool.enabled:
+            pool_path = wiring.write_pool_manifests(secchat_pool, base_out / "addressing")
+            if pool_path:
+                P.log(f"secchat: wrote Kubernetes agent-pool manifests → {pool_path} "
+                      "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
+                if secchat_pool.apply:
+                    common.apply_pool_manifests(secchat_pool, pool_path)
+                # Out-of-cluster SecChat: extract the SA token + CA and mount them into the compose
+                # service (compose.override.yaml) — BEFORE the stacks bring-up below, so the secchat
+                # container starts with its cluster credential in place. Folds the voice media
+                # relay's mediad service into the SAME compose.override.yaml when also enabled
+                # (Compose auto-merges only one override file — see provision_pool_credentials).
+                if secchat_pool.apply and secchat_pool.create_service_account:
+                    pool_sa_provisioned = common.provision_pool_credentials(
+                        secchat_pool, work / "secchat", voice=secchat_voice)
+        # Voice media relay (secchat-mediad), when enabled and NOT already folded into the pool's
+        # compose.override.yaml above (either no pool SA credential is being provisioned, or that
+        # step failed) — writes mediad's own compose.override.yaml with just the media-relay
+        # service + the new `recordings` volume. BEFORE the stacks bring-up below, same as the
+        # pool credential mount, so `mediad` exists in the compose project from the first `up`.
+        if secchat_voice is not None and secchat_voice.enabled and not pool_sa_provisioned:
+            common.write_mediad_compose(secchat_voice, work / "secchat")
 
     # SecRecorder (a NATIVE service, not a stack) turnkey SSO. Same early-seed + SecSSO-co-placement
     # requirement as the SecChat block above, but adapted to a native service: there's no stack .env
@@ -1050,6 +1234,12 @@ def deploy(
             else:
                 P.warn(f"secagent init failed — wire up pi yourself: {init_cmd}")
 
+        # Belt-and-suspenders: strip any GLOBAL LeanCTX wrap from the operator's shell + Claude
+        # Code that an older deploy (or `secagent init`'s own `lean-ctx init --agent pi`) may have
+        # left. LeanCTX attaches only at pi-launch time now — never to the developer's interactive
+        # shell or their other agents. No-op on a box that was never wrapped.
+        _unwrap_leanctx_operator(dry_run)
+
     # SecRecorder — native MLX/Metal (never containerized on macOS). Runs as the user; TLS optional
     # (a SecCert cert via certbot, reachable across the container boundary through
     # host.docker.internal — the one fronted name that DOES resolve inside the SecCert container)
@@ -1136,6 +1326,12 @@ def deploy(
                 sp_conf.write_text(wiring.nginx_conf_text(
                     topology, str(sp_cert), without, state_dir=str(sp_state),
                     user=_nginx_conf_user(user)))
+                # No logrotate config is installed here — macOS is a launchd host with no
+                # cron/logrotate by default (unlike fedora-fips, which installs
+                # wiring.logrotate_conf_text()'s output to /etc/logrotate.d/secproxy; see
+                # targets/fedora_fips.py). The macOS-native equivalent is `newsyslog`
+                # (/etc/newsyslog.d/*.conf, driven by periodic(8) — see `man newsyslog.conf`);
+                # wiring it up is left to the operator for this eval target (see docs/macos.md).
                 # Cert BEFORE the checklist/landing page below, so they reflect what actually
                 # landed: certbot's cross-boundary ACME issuance usually can't complete on macOS
                 # (see _issue_secproxy_cert), leaving a self-signed fallback that --trust-ca's
@@ -1154,6 +1350,11 @@ def deploy(
                 )
                 (sp_state / "www" / "index.html").write_text(wiring.landing_page_html(
                     topology, without, setup_actions=setup_actions))
+                # Branded 502/503/504/404 pages (see wiring.error_page_html) — nginx_conf_text's
+                # generated server blocks error_page-route to these, alongside the landing page,
+                # in the same www root.
+                (sp_state / "www" / "5xx.html").write_text(wiring.error_page_html("5xx"))
+                (sp_state / "www" / "404.html").write_text(wiring.error_page_html("404"))
                 secproxy = launchd.LaunchdService(
                     name="secproxy",
                     program_args=[nginx, "-c", str(sp_conf), "-g", "daemon off;"],
@@ -1263,7 +1464,7 @@ def _secproxy_setup_actions(
             "REQUESTS_CA_BUNDLE=$PWD/out/seccert-root.pem</code> first. Then authenticate as "
             "yourself: <code>work/secagent/.venv/bin/secagent login</code> (prints a device-code "
             "URL to approve in a browser) — then <code>pi --provider secrouter --model "
-            "balanced</code>, and to load secagent's own tools, <code>pi --extension "
+            "gemma-4-26B-A4B-it</code>, and to load secagent's own tools, <code>pi --extension "
             "work/secagent/pi/extensions/secagent.ts</code>."
         )
     return actions

@@ -30,12 +30,11 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 
 [components.secsso]
 repo = "secrouter/secsso"
-# Pinned at the global-issuer-anchor branch (secsso PR #10): the secrouter provider's
-# issuer_mode: global, which the root well-known alias in this repo's generated secproxy nginx
-# conf serves as the bare-root issuer's discovery doc (see wiring.nginx_conf_text). The
-# exact-sub service-identity work (feat/service-subject-subs) is already on main. Repin to
-# main once PR #10 merges, then to a release tag at the next suite release.
-ref = "feat/global-issuer-anchor"
+# main — carries the secchatng OIDC blueprint, the redirect-env passthrough, and the exact-sub
+# service identities (svc-secagent/svc-secchat app-password grants, SECAGENT_SVC_APP_PASSWORD/
+# SECCHAT_SVC_APP_PASSWORD env) this repo's wiring composites depend on. Repin to a secsso
+# release tag at the next suite release.
+ref = "main"
 kind = "stack"
 tier = "identity"
 port = 9000
@@ -56,7 +55,12 @@ role = "internal DNS — resolves the suite's *.internal names (drop it when you
 # ── Inference ──
 [components.secllm]
 repo = "secrouter/secllm"
-ref = "v1.1.0"
+# main (post-v1.1.0): the integrated superset — native Apple-Silicon MLX backend (the `mlx`
+# extra + backends/mlx_server.py + mlx_model catalog quants), the admin Download button
+# (decoupled from Load) with live download-progress, concurrent multi-model serving
+# (max_loaded=0 default: models coexist without eviction), and API-call tracking. Required for
+# real local inference on macOS — v1.1.0 has only the vllm/mock backends. Re-pin to a tag once cut.
+ref = "main"
 kind = "service"
 tier = "inference"
 port = 11400
@@ -66,7 +70,10 @@ role = "local inference — vLLM control plane (SecRouter routes to it)"
 # ── Gateway ──
 [components.secrouter]
 repo = "secrouter/secrouter"
-ref = "v1.1.0"
+# main (post-v1.1.0): forwards OpenAI-format `tools`/`tool_choice` to the upstream (v1.1.0 dropped
+# them, so agent tool-calls never reached secllm — the model hallucinated calls as text), plus the
+# SecLLM `<tag>` model remap and health-aware routing. Re-pin to a tag once cut.
+ref = "main"
 kind = "service"
 tier = "gateway"
 port = 47002
@@ -111,6 +118,7 @@ kind = "service"
 tier = "collab"
 port = 47003
 fronted = true
+optional = true   # eval instance drops it via secsite `without` (transcription not under test)
 runtime = "python>=3.11"
 role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
 

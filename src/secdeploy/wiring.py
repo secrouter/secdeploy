@@ -23,14 +23,16 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .manifest import Manifest
-from .site import SiteConfig, UserSpec
+from .site import AuditOptions, PoolOptions, SiteConfig, UserSpec, VoiceOptions
 from .topology import Topology
 
-# This suite's internal-CUI classification level — the default `authorizedClassifications`
-# for the SecRouter egress rule secrouter_egress_rules() builds (see there). Override per call
-# for a different/broader classification ladder (checkEgress does an exact membership check,
-# not a hierarchical one — see secrouter_egress_rules' docstring).
-DEFAULT_EGRESS_CLASSIFICATIONS = ["CUI"]
+# The default `authorizedClassifications` for the SecRouter egress rules secrouter_egress_rules()
+# builds — the suite's internal-CUI level AND every level below it. checkEgress does an EXACT
+# membership check (not hierarchical), so a rule cleared for CUI must ALSO list UNCLASSIFIED or an
+# unmarked request (which SecChat/assistant send as UNCLASSIFIED) is egress-denied → 502. A provider
+# inside the accreditation boundary that is cleared for CUI can obviously handle the lower level too.
+# Override per call for a different/broader ladder (keep it in ascending order).
+DEFAULT_EGRESS_CLASSIFICATIONS = ["UNCLASSIFIED", "CUI"]
 
 
 def active_topology(
@@ -278,7 +280,9 @@ def landing_page_html(
 \t\theader {{ display:flex; align-items:center; gap:14px; padding:14px 22px; background:var(--panel);
 \t\t         border-bottom:1px solid var(--border); border-top:3px solid var(--accent); }}
 \t\theader h1 {{ font-size:15px; margin:0; font-weight:700; text-transform:uppercase; letter-spacing:.14em; }}
-\t\theader .lock {{ color:var(--accent); }}
+\t\theader h1 .sec {{ color:var(--accent); }}
+\t\t/* one currentColor hexagon works in both themes (nodes follow --fg, hub follows --accent) */
+\t\theader .brand-mark {{ height:26px; width:auto; display:block; color:var(--fg); }}
 \t\theader .who {{ margin-left:auto; color:var(--muted); font:11px var(--mono);
 \t\t              text-transform:uppercase; letter-spacing:.08em; }}
 \t\tmain {{ padding:24px 22px; max-width:900px; margin:0 auto; }}
@@ -312,10 +316,18 @@ def landing_page_html(
 </head>
 <body>
 \t<header>
-\t\t<span class="lock">🔒</span>
-\t\t<h1>SecRouter Suite</h1>
+\t\t<svg class="brand-mark" viewBox="0 0 48 58" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+\t\t\t<g transform="translate(4,5)">
+\t\t\t\t<polygon points="24,2 44,13 44,37 24,54 4,37 4,13" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+\t\t\t\t<path d="M24 28 L24 14 M24 28 L14 38 M24 28 L34 38" stroke="currentColor" stroke-width="1.9"/>
+\t\t\t\t<path d="M24 14 L14 38 M24 14 L34 38 M14 38 L34 38" stroke="currentColor" stroke-width="1.4" stroke-opacity="0.4"/>
+\t\t\t\t<circle cx="24" cy="14" r="2.7" fill="currentColor"/><circle cx="14" cy="38" r="2.7" fill="currentColor"/><circle cx="34" cy="38" r="2.7" fill="currentColor"/>
+\t\t\t\t<circle cx="24" cy="28" r="4.4" fill="var(--accent)"/>
+\t\t\t</g>
+\t\t</svg>
+\t\t<h1><span class="sec">SEC</span>ROUTER SUITE</h1>
 \t\t<span class="who">{domain}</span>
-\t\t<button class="btn ghost theme-toggle" title="Toggle light / dark" onclick="toggleTheme()">DARK</button>
+\t\t<button class="btn ghost theme-toggle" title="Toggle light / dark" onclick="toggleTheme()">◐</button>
 \t</header>
 \t<main>
 \t\t<div class="card">
@@ -330,12 +342,85 @@ def landing_page_html(
 \t\tfunction effectiveTheme(){{ var a=document.documentElement.getAttribute("data-theme");
 \t\t\tif(a==="dark"||a==="light") return a;
 \t\t\treturn (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"; }}
+\t\t/* The ◐ glyph is theme-neutral (secrecorder's toggle pattern) — no label swap needed. */
 \t\tfunction setTheme(t){{ document.documentElement.setAttribute("data-theme", t);
-\t\t\ttry {{ localStorage.setItem("secrouter-theme", t); }} catch(e){{}}
-\t\t\tvar b=document.querySelector(".theme-toggle"); if(b) b.textContent = effectiveTheme()==="dark" ? "LIGHT" : "DARK"; }}
+\t\t\ttry {{ localStorage.setItem("secrouter-theme", t); }} catch(e){{}} }}
 \t\tfunction toggleTheme(){{ setTheme(effectiveTheme()==="dark" ? "light" : "dark"); }}
-\t\tsetTheme(effectiveTheme());
 \t</script>
+</body>
+</html>
+"""
+
+
+def error_page_html(kind: str) -> str:
+    """A tiny SecRouter-styled error page for nginx's ``error_page`` directive (see
+    :func:`nginx_conf_text`) — so a fronted service that's down, or a path nginx itself can't
+    route, still lands on something that reads as part of the suite rather than nginx's stock
+    white-on-grey default (previously the ONLY unbranded surface on the fronted HTTPS path).
+
+    ``kind`` is ``"5xx"`` (the nginx-ORIGINATED gateway failures — connection refused/timeout;
+    see :func:`nginx_conf_text`'s ``proxy_intercept_errors`` comment for why this deliberately
+    does NOT also catch an upstream's own error responses) or ``"404"``.
+
+    Same "field console" tokens/mono as :func:`landing_page_html`, deliberately NOT reusing its
+    full markup — this is a terse bounce page (wordmark + one-line message), no services table,
+    no theme toggle worth the extra weight — so it stays a tiny, self-contained file (no shared
+    asset path across nginx server blocks/targets, same reasoning as the landing page). OS-only
+    dark mode (``prefers-color-scheme``, no persisted toggle) is enough for a page nobody spends
+    time on.
+    """
+    title, message = {
+        "5xx": ("upstream unavailable", "The service behind this address didn't respond. Try again shortly."),
+        "404": ("not found", "Nothing is served at this address."),
+    }[kind]
+    esc_title = html.escape(title)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+\t<meta charset="utf-8">
+\t<meta name="viewport" content="width=device-width, initial-scale=1">
+\t<title>{esc_title} — SecRouter Suite</title>
+\t<style>
+\t\t:root {{
+\t\t\t--mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+\t\t\t--sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+\t\t\t--bg:#e7e3d8; --panel:#f3f0e8; --fg:#211f18; --muted:#6c6552;
+\t\t\t--accent:#4f6a2e; --border:#cdc6b2; --shadow:2px 2px 0 rgba(33,31,24,.06);
+\t\t}}
+\t\t@media (prefers-color-scheme: dark) {{
+\t\t\t:root {{
+\t\t\t\t--bg:#171511; --panel:#201e17; --fg:#e8e3d3; --muted:#9a9077;
+\t\t\t\t--accent:#94ad50; --border:#3a3730; --shadow:2px 2px 0 rgba(0,0,0,.30);
+\t\t\t}}
+\t\t}}
+\t\t* {{ box-sizing:border-box; }}
+\t\tbody {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+\t\t       font:14px/1.55 var(--sans); background:var(--bg); color:var(--fg); }}
+\t\t.card {{ background:var(--panel); border:1px solid var(--border); border-radius:2px;
+\t\t         box-shadow:var(--shadow); padding:28px 34px; text-align:center; max-width:420px; }}
+\t\t.wordmark {{ font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.14em;
+\t\t             color:var(--muted); margin-bottom:14px; }}
+\t\t.wordmark .sec {{ color:var(--accent); }}
+\t\t.brand-mark {{ height:34px; width:auto; display:block; margin:0 auto 10px; color:var(--fg); }}
+\t\th1 {{ margin:0 0 8px; font:700 20px var(--mono); text-transform:uppercase; letter-spacing:.04em; }}
+\t\tp {{ margin:0; color:var(--muted); }}
+\t</style>
+</head>
+<body>
+\t<div class="card">
+\t\t<svg class="brand-mark" viewBox="0 0 48 58" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+\t\t\t<g transform="translate(4,5)">
+\t\t\t\t<polygon points="24,2 44,13 44,37 24,54 4,37 4,13" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+\t\t\t\t<path d="M24 28 L24 14 M24 28 L14 38 M24 28 L34 38" stroke="currentColor" stroke-width="1.9"/>
+\t\t\t\t<path d="M24 14 L14 38 M24 14 L34 38 M14 38 L34 38" stroke="currentColor" stroke-width="1.4" stroke-opacity="0.4"/>
+\t\t\t\t<circle cx="24" cy="14" r="2.7" fill="currentColor"/><circle cx="14" cy="38" r="2.7" fill="currentColor"/><circle cx="34" cy="38" r="2.7" fill="currentColor"/>
+\t\t\t\t<circle cx="24" cy="28" r="4.4" fill="var(--accent)"/>
+\t\t\t</g>
+\t\t</svg>
+\t\t<div class="wordmark"><span class="sec">SEC</span>PROXY</div>
+\t\t<h1>{esc_title}</h1>
+\t\t<p>{html.escape(message)}</p>
+\t</div>
 </body>
 </html>
 """
@@ -348,6 +433,36 @@ def landing_page_html(
 # nginx natively too (see targets/macos.py + docs/macos.md) — hardcoding it here is fine, only
 # cert_dir varies.
 _NGINX_STATE_DIR = "/var/lib/secsuite/secproxy"
+
+
+def _error_page_lines(state_dir: str) -> list[str]:
+    """``error_page``/internal-``location`` lines for the branded 5xx/404 pages (see
+    :func:`error_page_html`), repeated verbatim into EVERY server block below (both the landing
+    page's and each fronted proxy's) — nginx resolves an ``error_page`` target URI within the
+    SAME server block that generated the error, so there is no http-level location that could
+    cover all of them from one place.
+
+    Deliberately no ``proxy_intercept_errors on;`` anywhere in this file: that directive is what
+    makes nginx replace an UPSTREAM-generated 4xx/5xx response (e.g. secchat's own JSON error
+    body) with the error_page target too. Left at its default (off), ``error_page`` only ever
+    fires for responses NGINX ITSELF invents — 502 (connection refused), 504 (upstream timeout),
+    503, and a 404 with no matching location/file — never a status code the proxied application
+    chose on purpose. That's exactly the split we want: brand "the upstream didn't answer", never
+    mask a legitimate API error body. The ``location`` blocks are ``internal`` so the pages are
+    only reachable via the error_page rewrite, never dialed directly.
+    """
+    return [
+        "\t\terror_page 502 503 504 /5xx.html;",
+        "\t\terror_page 404 /404.html;",
+        "\t\tlocation = /5xx.html {",
+        "\t\t\tinternal;",
+        f"\t\t\troot {state_dir}/www;",
+        "\t\t}",
+        "\t\tlocation = /404.html {",
+        "\t\t\tinternal;",
+        f"\t\t\troot {state_dir}/www;",
+        "\t\t}",
+    ]
 
 
 def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None = None,
@@ -378,13 +493,16 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
       dial bypasses DNS/itself rather than looping back through the very front door it's serving.
       Each carries the standard ``X-Forwarded-*``/``X-Real-IP``/``Host`` reverse-proxy headers and
       the WebSocket ``Upgrade``/``Connection`` pair;
-    * on the **SecSSO** server block only, a root ``/.well-known/openid-configuration`` alias:
-      the suite's verifiers pin the bare-root issuer (``issuer_mode: global`` — see
-      :func:`secrouter_oidc_config`), but Authentik serves discovery docs only under
-      ``/application/o/<slug>/``, so standard discovery against the root (e.g. SecRouter's
-      admin-ui login) would 404 without it. It serves the canonical ``secrouter`` provider's
-      doc, whose ``issuer`` field IS the root (``secsso/blueprints/secrouter-oidc.yaml`` pins
-      that provider ``issuer_mode: global`` for exactly this).
+    * SecSSO's block ADDITIONALLY gets a ``location = /.well-known/openid-configuration`` that
+      rewrites to the ``secrouter-admin-console`` application's own discovery doc — with
+      ``issuer_mode: global`` (see the OIDC-provider blueprints) a client's discovery fetch off
+      the root issuer would otherwise 404, since Authentik only ever serves that document under
+      ``/application/o/<slug>/...`` (see the loop body for the full explanation; this is what
+      unblocks ``secrouter``'s ``admin-ui.ts`` ``login()``).
+    * every server block (landing page + each fronted proxy) also gets branded 502/503/504/404
+      error pages (:func:`error_page_html`, via :func:`_error_page_lines`) instead of nginx's
+      stock pages — see that helper's docstring for why ``proxy_intercept_errors`` is deliberately
+      left off (upstream JSON error bodies must pass through untouched).
 
     Deterministic manifest order, so the output is stable/testable.
 
@@ -395,6 +513,10 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
     nginx as root with no user drop of its own (see ``targets/macos.py``).
     """
     fronted = fronted_instances(topology, without)
+    # SecSSO's own FQDN — special-cased below so its :443 server block also rewrites the
+    # OIDC discovery well-known to the secrouter-admin-console application's actual doc. See
+    # the loop over `fronted` for why.
+    secsso_fqdn = topology.fqdn("secsso")
     lines = [
         "# nginx config for secproxy — generated by secdeploy from the site topology",
         "# edit topology.toml, not this file",
@@ -415,7 +537,17 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
         "\t# ProtectSystem=strict makes nginx's default /var/log/nginx, /var/lib/nginx and /run",
         "\t# paths read-only — keep every writable path inside the service state dir (granted by",
         "\t# secproxy.service's ReadWritePaths), so no default nginx temp/log/pid path is touched.",
-        f"\taccess_log {state_dir}/access.log;",
+        "\t#",
+        "\t# 'secproxy' log format: nginx's stock 'combined' plus $request_id (correlate a",
+        "\t# request across secproxy + the fronted backend's own logs), $request_time (total",
+        "\t# time nginx spent on the request) and $upstream_response_time (time the upstream",
+        "\t# backend took) — log HYGIENE only; retention/integrity/forwarding is downstream/",
+        "\t# environment-owned (see docs/compliance.md), not something this config enforces.",
+        "\tlog_format secproxy '$remote_addr - $remote_user [$time_local] '",
+        "\t                    '\"$request\" $status $body_bytes_sent '",
+        "\t                    '\"$http_referer\" \"$http_user_agent\" '",
+        "\t                    'rid=$request_id rt=$request_time urt=$upstream_response_time';",
+        f"\taccess_log {state_dir}/access.log secproxy;",
         f"\tclient_body_temp_path {state_dir}/tmp/client_body;",
         f"\tproxy_temp_path {state_dir}/tmp/proxy;",
         f"\tfastcgi_temp_path {state_dir}/tmp/fastcgi;",
@@ -471,15 +603,10 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             "",
             f"\t\troot {state_dir}/www;",
             "\t\tindex index.html;",
+            *_error_page_lines(state_dir),
             "\t}",
             "",
         ]
-    # SecSSO's fronted names — its server block additionally aliases the root OIDC discovery
-    # path (see the docstring bullet). Instance-name based, same as fronted_instances' fqdns.
-    secsso_fqdns = (
-        {topology.fqdn(iname) for iname, _res, _addr in topology.instances("secsso")}
-        if "secsso" in topology.manifest.select(without) else set()
-    )
     for fqdn, addr, port in fronted:
         lines += [
             "\tserver {",
@@ -491,20 +618,30 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             f"\t\tssl_certificate_key {cert_dir}/privkey.pem;",
             "",
         ]
-        if fqdn in secsso_fqdns:
+        if fqdn == secsso_fqdn:
+            # With issuer_mode: global (secrouter-admin-console.yaml, secchat-service.yaml,
+            # secagent-service.yaml), every token's `iss` is the bare root
+            # (https://secsso.sec.internal/), so any client doing RFC 8414 discovery from the
+            # issuer — SecRouter's admin-ui.ts login() fetches
+            # `${issuer}/.well-known/openid-configuration` — asks for
+            # /.well-known/openid-configuration at the ROOT, not under an application slug.
+            # Authentik itself only ever serves that document under
+            # /application/o/<slug>/.well-known/openid-configuration — there is no root-level
+            # discovery endpoint in Authentik 2024.12, global issuer_mode or not. This rewrite
+            # is what makes the root URL a client's discovery actually resolve. Points at the
+            # secrouter-admin-console application specifically since that's the client whose
+            # bootstrap needs it (its authorize/token endpoints are already global paths so the
+            # rest of the doc works unmodified) — a different fronted client needing discovery
+            # at the root would need its own such rewrite.
             lines += [
-                "\t\t# Root OIDC discovery: the suite's verifiers pin the bare-root issuer",
-                "\t\t# (issuer_mode: global), but Authentik only serves discovery docs under",
-                "\t\t# /application/o/<slug>/ — so serve the canonical `secrouter` provider's doc",
-                "\t\t# (its issuer field IS this root; secsso/blueprints/secrouter-oidc.yaml) at",
-                "\t\t# the root path, for standard discovery like SecRouter's admin-ui login.",
                 "\t\tlocation = /.well-known/openid-configuration {",
-                f"\t\t\tproxy_pass http://{addr}:{port}"
-                "/application/o/secrouter/.well-known/openid-configuration;",
-                "\t\t\tproxy_http_version 1.1;",
+                f"\t\t\tproxy_pass http://{addr}:{port}/application/o/secrouter-admin-console"
+                "/.well-known/openid-configuration;",
                 "\t\t\tproxy_set_header Host $host;",
-                "\t\t\tproxy_set_header X-Real-IP $remote_addr;",
-                "\t\t\tproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+                # Authentik derives the scheme of EVERY URL in the served doc (issuer,
+                # authorize/token endpoints, jwks) from X-Forwarded-Proto — without it the
+                # upstream hop's plain http leaks into the doc and clients get http:// endpoints
+                # behind an https front door. Verified live against Authentik 2024.12.
                 "\t\t\tproxy_set_header X-Forwarded-Proto $scheme;",
                 "\t\t}",
                 "",
@@ -520,11 +657,50 @@ def nginx_conf_text(topology: Topology, cert_dir: str, without: list[str] | None
             "\t\t\tproxy_set_header Upgrade $http_upgrade;",
             "\t\t\tproxy_set_header Connection $connection_upgrade;",
             "\t\t}",
+            *_error_page_lines(state_dir),
             "\t}",
             "",
         ]
     lines.append("}")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def logrotate_conf_text(
+    state_dir: str = _NGINX_STATE_DIR, *, service_name: str = "secproxy",
+    owner: str = "secsuite-secproxy",
+) -> str:
+    """logrotate config for secproxy's nginx access/error logs (see :func:`nginx_conf_text`) —
+    fedora-fips installs this to ``/etc/logrotate.d/secproxy`` (systemd hosts run ``logrotate``
+    via a stock ``logrotate.timer``); macOS is a launchd host with no ``cron``/``logrotate`` by
+    default, so ``targets/macos.py`` deliberately skips installing this and only notes the
+    ``newsyslog`` alternative (``/etc/newsyslog.d/``) in a comment instead — see that module.
+
+    ``postrotate`` reloads the service (``systemctl reload <service_name>``, which runs nginx's
+    own ``ExecReload=... nginx -s reload`` — see ``deploy/fedora-fips/systemd/secproxy.service``)
+    so nginx re-opens fresh log files instead of continuing to write to the now-rotated-away
+    ones. A modest, deliberately unopinionated default (daily, 14 rotations, compressed) — actual
+    RETENTION policy and log INTEGRITY/forwarding are downstream/environment-owned (e.g. this
+    suite's own ``[audit]`` syslog sink, or a SIEM tailing these files), not something secdeploy
+    enforces; see docs/compliance.md.
+    """
+    return "\n".join([
+        "# secproxy nginx logs — generated by secdeploy (see wiring.nginx_conf_text). Rotation",
+        "# only: retention policy + log integrity/forwarding are downstream/environment-owned",
+        "# (see docs/compliance.md), not enforced here.",
+        f"{state_dir}/access.log {state_dir}/error.log {{",
+        "\tdaily",
+        "\trotate 14",
+        "\tmissingok",
+        "\tnotifempty",
+        "\tcompress",
+        "\tdelaycompress",
+        f"\tcreate 0640 {owner} {owner}",
+        "\tsharedscripts",
+        "\tpostrotate",
+        f"\t\tsystemctl reload {service_name}.service >/dev/null 2>&1 || true",
+        "\tendscript",
+        "}",
+    ]) + "\n"
 
 
 def env_text(
@@ -602,12 +778,12 @@ def secrouter_oidc_config(
     shape exactly (``issuer``, ``audience``, ``jwksUri``, ``serviceSubjects``).
 
     NOT env-var-driven in SecRouter today (unlike ``SECROUTER_SECLLM_ENDPOINTS``'s turnkey
-    intake) — SecRouter's ``FREEROUTER_CONFIG`` is a hand-authored JSON file, so this fragment
+    intake) — SecRouter's ``SECROUTER_CONFIG`` is a hand-authored JSON file, so this fragment
     is meant to be read and merged into ``security.oidc`` there by the operator (see
     :func:`write_addressing`, which writes it to ``secrouter-oidc.json`` for exactly that).
 
-    Values mirror secsso's own ``bootstrap/secsso.sh oidc-config``/``secagent-config`` output,
-    so the two never disagree: ``issuer``/``jwksUri`` are derived from SecSSO's
+    Values mirror secsso's own ``bootstrap/secsso.sh oidc-config``/``secagent-config`` output
+    exactly, so the two never disagree: ``issuer``/``jwksUri`` are derived from SecSSO's
     topology address (``https://secsso.<domain>:<port>/`` — same base :func:`secllm_endpoints`-
     style derivation every other cross-component URL in this module uses; if your SecSSO's own
     external URL differs from that convention, e.g. a reverse proxy on a different port, adjust
@@ -615,14 +791,15 @@ def secrouter_oidc_config(
 
     ``serviceSubjects`` names the suite's non-interactive service accounts, which otherwise
     trip ``requireMfa`` (client_credentials tokens can't carry an MFA assertion): always
-    ``"svc-secagent"``, plus ``"svc-secchat"`` when SecChat is placed in this topology. These
-    are the EXACT ``sub`` claims the secsso blueprints issue — each service authenticates via
-    Authentik's creds-path grant against a pre-provisioned service account with
-    ``sub_mode: user_username`` (see ``secsso/blueprints/secagent-service.yaml`` /
-    ``secchat-service.yaml``), so the names here are what live tokens actually carry, not
-    aspirations. ``svc-secchat`` is additionally a ``delegatingSubjects`` member: SecChat
-    forwards the acting end-user via ``X-Sec-Acting-User`` so SecRouter attributes
-    policy/budget/audit to that user.
+    ``"svc-secagent"`` (SecAgent's service account), plus ``"svc-secchat"`` (SecChat's single
+    shared service identity for the assistant path and pi — SecSSO client id
+    ``secchat-service``) when SecChat is placed in this topology. These are the EXACT ``sub``
+    claims the secsso blueprints issue — each service authenticates via Authentik's creds-path
+    grant against a pre-provisioned service account with ``sub_mode: user_username`` (see
+    ``secsso/blueprints/secagent-service.yaml`` / ``secchat-service.yaml``), so the names here
+    are what live tokens actually carry. ``svc-secchat`` is additionally a
+    ``delegatingSubjects`` member: SecChat forwards the acting end-user via
+    ``X-Sec-Acting-User`` so SecRouter attributes policy/budget/audit to that user.
 
     Empty when SecSSO isn't in this topology at all (nothing to configure).
     """
@@ -634,10 +811,6 @@ def secrouter_oidc_config(
     service_subjects = ["svc-secagent"]
     delegating_subjects: list[str] = []
     if urls.get("SECCHAT"):
-        # SecChat's shared service identity (secsso/blueprints/secchat-service.yaml) — one
-        # client_credentials identity for the assistant path + pi. It forwards the acting
-        # end-user via X-Sec-Acting-User (secchat's src/secrouter/client.ts), so it must be a
-        # delegator too — see secrouter's security/types.ts OidcConfig.delegatingSubjects.
         service_subjects.append("svc-secchat")
         delegating_subjects.append("svc-secchat")
     fragment: dict[str, object] = {
@@ -649,6 +822,35 @@ def secrouter_oidc_config(
     if delegating_subjects:
         fragment["delegatingSubjects"] = delegating_subjects
     return fragment
+
+
+def secrouter_audit_syslog_config(audit_opts: "AuditOptions | None") -> dict[str, object]:
+    """The ``security.audit`` fragment enabling syslog/SIEM forwarding of SecRouter's audit log
+    (secsite.toml's top-level ``[audit]`` table — AU-3.3.x/800-172 SOC integration; see
+    docs/compliance.md) — matches ``secrouter/src/security/types.ts``'s ``SecurityConfig``
+    ``audit`` shape exactly (``sink``, ``syslog.{host,port,protocol,format}``).
+
+    Same reasoning as :func:`secrouter_oidc_config`: NOT env-var-driven (SecRouter has no
+    turnkey intake for ``security.audit``, unlike ``SECROUTER_SECLLM_ENDPOINTS``/
+    ``SECROUTER_EGRESS_FILE``) — SecRouter's ``SECROUTER_CONFIG`` is hand-authored JSON, so
+    :func:`write_addressing` writes this as a documented fragment (``secrouter-audit.json``) for
+    the operator to merge into ``security.audit``, rather than installing it anywhere.
+
+    Empty when ``audit_opts`` is unset or its ``syslog_host`` is empty — the default, meaning no
+    ``[audit]`` table (or one with no ``syslog_host``) generates nothing, and SecRouter's audit
+    log stays SQLite-only exactly as it always has (``sink`` defaults ``"sqlite"`` there too).
+    """
+    if audit_opts is None or not audit_opts.syslog_host:
+        return {}
+    return {
+        "sink": "both",
+        "syslog": {
+            "host": audit_opts.syslog_host,
+            "port": audit_opts.syslog_port,
+            "protocol": audit_opts.syslog_proto,
+            "format": audit_opts.syslog_format,
+        },
+    }
 
 
 def secagent_pi_models_json(
@@ -684,8 +886,9 @@ def service_client_secret(svc_username: str, app_password: str) -> str:
     this — rather than the provider's own stored ``client_secret`` — routes the grant onto
     ``TokenView.__post_init_client_credentials_creds``, and with ``sub_mode: user_username``
     the issued ``sub`` is exactly ``svc_username`` (the literal secrouter's
-    ``security.oidc.serviceSubjects``/``delegatingSubjects`` name). See
-    ``secsso/blueprints/secchat-service.yaml``'s header for the full mechanism.
+    ``security.oidc.serviceSubjects``/``delegatingSubjects`` names). See
+    ``secsso/blueprints/secchat-service.yaml``'s header for the full mechanism, verified
+    against Authentik 2024.12 source and live.
     """
     return base64.b64encode(f"{svc_username}:{app_password}".encode()).decode()
 
@@ -693,15 +896,17 @@ def service_client_secret(svc_username: str, app_password: str) -> str:
 def sync_secagent_service_secret(
     secsso_env_path: str | Path, secrets_env_path: str | Path,
 ) -> str | None:
-    """Derive SecAgent's ``SECAGENT_CLIENT_SECRET`` (``deploy/macos/secrets.env`` or the
-    fedora-fips equivalent) from SecSSO's auto-generated ``SECAGENT_SVC_APP_PASSWORD`` (in
-    ``secsso/.env`` — seeded by ``targets/common.ensure_stack_secrets``, read by
-    ``secsso/blueprints/secagent-service.yaml``'s ``!Env`` to provision the pre-provisioned
-    ``svc-secagent`` service account's app-password Token). The written value is
+    """Derive SecAgent's ``SECAGENT_CLIENT_SECRET`` from SecSSO's auto-generated
+    ``SECAGENT_SVC_APP_PASSWORD`` (in ``secsso/.env`` — seeded by
+    ``targets/common.ensure_stack_secrets``, read by
+    ``secsso/blueprints/secagent-service.yaml``'s ``!Env`` as the app-password Token key bound
+    to the pre-provisioned ``svc-secagent`` service account) and write it into SecAgent's env
+    (``deploy/macos/secrets.env`` or the fedora-fips equivalent). The written value is
     :func:`service_client_secret`'s composite ``base64("svc-secagent:<app-password>")`` — NOT
-    the raw password — so ``secagent token``'s client_credentials grant resolves to
-    ``sub="svc-secagent"``, the exact subject ``secrouter_oidc_config``'s ``serviceSubjects``
-    names (same value ``./bootstrap/secsso.sh secagent-config`` prints for a manual hand-off).
+    the raw password — so ``secagent token``'s client_credentials grant rides Authentik's
+    creds path and resolves to ``sub="svc-secagent"``, the exact subject
+    :func:`secrouter_oidc_config`'s ``serviceSubjects`` names (same value
+    ``./bootstrap/secsso.sh secagent-config`` prints for a manual hand-off).
 
     Only fills a BLANK ``SECAGENT_CLIENT_SECRET=`` line — the same "blank key = fill me"
     convention :func:`~secdeploy.targets.common._seed_env_secrets` uses for the stacks' own
@@ -767,9 +972,377 @@ _SECCHAT_MANAGED_KEYS = frozenset({
 })
 
 
+def secchat_pool_env(
+    pool: PoolOptions, topology: Topology,
+    without: list[str] | None = None, scheme: str = "https",
+) -> dict[str, str]:
+    """The ``SECCHAT_POOL_*`` env for a configured Kubernetes agent pool (secsite.toml's
+    ``[secchat.pool]``). Empty when the pool is disabled. ``SECCHAT_POOL_SECCHAT_URL`` is the
+    cluster-internal URL a pool pod dials back to reach ``/runner`` — the operator's explicit
+    ``secchat_url`` if set, else SecChat's own address from the topology. These enable the pool in
+    the backend (src/config.ts); the runner-token secret it also needs is the stack's own session
+    secret, already seeded."""
+    if not pool.enabled:
+        return {}
+    secchat_url = pool.secchat_url or (topology.urls(without, scheme).get("SECCHAT", "") or "").rstrip("/")
+    env = {
+        "SECCHAT_POOL_IMAGE": pool.image,
+        "SECCHAT_POOL_NAMESPACE": pool.namespace,
+        "SECCHAT_POOL_CPU": pool.cpu,
+        "SECCHAT_POOL_MEMORY": pool.memory,
+        "SECCHAT_POOL_TTL": str(pool.ttl_seconds),
+        # In-process admission caps — the same numbers the ResourceQuota bounds, so SecChat rejects a
+        # burst fast (with a clear message) instead of leaning on the cluster to (opaquely) reject the
+        # pod create. max_pods also bounds the quota; max_per_owner is SecChat-only (no quota analogue).
+        "SECCHAT_POOL_MAX_PODS": str(pool.max_pods),
+        "SECCHAT_POOL_MAX_PER_OWNER": str(pool.max_per_owner),
+    }
+    if secchat_url:
+        env["SECCHAT_POOL_SECCHAT_URL"] = secchat_url
+    # Out-of-cluster SecChat: the API server URL reachable from the SecChat CONTAINER (the
+    # in-cluster default https://kubernetes.default.svc only resolves inside the cluster).
+    if pool.api_server:
+        env["SECCHAT_POOL_APISERVER"] = pool.api_server
+    # Analysis sidecar catalog (name=image, sorted for a deterministic .env) — SecChat offers these
+    # per agent pod, each sharing the pod's /workspace volume with the agent's code.
+    if pool.analysis_images:
+        env["SECCHAT_POOL_ANALYSIS_IMAGES"] = ",".join(
+            f"{name}={pool.analysis_images[name]}" for name in sorted(pool.analysis_images))
+    # One-shot task API image (batch secagent jobs — /pool/tasks). Unset ⇒ the API is off.
+    if pool.task_image:
+        env["SECCHAT_POOL_TASK_IMAGE"] = pool.task_image
+    return env
+
+
+def secchat_voice_env(
+    voice: VoiceOptions, topology: Topology, existing: dict[str, str] | None = None,
+    without: list[str] | None = None, scheme: str = "https",
+) -> dict[str, str]:
+    """The ``SECCHAT_*`` env for the optional 1:1 voice-call media relay (secsite.toml's
+    ``[secchat.voice]``) — see ``docs/plans/voice-calls-plan.md`` §2.5/§3.5 (secchat repo).
+    Empty when voice is disabled, exactly like :func:`secchat_pool_env`.
+
+    - ``SECCHAT_TRANSCRIBE_URL``: SecRecorder's own topology URL (:meth:`Topology.urls`) — unset
+      (not an empty string) when SecRecorder isn't placed/is withheld, so the backend's own
+      "transcription unavailable" fallback decides what to do, rather than secdeploy asserting
+      an empty-string URL is meaningful.
+    - ``SECCHAT_MEDIAD_URL``: mediad's compose-internal control-API base URL — fixed
+      ``http://mediad:<control_port>`` (the compose service name IS the DNS name on the stack's
+      own network; never published, see :func:`mediad_compose_override`).
+    - ``SECCHAT_MEDIAD_TOKEN``: the shared control-API bearer. **Idempotent-once-set**, the same
+      discipline ``common.ensure_stack_secrets`` uses for the stack's other generated secrets —
+      an operator-set ``[secchat.voice].token`` wins, else a value ALREADY in secchat's ``.env``
+      (``existing``) is kept so redeploys never rotate a live mediad's bearer out from under it,
+      else a fresh :func:`secrets.token_urlsafe` is minted. The mediad compose service reads the
+      SAME key via compose's automatic ``.env`` interpolation (:func:`mediad_compose_override`)
+      — one value, one file, no second secret store.
+    - ``SECCHAT_CALL_STUN``: ``voice.stun`` verbatim — empty by default (suite-local/none, NEVER
+      a public STUN server; see :class:`~secdeploy.site.VoiceOptions` / plan §2.5 point 4 — the
+      CUI/air-gap posture this default protects). Written even when empty so an operator's
+      earlier non-empty value is explicitly cleared, not left stale, if they blank it out.
+    - ``SECCHAT_MEDIAD_ADVERTISE_ADDR``: ``voice.advertise_addr`` — required by
+      :meth:`SiteConfig.load`'s validation whenever ``voice.enabled``, so this is always
+      non-empty here; also consumed by mediad itself via compose ``.env`` interpolation.
+    - ``SECCHAT_MEDIAD_RECORDINGS_DIR``: fixed ``/var/lib/secchat/recordings`` — the secchat
+      CONTAINER's mount path for the shared ``recordings`` volume (:func:`mediad_compose_override`'s
+      ``"      - recordings:/var/lib/secchat/recordings\\n"`` line; mediad's own mount path differs,
+      ``/var/lib/mediad/recordings`` — only the volume identity has to match, not the path, same
+      "NAMED volume, legitimately different mount paths" note as ``uploads``). Without this the
+      secchat backend has a volume mounted but no configured path to read it from: a recorded
+      call's mixed file is never ingested as an attachment and no leg can be read for transcription
+      (secchat repo's calls/registry.ts `CallRegistryDeps.recordingsDir`) — this is what makes the P2
+      exit test (a transcript message landing in the DM) actually pass end-to-end. Not derived from
+      any ``VoiceOptions`` field — it's a fixed container-internal path, same instinct as
+      ``SECCHAT_MEDIAD_URL``'s fixed ``http://mediad:<port>``.
+    """
+    if not voice.enabled:
+        return {}
+    existing = existing or {}
+    env: dict[str, str] = {}
+    transcribe_url = (topology.urls(without, scheme).get("SECRECORDER", "") or "").rstrip("/")
+    if transcribe_url:
+        env["SECCHAT_TRANSCRIBE_URL"] = transcribe_url
+    env["SECCHAT_MEDIAD_URL"] = f"http://mediad:{voice.control_port}"
+    env["SECCHAT_MEDIAD_TOKEN"] = (
+        voice.token or existing.get("SECCHAT_MEDIAD_TOKEN") or secrets.token_urlsafe(32)
+    )
+    env["SECCHAT_CALL_STUN"] = voice.stun
+    env["SECCHAT_MEDIAD_ADVERTISE_ADDR"] = voice.advertise_addr
+    env["SECCHAT_MEDIAD_RECORDINGS_DIR"] = "/var/lib/secchat/recordings"
+    return env
+
+
+def k8s_pool_manifests(pool: PoolOptions) -> dict[str, object]:
+    """The Kubernetes manifests SecDeploy emits for an enabled agent pool, as a ``v1/List`` object
+    (``kubectl apply -f`` applies every item). Namespace + a Role granting SecChat's ServiceAccount
+    create/delete/get on pods there + its RoleBinding + a ResourceQuota bounding the pod count + a
+    NetworkPolicy that denies all inbound and restricts pod egress to DNS and the git/SecChat ports.
+
+    SecChat's ServiceAccount is REFERENCED, not created (it belongs to SecChat's own deployment). The
+    NetworkPolicy's port-only egress rules are a sane default the operator should tighten with real
+    ``to:`` ipBlocks (a NetworkPolicy can't name hosts) — see docs/agent-pool.md. Pure/deterministic
+    for testing; secrets never appear (the runner token is minted per session, not baked in)."""
+    ns, sa, sa_ns = pool.namespace, pool.service_account, pool.service_account_namespace
+    labels = {"app.kubernetes.io/part-of": "secchat", "app.kubernetes.io/component": "agent-pool"}
+    # The pod MUST be able to dial back to SecChat (/runner WS + the /agent-llm proxy) — allow its
+    # port in the egress policy, else an enforcing CNI (k3s enforces NetworkPolicies) silently
+    # breaks the attach and every pool session times out "did not come online".
+    secchat_port = urlsplit(pool.secchat_url).port if pool.secchat_url else None
+    secchat_port = secchat_port or (443 if (pool.secchat_url or "").startswith("https") else 47010)
+    # Out-of-cluster SecChat: create the ServiceAccount + a bound long-lived token Secret so the
+    # deploy can extract a credential to mount into the compose-hosted SecChat (see
+    # provision_pool_credentials). An in-cluster SecChat brings its own SA; these are only emitted
+    # when the site opts in.
+    sa_items: list[dict[str, object]] = []
+    if pool.create_service_account:
+        if sa_ns != ns:
+            sa_items.append({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": sa_ns, "labels": labels}})
+        sa_items.append({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": sa, "namespace": sa_ns, "labels": labels}})
+        sa_items.append({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {
+                "name": pool_token_secret_name(pool), "namespace": sa_ns, "labels": labels,
+                "annotations": {"kubernetes.io/service-account.name": sa},
+            },
+            "type": "kubernetes.io/service-account-token",
+        })
+    return {
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns, "labels": labels}},
+            *sa_items,
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                "metadata": {"name": "secchat-pool-manager", "namespace": ns, "labels": labels},
+                "rules": [
+                    {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]},
+                    # pods/log: the one-shot task API's result channel — a task pod's stdout IS its
+                    # report, read via the log subresource once the pod goes terminal.
+                    {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+                ],
+            },
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                "metadata": {"name": "secchat-pool-manager", "namespace": ns, "labels": labels},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "secchat-pool-manager"},
+                "subjects": [{"kind": "ServiceAccount", "name": sa, "namespace": sa_ns}],
+            },
+            {
+                "apiVersion": "v1", "kind": "ResourceQuota",
+                "metadata": {"name": "secchat-pool-quota", "namespace": ns, "labels": labels},
+                "spec": {"hard": {"pods": str(pool.max_pods)}},
+            },
+            {
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": "secchat-pool-egress", "namespace": ns, "labels": labels,
+                    # A vanilla NetworkPolicy can't match hosts, so the port-only egress below can't be
+                    # narrowed to git_host here. Surface the intended host as an annotation so an
+                    # FQDN-aware layer (Cilium/Calico egress-by-FQDN) or the operator can scope it —
+                    # keeping git_host meaningful rather than silently dropped.
+                    **({"annotations": {"secchat.io/git-host": pool.git_host}} if pool.git_host else {}),
+                },
+                "spec": {
+                    "podSelector": {},
+                    "policyTypes": ["Ingress", "Egress"],
+                    "ingress": [],  # deny all inbound — nothing should connect TO an agent pod
+                    "egress": [
+                        {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},  # DNS
+                        {"ports": [{"protocol": "TCP", "port": 22}, {"protocol": "TCP", "port": 443}, {"protocol": "TCP", "port": 9418}]},  # git ssh/https/git
+                        {"ports": [{"protocol": "TCP", "port": secchat_port}]},  # SecChat dial-back (/runner + /agent-llm)
+                    ],
+                },
+            },
+            # Opt-in INTERNET egress: SecChat labels a pod `secchat.io/egress: open` only when its
+            # agent explicitly enabled internet access (default off). NetworkPolicies are additive,
+            # so labeled pods get this allow-all-egress ON TOP of the restricted base; unlabeled
+            # pods keep the base allowlist alone. Emitted unconditionally — inert without the label.
+            {
+                "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                "metadata": {"name": "secchat-pool-egress-open", "namespace": ns, "labels": labels},
+                "spec": {
+                    "podSelector": {"matchLabels": {"secchat.io/egress": "open"}},
+                    "policyTypes": ["Egress"],
+                    "egress": [{}],  # allow all egress (the pod opted into the internet)
+                },
+            },
+        ],
+    }
+
+
+def write_pool_manifests(pool: PoolOptions, out_dir: str | Path) -> str | None:
+    """Write the pool's Kubernetes manifests (:func:`k8s_pool_manifests`) to
+    ``<out_dir>/secchat-pool.k8s.json`` for the operator to ``kubectl apply``, mirroring how
+    :func:`write_addressing` emits ``secrouter-egress.json``. Returns the path, or ``None`` when the
+    pool is disabled (nothing to emit)."""
+    if not pool.enabled:
+        return None
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "secchat-pool.k8s.json"
+    path.write_text(json.dumps(k8s_pool_manifests(pool), indent=2) + "\n")
+    return str(path)
+
+
+# ── Turnkey pool helpers: pure command construction (execution lives in the target, so these stay
+#    unit-testable without docker/kubectl). ──────────────────────────────────────────────────────
+
+def pool_token_secret_name(pool: PoolOptions) -> str:
+    """The name of the long-lived ServiceAccount token Secret emitted for an out-of-cluster
+    SecChat (``create_service_account``): ``<service_account>-pool-token``."""
+    return f"{pool.service_account}-pool-token"
+
+
+def pool_secret_read_argv(pool: PoolOptions, jsonpath: str) -> list[str]:
+    """``kubectl get secret`` argv reading one ``jsonpath`` field (e.g. ``{.data.token}``) of the
+    pool token Secret — used to extract the token + cluster CA for the compose-hosted SecChat."""
+    ctx = ["--context", pool.kube_context] if pool.kube_context else []
+    return ["kubectl", *ctx, "-n", pool.service_account_namespace, "get", "secret",
+            pool_token_secret_name(pool), "-o", f"jsonpath={jsonpath}"]
+
+
+def pool_compose_override(pool: PoolOptions) -> str:
+    """The ``compose.override.yaml`` body that mounts the extracted ServiceAccount credential into
+    the SecChat container at the STANDARD in-cluster paths — so the backend's unmodified in-cluster
+    Kubernetes client (secchat src/agent/k8s.ts) works from a compose-hosted SecChat. Compose merges
+    ``compose.override.yaml`` automatically (the stack's bootstrap runs a bare ``docker compose``,
+    no ``-f``), so the stack's own compose.yaml is never edited."""
+    return (
+        "# GENERATED by secdeploy ([secchat.pool].create_service_account) — do not edit.\n"
+        "# Mounts the agent-pool ServiceAccount credential (extracted from the cluster into\n"
+        "# ./pool-sa/) at the standard in-cluster paths, so SecChat's Kubernetes client can\n"
+        "# create/delete pool pods from OUTSIDE the cluster. Regenerated each deploy.\n"
+        "services:\n"
+        "  secchat:\n"
+        "    volumes:\n"
+        "      - ./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro\n"
+        "      - ./pool-sa/ca.crt:/var/run/secrets/kubernetes.io/serviceaccount/ca.crt:ro\n"
+        "      - ./pool-sa/namespace:/var/run/secrets/kubernetes.io/serviceaccount/namespace:ro\n"
+    )
+
+
+def mediad_compose_override(voice: VoiceOptions) -> str:
+    """The ``mediad``-only slice of ``compose.override.yaml`` — the media-relay compose service
+    plus the NEW ``recordings`` volume (distinct from ``uploads``, which mounts to ``secchat``
+    only today) mounted rw on both ``mediad`` and ``secchat``. Plan §2.5/§3.5 (secchat repo).
+
+    ``mediad``'s ``MEDIAD_TOKEN``/``MEDIAD_ADVERTISE_ADDR`` are NOT hardcoded here — they're
+    ``${SECCHAT_MEDIAD_TOKEN}``/``${SECCHAT_MEDIAD_ADVERTISE_ADDR}`` compose-variable
+    interpolations, resolved from the stack's OWN ``.env`` (Compose reads the project directory's
+    ``.env`` for substitution automatically, the same file :func:`sync_secchat_env` writes those
+    two keys into via ``voice=``) — one value, one file, no second secret store to keep in sync.
+    The control API (``:47021``) is deliberately NEVER published — compose-internal network only,
+    reachable solely from the ``secchat`` container, per the plan's control-API isolation
+    requirement. Media (``:47020``) publishes BOTH ``udp`` and ``tcp`` on the SAME port number
+    (Pion ``ICEUDPMux`` + ``SetICETCPMux`` fallback) — see the colima UDP caveat below.
+
+    Standalone: when ``[secchat.pool].create_service_account`` is ALSO enabled, don't write this
+    directly to ``compose.override.yaml`` — call :func:`secchat_compose_override` (which this
+    delegates to, with ``pool=None``) instead, passing both, so they merge into ONE file (Compose
+    merges exactly one ``compose.override.yaml`` automatically; a second file would silently
+    clobber it, not add to it)."""
+    return secchat_compose_override(None, voice)
+
+
+def secchat_compose_override(pool: PoolOptions | None, voice: VoiceOptions | None) -> str:
+    """The FULL ``compose.override.yaml`` body for however many of the pool-SA-mount
+    (:func:`pool_compose_override`) and mediad (:func:`mediad_compose_override`) features are
+    active — Compose auto-merges exactly ONE ``compose.override.yaml``, so both must land in the
+    same file rather than each writer clobbering the other's. Returns ``""`` when neither applies
+    (nothing to write — callers should skip writing the file, not write an empty/inert one)."""
+    pool_active = pool is not None and pool.create_service_account
+    voice_active = voice is not None and voice.enabled
+    if not pool_active and not voice_active:
+        return ""
+    header = "# GENERATED by secdeploy ([secchat.pool]/[secchat.voice]) — do not edit.\n"
+    secchat_volumes: list[str] = []
+    body_lines: list[str] = [header, "services:\n"]
+    if voice_active:
+        body_lines += [
+            "  mediad:\n",
+            f"    image: {voice.image}\n",
+            # mediad writes recordings that the secchat backend (a DIFFERENT uid) ingests,
+            # transcribes, and deletes on the SHARED `recordings` volume. Run mediad with secchat's
+            # GID (the node base image's 1000) so its group-rwx session dirs (mediad/manager.go's
+            # 0770) are readable + cleanable by secchat — without this the backend hits EACCES on
+            # every recording. mediad keeps its own uid (999) so it still owns the volume root.
+            '    user: "999:1000"\n',
+            "    environment:\n",
+            "      MEDIAD_TOKEN: ${SECCHAT_MEDIAD_TOKEN}\n",
+            "      MEDIAD_ADVERTISE_ADDR: ${SECCHAT_MEDIAD_ADVERTISE_ADDR}\n",
+            f"      MEDIAD_MEDIA_ADDR: \":{voice.media_port}\"\n",
+            f"      MEDIAD_CONTROL_ADDR: \":{voice.control_port}\"\n",
+            # Participant cap per call. Emitted as a literal (like the ports above), not a .env
+            # interpolation — it's non-secret site config, one value, resolved at write time.
+            f'      MEDIAD_MAX_LEGS_PER_SESSION: "{voice.max_legs_per_session}"\n',
+            "    ports:\n",
+            "      # colima UDP forwarding is not at parity with the TCP publish — see docs/voice.md\n",
+            f'      - "{voice.media_port}:{voice.media_port}/udp"\n',
+            f'      - "{voice.media_port}:{voice.media_port}/tcp"\n',
+            "    volumes:\n",
+            "      - recordings:/var/lib/mediad/recordings\n",
+            "    restart: unless-stopped\n",
+        ]
+        secchat_volumes.append("      - recordings:/var/lib/secchat/recordings\n")
+    if pool_active:
+        secchat_volumes += [
+            "      - ./pool-sa/token:/var/run/secrets/kubernetes.io/serviceaccount/token:ro\n",
+            "      - ./pool-sa/ca.crt:/var/run/secrets/kubernetes.io/serviceaccount/ca.crt:ro\n",
+            "      - ./pool-sa/namespace:/var/run/secrets/kubernetes.io/serviceaccount/namespace:ro\n",
+        ]
+    body_lines += ["  secchat:\n", "    volumes:\n", *secchat_volumes]
+    if voice_active:
+        body_lines += ["volumes:\n", "  recordings: {}\n"]
+    return "".join(body_lines)
+
+
+def image_build_argv(context_dir: str | Path, dockerfile: str | Path, ref: str,
+                     platform: str = "") -> list[str]:
+    """Generic ``docker build`` argv for a site ``[[builds]]`` entry: dockerfile + tag + optional
+    ``--platform``, with ``context_dir`` as the build context."""
+    plat = ["--platform", platform] if platform else []
+    return ["docker", "build", *plat, "-f", str(dockerfile), "-t", ref, str(context_dir)]
+
+
+def image_push_argv(ref: str) -> list[str]:
+    """``docker push`` argv for a built image reference."""
+    return ["docker", "push", ref]
+
+
+def image_tag_argv(src: str, dst: str) -> list[str]:
+    """``docker tag`` argv — retags the local build as its push reference."""
+    return ["docker", "tag", src, dst]
+
+
+def runnerd_image_ref(registry: str, tag: str) -> str:
+    """The tagged runnerd image reference to build+push: ``<registry>/secchat-runnerd:<tag>``. The
+    registry's trailing slash (if any) is normalized off."""
+    return f"{registry.rstrip('/')}/secchat-runnerd:{tag}"
+
+
+def runnerd_build_argv(context_dir: str | Path, image_ref: str) -> list[str]:
+    """``docker build`` argv for the runnerd image — ``Dockerfile.runnerd`` at the root of the fetched
+    secchat checkout (``context_dir``), which is also the build context."""
+    context = str(context_dir)
+    return ["docker", "build", "-f", f"{context}/Dockerfile.runnerd", "-t", image_ref, context]
+
+
+def runnerd_push_argv(image_ref: str) -> list[str]:
+    """``docker push`` argv for the built runnerd image."""
+    return ["docker", "push", image_ref]
+
+
+def kubectl_apply_argv(manifest_path: str | Path, context: str = "") -> list[str]:
+    """``kubectl apply -f <manifest>`` argv, with ``--context`` prepended when the site pins one."""
+    ctx = ["--context", context] if context else []
+    return ["kubectl", *ctx, "apply", "-f", str(manifest_path)]
+
+
 def sync_secchat_env(
     secsso_env_path: str | Path, secchat_env_path: str | Path,
     topology: Topology, without: list[str] | None = None, scheme: str = "https",
+    pool: PoolOptions | None = None, voice: VoiceOptions | None = None,
 ) -> list[str] | None:
     """Make the native SecChat's stack ``.env`` turnkey: mirror the OIDC login-client secret SecSSO
     generated and write the topology-derived OIDC/gateway env into ``work/secchat/.env``.
@@ -794,12 +1367,19 @@ def sync_secchat_env(
     (``secchat-service``) and ``SECCHAT_SECROUTER_CLIENT_SECRET`` —
     :func:`service_client_secret`'s composite ``base64("svc-secchat:<app-password>")``, NOT a
     random value — so SecChat's grant resolves to ``sub="svc-secchat"``, the exact subject
-    ``secrouter_oidc_config``'s ``serviceSubjects``/``delegatingSubjects`` name. An older
+    :func:`secrouter_oidc_config`'s ``serviceSubjects``/``delegatingSubjects`` name. An older
     SecSSO ``.env`` without the app-password simply skips these three keys (login sync
     unaffected).
 
+    ``voice`` (:class:`~secdeploy.site.VoiceOptions`, the optional 1:1 voice-call media relay)
+    adds ``SECCHAT_TRANSCRIBE_URL``/``SECCHAT_MEDIAD_URL``/``SECCHAT_MEDIAD_TOKEN``/
+    ``SECCHAT_CALL_STUN``/``SECCHAT_MEDIAD_ADVERTISE_ADDR``/``SECCHAT_MEDIAD_RECORDINGS_DIR`` — same
+    OUTSIDE-the-managed-key-filter treatment as ``pool``'s ``SECCHAT_POOL_*`` env
+    (:func:`secchat_voice_env`); absent/disabled ⇒ no keys added, so the existing behavior (and its
+    test) is unchanged.
+
     Returns the sorted list of keys written, or ``None`` if either file is missing or SecSSO
-    hasn't generated the login secret yet (stack never seeded).
+    hasn't generated the secret yet (stack never seeded).
     """
     secsso_env_path, secchat_env_path = Path(secsso_env_path), Path(secchat_env_path)
     if not secsso_env_path.exists() or not secchat_env_path.exists():
@@ -818,6 +1398,17 @@ def sync_secchat_env(
         managed["SECCHAT_SECROUTER_CLIENT_SECRET"] = service_client_secret(
             "svc-secchat", svc_app_password)
     to_write = {k: v for k, v in managed.items() if k in _SECCHAT_MANAGED_KEYS}
+    # The optional Kubernetes agent pool's env (SECCHAT_POOL_*) — added OUTSIDE the managed-key
+    # filter, since it's a site-config capability, not a topology-derived key. Absent ⇒ pool off,
+    # so the existing managed-only behavior (and its test) is unchanged.
+    if pool is not None:
+        to_write.update(secchat_pool_env(pool, topology, without, scheme))
+    # The optional voice media relay's env (SECCHAT_TRANSCRIBE_URL/SECCHAT_MEDIAD_*/
+    # SECCHAT_CALL_STUN) — same treatment, and reads the file's OWN current values first so a
+    # once-generated SECCHAT_MEDIAD_TOKEN survives redeploys instead of rotating (see
+    # secchat_voice_env's docstring).
+    if voice is not None:
+        to_write.update(secchat_voice_env(voice, topology, _read_env_values(secchat_env_path), without, scheme))
     _set_env_keys(secchat_env_path, to_write)
     return sorted(to_write)
 
@@ -1077,9 +1668,12 @@ def generate_secsso_users_blueprint(users: list[UserSpec], dest: str | Path) -> 
             "    attrs:",
             "      type: internal",
             f"      password: {_yaml_q(pw)}",
+            # `name` is REQUIRED by authentik_core.user's serializer. It is not optional like
+            # email/groups: omitting it fails validation for the ENTIRE blueprint, so a single
+            # nameless user silently leaves EVERY declared account uncreated while the deploy
+            # still prints their initial credentials. Default to the username when unset.
+            f"      name: {_yaml_q(u.name or u.username)}",
         ]
-        if u.name:
-            lines.append(f"      name: {_yaml_q(u.name)}")
         if u.email:
             lines.append(f"      email: {_yaml_q(u.email)}")
         if u.groups:
@@ -1198,8 +1792,8 @@ def secllm_env_text(
       than letting each mint its own (which would leave SecRouter unable to authenticate to
       more than one of them).
 
-    ``autostart`` (``SECLLM_AUTOSTART``) is a list of CATALOG MODEL IDS (e.g. ``["fast",
-    "gemma-31b"]``, not a boolean) to load — downloading the weights first, if not already
+    ``autostart`` (``SECLLM_AUTOSTART``) is a list of CATALOG MODEL IDS (e.g. ``["Llama-3.2-3B-Instruct",
+    "gemma-4-31B-it"]``, not a boolean) to load — downloading the weights first, if not already
     cached — the moment the service starts, instead of waiting for the first request routed
     to that model. Empty/``None`` (the default) leaves the line commented out as
     documentation, matching this file's pre-``autostart_models`` behavior.
@@ -1209,7 +1803,7 @@ def secllm_env_text(
     autostart_line = (
         f"SECLLM_AUTOSTART={','.join(autostart)}\n" if autostart
         else "# Autostart model(s) at boot instead of lazy first-request load — comma-separated "
-             "catalog ids, e.g. fast,reasoning.\n# SECLLM_AUTOSTART=\n"
+             "catalog ids, e.g. Llama-3.2-3B-Instruct,gpt-oss-20b.\n# SECLLM_AUTOSTART=\n"
     )
     return (
         "# secllm — generated by secdeploy (--with-inference); kept across redeploys\n"
@@ -1229,6 +1823,7 @@ def write_addressing(
     without: list[str] | None = None,
     *,
     secrouter_egress_path: str | None = None,
+    audit_opts: "AuditOptions | None" = None,
 ) -> dict[str, object]:
     """Write the addressing artifacts for ``resource`` into ``out_dir``.
 
@@ -1244,13 +1839,18 @@ def write_addressing(
     long as they share the same ``--out``). When SecRouter is placed on ``resource`` and SecSSO
     is anywhere in the topology, also writes ``<out_dir>/secrouter-oidc.json`` (see
     :func:`secrouter_oidc_config`) — a documented fragment for the operator to merge, not an
-    installed/consumed file (SecRouter has no env-var turnkey for OIDC). When secproxy is
-    placed on ``resource``, also writes ``<out_dir>/secproxy.nginx.conf`` (see
+    installed/consumed file (SecRouter has no env-var turnkey for OIDC). When SecRouter is
+    placed on ``resource`` and ``audit_opts`` carries a ``syslog_host`` (secsite.toml's
+    ``[audit]`` table), also writes ``<out_dir>/secrouter-audit.json`` (see
+    :func:`secrouter_audit_syslog_config`) — the same documented-fragment-for-the-operator-to-
+    merge treatment as the OIDC fragment, for the identical reason (no env-var turnkey). When
+    secproxy is placed on ``resource``, also writes ``<out_dir>/secproxy.nginx.conf`` (see
     :func:`nginx_conf_text`, cert dir ``/etc/secsuite/secproxy``) — secproxy's reverse-proxy
     config for the topology's fronted services (installed on fedora-fips, pointed at natively on
-    macOS; both targets run nginx). It is resource-specific like the egress/OIDC files above
-    (only the resource secproxy itself runs on needs it), unlike the suite-wide zone. Returns the
-    written paths — note that these last are
+    macOS; both targets run nginx) — plus ``<out_dir>/secproxy.logrotate.conf`` (see
+    :func:`logrotate_conf_text`) for its access/error logs. Both are resource-specific like the
+    egress/OIDC/audit files above (only the resource secproxy itself runs on needs them), unlike
+    the suite-wide zone. Returns the written paths — note that these last are
     generated purely from topology PLACEMENT, the same as everything else here, independent of
     whether a target's ``--with-inference``/``--with-agent`` flag actually installs the
     corresponding service (see ``targets/fedora_fips.py``).
@@ -1265,6 +1865,7 @@ def write_addressing(
 
     egress_path: Path | None = None
     oidc_path: Path | None = None
+    audit_path: Path | None = None
     if "secrouter" in placed:
         rules = secrouter_egress_rules(topology, without)
         if rules:
@@ -1274,13 +1875,20 @@ def write_addressing(
         if oidc:
             oidc_path = rdir / "secrouter-oidc.json"
             oidc_path.write_text(json.dumps(oidc, indent=2) + "\n")
+        audit_fragment = secrouter_audit_syslog_config(audit_opts)
+        if audit_fragment:
+            audit_path = rdir / "secrouter-audit.json"
+            audit_path.write_text(json.dumps(audit_fragment, indent=2) + "\n")
 
     nginx_conf_path: Path | None = None
+    logrotate_conf_path: Path | None = None
     if "secproxy" in placed:
         # secproxy's generated nginx config for the topology's fronted services — installed on
         # fedora-fips, and pointed at natively on macOS (both targets run nginx; see targets/).
         nginx_conf_path = rdir / "secproxy.nginx.conf"
         nginx_conf_path.write_text(nginx_conf_text(topology, "/etc/secsuite/secproxy", without))
+        logrotate_conf_path = rdir / "secproxy.logrotate.conf"
+        logrotate_conf_path.write_text(logrotate_conf_text())
 
     env_paths: dict[str, Path] = {}
     for name in placed:
@@ -1299,6 +1907,10 @@ def write_addressing(
         result["egress"] = egress_path
     if oidc_path is not None:
         result["oidc"] = oidc_path
+    if audit_path is not None:
+        result["audit"] = audit_path
     if nginx_conf_path is not None:
         result["nginx_conf"] = nginx_conf_path
+    if logrotate_conf_path is not None:
+        result["logrotate_conf"] = logrotate_conf_path
     return result

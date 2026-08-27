@@ -14,7 +14,7 @@ gitignored ``*.env`` files: SecCert's admin token/CA passphrase are **auto-gener
 default (self-contained internal secrets — a machine should mint them, not the operator);
 the external token a machine can't mint (SecRecorder's Hugging Face token) and the shared
 SecAgent↔SecSSO client secret are asked; SecRouter's
-``FREEROUTER_CONFIG`` is a path, not a secret. Secrets NEVER go in ``secsite.toml``: see
+``SECROUTER_CONFIG`` is a path, not a secret. Secrets NEVER go in ``secsite.toml``: see
 :func:`_maybe_seed_secrets`.
 
 Pure standard library (``getpass`` for the secret prompts, so nothing echoes to the terminal);
@@ -147,7 +147,7 @@ def _ask_deploy_options(
         if opts.with_inference:
             raw = _ask(
                 input_fn, f"  [{r.name}] catalog model id(s) to download + load at boot, "
-                "comma-separated (e.g. fast,reasoning,gemma-31b — blank = none, load on demand "
+                "comma-separated (e.g. Llama-3.2-3B-Instruct,gpt-oss-20b,gemma-4-31B-it — blank = none, load on demand "
                 "later via SecLLM's /admin console)", "",
             )
             opts.autostart_models = [m.strip() for m in raw.split(",") if m.strip()]
@@ -286,7 +286,7 @@ def run(
 
 # ── optional secret-seeding: operator-typed secrets → the gitignored *.env files ─────────────
 # NEVER secsite.toml — see the module docstring. Every value here is asked with getpass (masked,
-# nothing echoed) except FREEROUTER_CONFIG, which is a PATH, not a secret.
+# nothing echoed) except SECROUTER_CONFIG, which is a PATH, not a secret.
 
 _ENV_KEY_RE = re.compile(r"^#?\s*([A-Za-z_][A-Za-z0-9_]*)=")
 
@@ -412,8 +412,8 @@ def _maybe_seed_secrets(
     if groups.get("gateway"):
         out("\nSecRouter (governed AI gateway):")
         items.append(("secrouter", groups["gateway"][0], {
-            "FREEROUTER_CONFIG": _ask(
-                input_fn, "  FREEROUTER_CONFIG — path to a hardened config (not a secret; "
+            "SECROUTER_CONFIG": _ask(
+                input_fn, "  SECROUTER_CONFIG — path to a hardened config (not a secret; "
                 "blank = leave the example default)", "",
             ),
         }))

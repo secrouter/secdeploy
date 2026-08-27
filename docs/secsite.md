@@ -125,7 +125,7 @@ to skip any single value:
 | SecCert | placed (identity tier) and not dropped via `without` | `SECCERT_CA_PASSPHRASE`, `SECCERT_ADMIN_TOKEN` |
 | SecAgent | placed (collab tier) **and** `with_agent` is on for that resource | `SECAGENT_CLIENT_SECRET` (SecSSO service-account secret) |
 | SecRecorder | placed (collab tier) | `HF_TOKEN` (optional — only needed for the gated diarizer model) |
-| SecRouter | placed (gateway tier) | `FREEROUTER_CONFIG` — a **path** to a hardened config, not a secret; asked as plain text, not masked |
+| SecRouter | placed (gateway tier) | `SECROUTER_CONFIG` — a **path** to a hardened config, not a secret; asked as plain text, not masked |
 
 **secrets never land in `secsite.toml`.** They're written into the same local, gitignored
 `*.env` files `deploy` already reads (`*.env` / `!*.env.example` in `.gitignore`):
@@ -161,6 +161,79 @@ reaches the target host on first deploy instead of landing an empty template tha
 manual `sudoedit`. A checkout nobody has seeded falls back to the `.env.example` exactly as
 before.
 
+## Optional: the SecChat Kubernetes agent pool
+
+A `[secchat.pool]` table turns on SecChat's **Kubernetes agent pool** — coding agents whose launch
+environment is "pool" run in server-launched, ephemeral pods (the runnerd image) instead of the
+user's desktop. It is off unless you add the section, and needs a Kubernetes cluster (the enclave's
+own — SecDeploy generates the manifests; the operator applies them).
+
+```toml
+[secchat.pool]
+enabled = true
+image = "registry.internal/secchat-runnerd:1.0.0"  # the runnerd image (required when enabled)
+namespace = "secchat-pool"
+service_account = "secchat"                          # SecChat's ServiceAccount (create/delete pods)
+service_account_namespace = "secchat"
+git_host = "git.sec.internal"                        # the enclave git host pods may reach
+secchat_url = ""                                     # cluster-internal URL a pod dials back (default: SecChat's own)
+max_pods = 20
+ttl_seconds = 3600
+```
+
+When enabled, `deploy` does two things at the SecChat wiring step:
+
+1. writes `SECCHAT_POOL_*` into `work/secchat/.env` (image, namespace, callback URL, limits, TTL),
+   so the SecChat backend offers the pool; and
+2. emits the cluster manifests — namespace, a Role granting SecChat's ServiceAccount create/delete
+   on pods + its binding, a ResourceQuota, and a default-deny-ingress NetworkPolicy — to
+   `<out>/addressing/secchat-pool.k8s.json`, which the operator applies with
+   `kubectl apply -f secchat-pool.k8s.json`. The NetworkPolicy's egress is port-scoped (DNS + git);
+   tighten it with real `to:` ipBlocks for your cluster. See
+   [secchat's docs/agent-pool.md](https://github.com/secrouter/secchat/blob/main/docs/agent-pool.md).
+
+## Optional: 1:1 voice calls (secchat-mediad + SecRecorder)
+
+A `[secchat.voice]` table turns on SecChat's **1:1 voice calls** — a `mediad` compose service
+(server-side WebRTC media relay + recorder) alongside SecChat, plus the env that points SecChat at
+it and at SecRecorder for per-leg transcription. Off unless you add the section.
+
+```toml
+[secchat.voice]
+enabled = true
+advertise_addr = "192.168.5.1"   # REQUIRED — the suite host's cross-host-reachable address
+```
+
+`secrecorder` must also **not** be in `[deploy].without` — voice transcription is one more caller
+of its `/v1/audio/transcriptions` endpoint. See [voice.md](voice.md) for the full picture: the new
+`recordings` volume, the `:47020` UDP+TCP media port and its colima caveat, why the control API is
+never published, and why `stun` must stay suite-local/empty (never a public STUN server).
+
+## Optional: audit syslog forwarding — `[audit]`
+
+A top-level `[audit]` table turns on **syslog/SIEM forwarding** of SecRouter's audit log
+(AU-3.3.x/800-172 SOC integration — see [compliance.md](compliance.md)), in *addition* to its own
+tamper-evident SQLite chain — never a replacement for it. Suite-wide like `[deploy]`, not
+per-resource: there is one audit posture for the deployment.
+
+```toml
+[audit]
+syslog_host = "siem.sec.internal"
+# syslog_port = 514        # default
+# syslog_proto = "udp"     # "udp" or "tcp"
+# syslog_format = "json"   # "json" or "cef"
+```
+
+Absent, or present with an empty `syslog_host`, means no syslog sink at all — the default,
+unchanged behavior. `syslog_proto`/`syslog_format` are validated fail-loud against SecRouter's own
+`SyslogConfig` shape (`udp`/`tcp`, `json`/`cef`).
+
+SecRouter's `SECROUTER_CONFIG` is hand-authored JSON with no env-var turnkey for
+`security.audit` (unlike, say, `SECROUTER_SECLLM_ENDPOINTS`), so `deploy` writes this as a
+documented fragment — `secrouter-audit.json`, alongside the addressing artifacts, printed as
+"merge into security.audit" — for you to fold into SecRouter's config by hand, same treatment as
+its OIDC fragment.
+
 ## Precedence and back-compat
 
 `secdeploy verify` / `plan` / `deploy` / `bundle` all resolve the active site config the same
@@ -185,3 +258,46 @@ Same as `topology.toml` (see [What consumes the topology](topology.md#what-consu
 plus: `verify`/`plan`/`deploy`/`bundle` also accept `--site` and resolve every deploy-option
 toggle from it, not just placement — and every one of those toggles remains a one-off CLI flag
 override away.
+
+## Optional container builds — `[[builds]]`
+
+Declare images the deploy should build (the pool runnerd, analyzer tooling, any site image),
+instead of by-hand `docker build`s. Each builds from a fetched component checkout, before any
+step that needs the image; failures warn (with the command to run by hand) and never abort the
+deploy; docker's layer cache makes repeat deploys cheap.
+
+```toml
+[[builds]]
+name = "secagent-analyzer-rust"                  # image name → built as <name>:<tag>
+component = "secagent"                            # fetched checkout = build context
+dockerfile = "docker/analyzer-rust.Dockerfile"    # relative to the checkout
+# tag = "local"        # default — pairs with local-runtime clusters (colima) needing no registry
+# context = "."        # build context, relative to the checkout
+# push = false         # true pushes <registry>/<name>:<tag> (registry then required)
+# platform = ""        # optional --platform
+```
+
+## Named site profiles — `configure --name` / `--site <name>`
+
+Keep several site configurations on one machine and select one by name:
+
+```bash
+secdeploy configure --name colima-test     # writes sites/colima-test.toml (gitignored)
+secdeploy configure --list                 # show saved profiles
+secdeploy deploy macos --site colima-test  # every --site accepts a profile NAME or a path
+```
+
+A `--site` value that exists as a file always wins; a bare name resolves to `sites/<name>.toml`.
+
+## Graphical configurator — `configure --web`
+
+```bash
+secdeploy configure --web [--port 4477] [--name <profile>]
+```
+
+Serves ONE SecRouter-themed page on 127.0.0.1 with every option in this document laid out with
+an explanation — Site, Resources (per-host deploy toggles), Tier placement, suite deploy options,
+Users, the agent pool, and container builds. Saving round-trips the form through the SAME
+validation `SiteConfig.load` applies on the CLI: errors render inline and nothing is written
+until the config is valid. The save bar accepts a bare name to save as a `sites/<name>.toml`
+profile. Pure standard library, loopback-only, no CDN.

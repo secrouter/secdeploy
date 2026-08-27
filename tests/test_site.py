@@ -318,3 +318,325 @@ def test_users_round_trip(tmp_path):
     reloaded = _site(tmp_path, site.to_toml())
     assert [(u.username, u.email, u.name, u.groups) for u in reloaded.users] == \
            [(u.username, u.email, u.name, u.groups) for u in site.users]
+
+
+# ── Named site profiles (sites/<name>.toml) ──────────────────────────────────────────
+
+def test_resolve_site_ref_paths_and_profiles(tmp_path):
+    from secdeploy.site import list_site_profiles, resolve_site_ref, site_profile_path
+
+    # No value → None; a real path → unchanged.
+    assert resolve_site_ref(None, tmp_path) is None
+    real = tmp_path / "somewhere.toml"
+    real.write_text("x = 1\n")
+    assert resolve_site_ref(str(real), tmp_path) == str(real)
+
+    # A bare name resolves to sites/<name>.toml when saved…
+    p = site_profile_path("colima-test", tmp_path)
+    p.parent.mkdir(parents=True)
+    p.write_text("domain = 'sec.internal'\n")
+    assert resolve_site_ref("colima-test", tmp_path) == str(p)
+    assert list_site_profiles(tmp_path) == ["colima-test"]
+
+    # …an unsaved name / an explicit .toml path pass through unchanged (downstream errors name
+    # what the caller typed).
+    assert resolve_site_ref("nope", tmp_path) == "nope"
+    assert resolve_site_ref("missing.toml", tmp_path) == "missing.toml"
+
+
+# ── Optional container builds ([[builds]]) ───────────────────────────────────────────
+SITE_BUILDS = BARE + """
+[[builds]]
+name = "secchat-runnerd"
+component = "secchat"
+dockerfile = "Dockerfile.runnerd"
+
+[[builds]]
+name = "secagent-analyzer-rust"
+component = "secagent"
+dockerfile = "docker/analyzer-rust.Dockerfile"
+tag = "v1"
+push = true
+registry = "registry.internal"
+platform = "linux/arm64"
+"""
+
+
+def test_builds_default_empty_when_absent(tmp_path):
+    assert _site(tmp_path, BARE).builds == []
+
+
+def test_builds_parse_all_fields_and_refs(tmp_path):
+    builds = _site(tmp_path, SITE_BUILDS).builds
+    assert [b.name for b in builds] == ["secchat-runnerd", "secagent-analyzer-rust"]
+    first = builds[0]
+    assert (first.component, first.dockerfile, first.tag, first.context, first.push) == \
+        ("secchat", "Dockerfile.runnerd", "local", ".", False)
+    assert first.local_ref == "secchat-runnerd:local"
+    second = builds[1]
+    assert second.push is True and second.registry == "registry.internal"
+    assert second.platform == "linux/arm64"
+    assert second.local_ref == "secagent-analyzer-rust:v1"
+    assert second.push_ref == "registry.internal/secagent-analyzer-rust:v1"
+
+
+def test_builds_missing_required_fields_rejected(tmp_path):
+    with pytest.raises(ValueError, match="name, component, and dockerfile are required"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\n')
+
+
+def test_builds_unknown_component_rejected(tmp_path):
+    with pytest.raises(ValueError, match="unknown component 'nope'"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\ncomponent = "nope"\ndockerfile = "Dockerfile"\n')
+
+
+def test_builds_push_without_registry_rejected(tmp_path):
+    with pytest.raises(ValueError, match="registry is required when push"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\ncomponent = "secchat"\ndockerfile = "Dockerfile"\npush = true\n')
+
+
+def test_builds_duplicate_name_rejected(tmp_path):
+    dup = ('\n[[builds]]\nname = "x"\ncomponent = "secchat"\ndockerfile = "Dockerfile"\n' * 2)
+    with pytest.raises(ValueError, match="duplicate name 'x'"):
+        _site(tmp_path, BARE + dup)
+
+
+def test_builds_unknown_key_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[\[builds\]\]\[0\]: unknown key"):
+        _site(tmp_path, BARE + '\n[[builds]]\nname = "x"\ncomponent = "secchat"\ndockerfile = "D"\nbogus = 1\n')
+
+
+def test_builds_round_trip_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_BUILDS)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.builds == site.builds
+
+
+# ── Kubernetes agent pool ([secchat.pool]) ───────────────────────────────────────────
+SITE_POOL = BARE + """
+[secchat.pool]
+enabled = true
+image = "registry.internal/secchat-runnerd:1.0.0"
+namespace = "chat-pool"
+service_account = "secchat"
+service_account_namespace = "chat"
+git_host = "git.sec.internal"
+secchat_url = "http://secchat.chat.svc:47010"
+max_pods = 12
+max_per_owner = 4
+ttl_seconds = 1800
+build_image = true
+registry = "registry.internal"
+apply = true
+kube_context = "enclave"
+api_server = "https://192.168.5.1:6443"
+create_service_account = true
+
+[secchat.pool.analysis_images]
+rust = "secagent-analyzer-rust:1"
+ikos = "secagent-analysis:1"
+"""
+
+
+def test_secchat_pool_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.secchat_pool.enabled is False
+    assert site.secchat_pool.image == ""
+    assert site.secchat_pool.namespace == "secchat-pool"  # the default
+
+
+def test_secchat_pool_parses_all_fields(tmp_path):
+    pool = _site(tmp_path, SITE_POOL).secchat_pool
+    assert pool.enabled is True
+    assert pool.image == "registry.internal/secchat-runnerd:1.0.0"
+    assert pool.namespace == "chat-pool"
+    assert pool.service_account == "secchat"
+    assert pool.service_account_namespace == "chat"
+    assert pool.git_host == "git.sec.internal"
+    assert pool.secchat_url == "http://secchat.chat.svc:47010"
+    assert pool.max_pods == 12
+    assert pool.max_per_owner == 4
+    assert pool.ttl_seconds == 1800
+    assert pool.build_image is True
+    assert pool.registry == "registry.internal"
+    assert pool.apply is True
+    assert pool.kube_context == "enclave"
+    assert pool.api_server == "https://192.168.5.1:6443"
+    assert pool.create_service_account is True
+    assert pool.analysis_images == {"rust": "secagent-analyzer-rust:1", "ikos": "secagent-analysis:1"}
+
+
+def test_secchat_pool_enabled_without_image_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="image is required"):
+        _site(tmp_path, BARE + "\n[secchat.pool]\nenabled = true\n")
+
+
+def test_secchat_pool_enabled_without_image_ok_when_build_image(tmp_path):
+    # build_image produces the image, so an explicit image isn't required (registry must be set).
+    pool = _site(tmp_path, BARE + '\n[secchat.pool]\nenabled = true\nbuild_image = true\nregistry = "reg.io"\n').secchat_pool
+    assert pool.enabled is True and pool.build_image is True and pool.image == ""
+
+
+def test_secchat_pool_build_image_without_registry_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="registry is required"):
+        _site(tmp_path, BARE + '\n[secchat.pool]\nenabled = true\nimage = "x"\nbuild_image = true\n')
+
+
+def test_secchat_pool_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secchat.pool\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secchat.pool]\nimage = "x"\nbogus = 1\n')
+
+
+def test_secchat_section_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secchat\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secchat]\nnope = 1\n')
+
+
+def test_secchat_pool_round_trips_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_POOL)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.secchat_pool == site.secchat_pool
+
+
+def test_bare_config_emits_no_pool_section(tmp_path):
+    # A pool-less site never writes a [secchat.pool] block (keeps bare configs clean).
+    assert "[secchat.pool]" not in _site(tmp_path, BARE).to_toml()
+
+
+# ── [secchat.voice] — the 1:1 voice-call media relay (secchat-mediad). Mirrors the [secchat.pool]
+#    coverage above: defaults, full-field parse, required-field/unknown-key rejection, round-trip,
+#    bare-config cleanliness. See docs/voice.md / docs/plans/voice-calls-plan.md §2.5. ────────────
+SITE_VOICE = BARE + """
+[secchat.voice]
+enabled = true
+image = "registry.internal/secchat-mediad:1.0.0"
+token = "shared-bearer"
+stun = "stun.internal:3478"
+advertise_addr = "192.168.5.1"
+media_port = 48020
+control_port = 48021
+max_legs_per_session = 12
+"""
+
+
+def test_secchat_voice_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.secchat_voice.enabled is False
+    assert site.secchat_voice.advertise_addr == ""
+    assert site.secchat_voice.image == "secchat-mediad:local"  # the default
+    assert site.secchat_voice.media_port == 47020
+    assert site.secchat_voice.control_port == 47021
+    assert site.secchat_voice.max_legs_per_session == 8  # mediad's own default
+
+
+def test_secchat_voice_parses_all_fields(tmp_path):
+    voice = _site(tmp_path, SITE_VOICE).secchat_voice
+    assert voice.enabled is True
+    assert voice.image == "registry.internal/secchat-mediad:1.0.0"
+    assert voice.token == "shared-bearer"
+    assert voice.stun == "stun.internal:3478"
+    assert voice.advertise_addr == "192.168.5.1"
+    assert voice.media_port == 48020
+    assert voice.control_port == 48021
+    assert voice.max_legs_per_session == 12
+
+
+def test_secchat_voice_enabled_without_advertise_addr_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="advertise_addr is required"):
+        _site(tmp_path, BARE + "\n[secchat.voice]\nenabled = true\n")
+
+
+def test_secchat_voice_rejects_max_legs_below_two(tmp_path):
+    # A cap below 2 rejects even a 1:1 call (caller + callee = two legs) at mediad — catch it at
+    # config-load time rather than letting every call fail at runtime.
+    with pytest.raises(ValueError, match="max_legs_per_session must be >= 2"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n'
+                               'max_legs_per_session = 1\n')
+
+
+def test_secchat_voice_rejects_a_public_stun_default(tmp_path):
+    # A public STUN server leaks call metadata + client IPs off-suite — the v3.1 REQUIRED default
+    # (plan §2.5 point 4). Must be rejected, not silently accepted.
+    with pytest.raises(ValueError, match="looks like a public STUN server"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n'
+                               'stun = "stun.l.google.com:19302"\n')
+
+
+def test_secchat_voice_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secchat.voice\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secchat.voice]\nbogus = 1\n')
+
+
+def test_secchat_voice_round_trips_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_VOICE)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.secchat_voice == site.secchat_voice
+
+
+def test_bare_config_emits_no_voice_section(tmp_path):
+    assert "[secchat.voice]" not in _site(tmp_path, BARE).to_toml()
+
+
+def test_secchat_pool_and_voice_can_coexist(tmp_path):
+    # [secchat] carries both sub-tables at once without either rejecting the other.
+    site = _site(tmp_path, SITE_POOL + '\n[secchat.voice]\nenabled = true\nadvertise_addr = "1.2.3.4"\n')
+    assert site.secchat_pool.enabled is True
+    assert site.secchat_voice.enabled is True
+
+
+# ── [audit] — optional syslog/SIEM forwarding for SecRouter's audit log (AU-3.3.x). Mirrors the
+#    [secchat.voice] coverage above: defaults, full-field parse, unknown-key/value rejection,
+#    round-trip, bare-config cleanliness. See docs/compliance.md. ─────────────────────────────
+SITE_AUDIT = BARE + """
+[audit]
+syslog_host = "siem.internal"
+syslog_port = 6514
+syslog_proto = "tcp"
+syslog_format = "cef"
+"""
+
+
+def test_audit_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.audit.syslog_host == ""
+    assert site.audit.syslog_port == 514
+    assert site.audit.syslog_proto == "udp"
+    assert site.audit.syslog_format == "json"
+
+
+def test_audit_parses_all_fields(tmp_path):
+    aud = _site(tmp_path, SITE_AUDIT).audit
+    assert aud.syslog_host == "siem.internal"
+    assert aud.syslog_port == 6514
+    assert aud.syslog_proto == "tcp"
+    assert aud.syslog_format == "cef"
+
+
+def test_audit_rejects_bad_syslog_proto(tmp_path):
+    with pytest.raises(ValueError, match="syslog_proto"):
+        _site(tmp_path, BARE + '\n[audit]\nsyslog_host = "siem.internal"\nsyslog_proto = "sctp"\n')
+
+
+def test_audit_rejects_bad_syslog_format(tmp_path):
+    with pytest.raises(ValueError, match="syslog_format"):
+        _site(tmp_path, BARE + '\n[audit]\nsyslog_host = "siem.internal"\nsyslog_format = "xml"\n')
+
+
+def test_audit_rejects_out_of_range_port(tmp_path):
+    with pytest.raises(ValueError, match="syslog_port"):
+        _site(tmp_path, BARE + '\n[audit]\nsyslog_host = "siem.internal"\nsyslog_port = 70000\n')
+
+
+def test_audit_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[audit\]: unknown key"):
+        _site(tmp_path, BARE + '\n[audit]\nbogus = 1\n')
+
+
+def test_audit_round_trips_through_to_toml(tmp_path):
+    site = _site(tmp_path, SITE_AUDIT)
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.audit == site.audit
+
+
+def test_bare_config_emits_no_audit_section(tmp_path):
+    assert "[audit]" not in _site(tmp_path, BARE).to_toml()

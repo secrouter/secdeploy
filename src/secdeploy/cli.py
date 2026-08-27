@@ -1,8 +1,11 @@
 """``secdeploy`` — the suite release/deploy CLI.
 
 Subcommands:
-  configure interactively write secsite.toml (placement + deploy options; optionally seeds
-            operator secrets into the gitignored *.env files) — see docs/secsite.md
+  configure write secsite.toml — interactively (the wizard), or graphically via --web (a local
+            SecRouter-themed page with every option + explanation). --name saves a NAMED profile
+            (sites/<name>.toml; list with --list) selectable anywhere --site is accepted, by
+            name. Optionally seeds operator secrets into the gitignored *.env files —
+            see docs/secsite.md
   verify    validate the manifest and that each target's assets are present
   plan      show what a target deploy would do (pinned versions + steps)
   fetch     git clone/checkout every component at its pinned ref into ./work
@@ -10,6 +13,11 @@ Subcommands:
   bundle    produce an air-gapped release bundle (+ SHA256SUMS)
   deploy    stand the suite up on this host for a target (use --dry-run to preview)
   status    report health of a deployed target
+  audit     deploy-audit hash-chain tooling — `secdeploy audit verify` walks out/audit/ (AU
+            3.3.8 — see docs/compliance.md)
+  evidence  fetch each reachable component's /admin/api/evidence + this host's own deploy-audit
+            chain verify result into out/evidence/suite-evidence-<date>.json — needs a live,
+            reachable deployment (see docs/compliance.md)
   teardown  remove what a deploy installed on THIS host (discovers what's actually here —
             never trusts topology.toml/deploy flags/the audit JSON; use --dry-run to preview,
             --purge to also remove persistent data)
@@ -29,7 +37,7 @@ from pathlib import Path
 from . import process as P
 from . import wiring
 from .manifest import Manifest
-from .site import DeployOptions
+from .site import DeployOptions, list_site_profiles, resolve_site_ref, site_profile_path
 from .targets import common, fedora_fips, macos
 
 TARGETS = {macos.NAME: macos, fedora_fips.NAME: fedora_fips}
@@ -77,14 +85,22 @@ def _resolved_list(cli_value: str | None, site_value: list[str]) -> list[str]:
     return [s.strip() for s in cli_value.split(",") if s.strip()]
 
 
+def _site_arg(args) -> str | None:
+    """``--site`` with named-profile resolution: a bare name matching a saved profile
+    (``sites/<name>.toml`` — see `secdeploy configure --name`) resolves to its file; a real path
+    passes through unchanged."""
+    return resolve_site_ref(getattr(args, "site", None))
+
+
 def _site_or_topology_path(args) -> str:
     """The effective placement FILE PATH for commands that only need placement, not deploy
     options (verify/plan already resolve a full SiteConfig instead; bundle uses this) —
-    ``--site`` if given, else ``secsite.toml`` in the current directory if present, else
-    ``--topology``. Safe to hand straight to :meth:`~secdeploy.topology.Topology.load` (or
-    anything that loads one): a secsite.toml's extra deploy-only keys are simply ignored by
-    Topology's own parser (see :meth:`Topology.from_data`)."""
-    site_arg = getattr(args, "site", None)
+    ``--site`` (a path or a saved profile name) if given, else ``secsite.toml`` in the current
+    directory if present, else ``--topology``. Safe to hand straight to
+    :meth:`~secdeploy.topology.Topology.load` (or anything that loads one): a secsite.toml's
+    extra deploy-only keys are simply ignored by Topology's own parser (see
+    :meth:`Topology.from_data`)."""
+    site_arg = _site_arg(args)
     if site_arg is not None:
         return site_arg
     if Path("secsite.toml").exists():
@@ -144,7 +160,7 @@ def _verify_topology(args, m: Manifest) -> None:
     from .site import SiteConfig
     from .topology import Topology
 
-    site_arg = getattr(args, "site", None)
+    site_arg = _site_arg(args)
     spath = Path(site_arg) if site_arg is not None else Path("secsite.toml")
     if site_arg is None and not spath.exists():
         tpath = Path(args.topology)
@@ -169,8 +185,35 @@ def _verify_topology(args, m: Manifest) -> None:
 def cmd_configure(args) -> int:
     from . import configure
 
+    if getattr(args, "list", False):
+        profiles = list_site_profiles()
+        if not profiles:
+            print("no saved site profiles (save one with: secdeploy configure --name <profile>)")
+            return 0
+        print("saved site profiles (usable anywhere --site is accepted, by name):")
+        for name in profiles:
+            print(f"    {name:<20} {site_profile_path(name)}")
+        return 0
+    # --name <profile> saves to sites/<profile>.toml instead of secsite.toml, so a machine can
+    # hold several site configurations (e.g. colima-test vs enclave) and every command can select
+    # one BY NAME: `secdeploy deploy macos --site <profile>`.
+    dest = args.site
+    if getattr(args, "name", None):
+        dest_path = site_profile_path(args.name)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest = str(dest_path)
     m = Manifest.load(args.manifest)
-    return 0 if configure.run(m, dest=args.site, root=_root(args)) else 1
+    # --web: the graphical configurator — a local SecRouter-themed page with every option +
+    # explanation; saving round-trips through the same SiteConfig validation as the wizard.
+    if getattr(args, "web", False):
+        from . import webconfig
+
+        webconfig.serve(m, dest, port=args.port)
+        return 0
+    ok = configure.run(m, dest=dest, root=_root(args))
+    if ok and getattr(args, "name", None):
+        print(f"saved profile {args.name!r} — use it with: secdeploy deploy <target> --site {args.name}")
+    return 0 if ok else 1
 
 
 def cmd_plan(args) -> int:
@@ -178,7 +221,7 @@ def cmd_plan(args) -> int:
     mod = _target_mod(args.target)
     t = m.target(args.target)
     without = _without(args)
-    site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+    site, from_file = wiring.active_site(m, _site_arg(args), args.topology, args.target)
     topo = site.topology
     print(f"suite {m.suite}  →  target {t.name} ({t.kind})")
     print(f"  {t.description}\n")
@@ -252,7 +295,7 @@ def cmd_deploy(args) -> int:
     """
     m = Manifest.load(args.manifest).include(_with(args))
     mod = _target_mod(args.target)
-    site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+    site, from_file = wiring.active_site(m, _site_arg(args), args.topology, args.target)
     without = _resolved_without(args.without, site.without)
     ssh = args.ssh if args.ssh is not None else site.ssh
 
@@ -280,7 +323,17 @@ def cmd_deploy(args) -> int:
         with_agent=_resolved(args.with_agent, opts.with_agent),
         native_services=args.native_services,
         autostart_models=_resolved_list(args.autostart_models, opts.autostart_models),
+        inference_backend=opts.inference_backend,
         users=site.users if from_file else None,
+        secchat_pool=site.secchat_pool if from_file else None,
+        secchat_voice=site.secchat_voice if from_file else None,
+        site_builds=site.builds if from_file else None,
+        # [audit] is suite-wide (like [deploy].without/ssh), not per-resource — so, unlike the
+        # from_file-gated fields above, it's always passed: `site` already defaults to an
+        # all-off AuditOptions() in single-host/topology-only mode (see SiteConfig.single_host/
+        # from_topology), so this is a no-op (no syslog fragment generated) exactly when there's
+        # no secsite.toml to have set it in the first place.
+        audit_opts=site.audit,
     )
     return 0
 
@@ -289,6 +342,42 @@ def cmd_status(args) -> int:
     m = Manifest.load(args.manifest)
     mod = _target_mod(args.target)
     mod.status(m, root=_root(args))
+    return 0
+
+
+def cmd_audit_verify(args) -> int:
+    from . import audit as audit_mod
+
+    result = audit_mod.verify_all(args.out)
+    print(f"deploy-audit chain verify — {Path(args.out) / 'audit'}")
+    if not result["targets"]:
+        print("  (no chained audit files found yet — nothing to verify; see docs/compliance.md)")
+    for stem, r in sorted(result["targets"].items()):
+        status = "OK" if r["ok"] else f"BROKEN at {r['brokenAt']}"
+        print(f"  {stem:<30} {r['checked']:>3} checked  {status}")
+    overall = "OK" if result["ok"] else f"BROKEN ({result['brokenAt']})"
+    print(f"  overall: {result['checked']} checked — {overall}")
+    return 0 if result["ok"] else 1
+
+
+def cmd_evidence(args) -> int:
+    from . import evidence as evidence_mod
+
+    m = Manifest.load(args.manifest)
+    without = _without(args)
+    # evidence has no per-target install behavior of its own (it's a read-only HTTP client
+    # against an already-deployed suite) — "fedora-fips" is just a harmless placeholder target
+    # for active_site's single-host synthesis fallback (see wiring.active_site), never used to
+    # gate/shape anything below.
+    site, _from_file = wiring.active_site(m, _site_arg(args), args.topology, "fedora-fips")
+    urls = site.topology.urls(without)
+    result = evidence_mod.collect(urls, args.out, token=args.token, timeout=args.timeout)
+    print(f"evidence bundle written → {result['path']}")
+    for name, info in result["components"].items():
+        note = f" — {info['note']}" if info.get("note") else ""
+        print(f"  {name:<12} {info['status']:<16}{note}")
+    chain = result["audit_chain"]
+    print(f"  deploy-audit chain: {'OK' if chain['ok'] else 'BROKEN'} ({chain['checked']} checked)")
     return 0
 
 
@@ -308,7 +397,7 @@ def _resolve_resource_opt(args, m: Manifest) -> str | None:
     single-host mode. Never fatal — the label is cosmetic (which host's archive this is), so a
     missing/oddly-shaped topology just falls back to ``--resource``/None rather than erroring."""
     try:
-        site, from_file = wiring.active_site(m, getattr(args, "site", None), args.topology, args.target)
+        site, from_file = wiring.active_site(m, _site_arg(args), args.topology, args.target)
         if not from_file:
             return getattr(args, "resource", None)
         return wiring.resource_for(site.topology, args.target, getattr(args, "resource", None))
@@ -382,6 +471,24 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument(
         "--site", default="secsite.toml",
         help="destination site config file to write (default: secsite.toml)",
+    )
+    cp.add_argument(
+        "--name", default=None,
+        help="save as a NAMED profile (sites/<name>.toml) instead of secsite.toml — select it "
+             "later anywhere --site is accepted, by name (e.g. `deploy macos --site <name>`)",
+    )
+    cp.add_argument(
+        "--list", action="store_true",
+        help="list the saved site profiles and exit",
+    )
+    cp.add_argument(
+        "--web", action="store_true",
+        help="graphical configurator: serve a local web page (loopback only) with every option "
+             "+ explanation; saving applies the same validation as the wizard",
+    )
+    cp.add_argument(
+        "--port", type=int, default=4477,
+        help="port for --web (default 4477)",
     )
     cp.set_defaults(fn=cmd_configure)
 
@@ -462,7 +569,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.choices["deploy"].add_argument(
         "--autostart-models", default=None,
-        help="comma-separated SecLLM catalog ids (e.g. fast,gemma-31b) to download (if not "
+        help="comma-separated SecLLM catalog ids (e.g. Llama-3.2-3B-Instruct,gemma-4-31B-it) to download (if not "
              "already cached) and load the moment the secllm service starts, instead of on "
              "first request via /admin. Only takes effect with --with-inference. Overrides the "
              "resource's secsite.toml `autostart_models` when given.",
@@ -571,6 +678,39 @@ def build_parser() -> argparse.ArgumentParser:
     _resource_arg(bp)
     _site_arg(bp)
     bp.set_defaults(fn=cmd_bundle)
+
+    ap = sub.add_parser(
+        "audit",
+        help="deploy-audit hash-chain tooling (AU-3.3.8 — CMMC evidence; see docs/compliance.md)",
+    )
+    audit_sub = ap.add_subparsers(dest="audit_cmd", required=True)
+    avp = audit_sub.add_parser(
+        "verify",
+        help="walk out/audit/ chronologically, per target+resource, and check the deploy-audit "
+             "hash chain (prevHash/hash — grandfathers old un-chained files)",
+    )
+    avp.set_defaults(fn=cmd_audit_verify)
+
+    ep = sub.add_parser(
+        "evidence",
+        help="fetch /admin/api/evidence from every reachable suite component + this host's own "
+             "deploy-audit chain verify result, bundled to out/evidence/suite-evidence-<date>.json "
+             "— NEEDS a live, reachable deployment (see docs/compliance.md)",
+    )
+    _without_arg(ep)
+    _topology_arg(ep)
+    _site_arg(ep)
+    ep.add_argument(
+        "--token", default=None,
+        help="admin bearer token sent to EVERY component's /admin/api/evidence — overridden "
+             "per-component by <COMPONENT>_ADMIN_TOKEN env vars (e.g. SECROUTER_ADMIN_TOKEN). "
+             "Never written to the output bundle.",
+    )
+    ep.add_argument(
+        "--timeout", type=float, default=5.0,
+        help="per-component HTTP timeout in seconds (default: 5)",
+    )
+    ep.set_defaults(fn=cmd_evidence)
 
     return p
 

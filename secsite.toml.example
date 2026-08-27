@@ -128,3 +128,122 @@ resource = "core"
 #
 # …or just delete secsite.toml (and topology.toml) — that is exactly what single-host mode
 # does for you, with every deploy option at its default.
+
+# ── Optional: Kubernetes agent pool for SecChat coding agents ─────────────────────────
+# When enabled, a coding agent whose launch environment is "pool" runs in a server-launched,
+# ephemeral Kubernetes pod (the runnerd image) instead of the user's desktop. SecDeploy writes
+# the SECCHAT_POOL_* env into secchat's .env AND emits the cluster manifests (namespace / Role +
+# binding / ResourceQuota / NetworkPolicy) to <out>/addressing/secchat-pool.k8s.json for the
+# operator to `kubectl apply`. Off by default — omit this whole section if you have no cluster.
+# See docs/agent-pool.md.
+#
+# [secchat.pool]
+# enabled = true
+# image = "registry.internal/secchat-runnerd:1.0.0"  # the runnerd image (required when enabled)
+# namespace = "secchat-pool"                          # where pool pods are created
+# service_account = "secchat"                         # SecChat's ServiceAccount (create/delete pods)
+# service_account_namespace = "secchat"               # ...and the namespace it lives in
+# git_host = "git.sec.internal"                       # the enclave git host pods may reach
+# secchat_url = ""                                    # cluster-internal URL a pod dials back (default: SecChat's own)
+# cpu = "1"
+# memory = "1Gi"
+# max_pods = 20                                       # ResourceQuota pod cap for the pool namespace
+# max_per_owner = 3                                   # per-user cap (SecChat's own admission)
+# ttl_seconds = 3600                                  # hard pod TTL backstop
+#
+# # Turnkey knobs (all optional; default off = write manifests only):
+# build_image = false                                 # build+push Dockerfile.runnerd (needs registry)
+# registry = ""                                       # push destination when build_image
+# apply = false                                       # kubectl apply the manifests during deploy
+# kube_context = ""                                   # kubectl --context for apply/extraction
+#
+# # OUT-OF-CLUSTER SecChat (compose on the host — this suite's normal shape):
+# api_server = "https://192.168.5.1:58483"            # k8s API reachable FROM the secchat container
+# create_service_account = true                       # emit SA + token Secret; deploy mounts the credential
+#
+# # Analysis sidecar catalog — containers attachable to an agent's pod, sharing its /workspace.
+# # Internet access for a pod is a PER-AGENT toggle in the SecChat UI, default OFF.
+# [secchat.pool.analysis_images]
+# rust = "secagent-analyzer-rust:local"
+
+# ── Optional: 1:1 voice calls (secchat-mediad media relay + SecRecorder transcription) ────
+# When enabled, SecDeploy adds a `mediad` compose service alongside SecChat (server-side WebRTC
+# relay that records consented calls), a NEW `recordings` volume (distinct from `uploads`,
+# mounted rw on both mediad and secchat), and writes SECCHAT_TRANSCRIBE_URL/SECCHAT_MEDIAD_*/
+# SECCHAT_CALL_STUN into secchat's .env. secrecorder must NOT be in [deploy].without (voice
+# transcription needs it — see docs/voice.md). Off by default.
+#
+# [secchat.voice]
+# enabled = true
+# image = "secchat-mediad:local"        # built via a [[builds]] entry below, or push your own
+# token = ""                            # SECCHAT_MEDIAD_TOKEN — blank generates+persists one
+# stun = ""                             # SECCHAT_CALL_STUN — suite-local ONLY; NEVER a public
+#                                        # STUN server (leaks call metadata off-suite; CUI/air-
+#                                        # gap posture). Empty is fine — LAN/VPN p2p usually
+#                                        # connects via host/peer-reflexive candidates anyway.
+# advertise_addr = "192.168.5.1"        # REQUIRED — the suite host's CROSS-HOST-reachable
+#                                        # address, fed to Pion's SetNAT1To1IPs. Wrong value =
+#                                        # relayed calls never connect from a second host.
+# # media_port = 47020                  # UDP+TCP (Pion ICEUDPMux/SetICETCPMux); rarely changed
+# # control_port = 47021                # compose-internal only, never published
+# # max_legs_per_session = 8            # MEDIAD_MAX_LEGS_PER_SESSION — participants per call;
+#                                        # raise for larger group calls, must be >= 2
+
+# ── Audit syslog forwarding (optional) ─────────────────────────────────────────────────
+# Suite-wide (like [deploy] above, not per-resource): forwards SecRouter's tamper-evident audit
+# log to a syslog/SIEM sink in ADDITION to its own SQLite chain (AU-3.3.x/800-172 — see
+# docs/compliance.md). Written as a documented `security.audit` fragment (secrouter-audit.json)
+# for you to merge into SecRouter's SECROUTER_CONFIG — not env-var-driven, same as its OIDC
+# fragment. Absent/empty syslog_host = no syslog sink at all (default; unchanged behavior).
+#
+# [audit]
+# syslog_host = "siem.sec.internal"
+# # syslog_port = 514                   # default
+# # syslog_proto = "udp"                # "udp" or "tcp"
+# # syslog_format = "json"              # "json" or "cef"
+
+# ── Container builds (optional) ────────────────────────────────────────────────────────
+# Images the deploy builds from fetched component checkouts (docker layer cache makes re-runs
+# cheap; local-only by default — right for colima/k3s shared runtimes; push = true needs registry).
+#
+# [[builds]]
+# name = "secchat-runnerd"                            # built as <name>:<tag> (tag defaults to local)
+# component = "secchat"                               # fetched checkout = build context
+# dockerfile = "Dockerfile.runnerd"
+#
+# [[builds]]
+# name = "secchat-mediad"                             # the voice media relay (Go/Pion + ffmpeg)
+# component = "secchat"
+# dockerfile = "mediad/Dockerfile"
+# context = "mediad"                                  # Dockerfile does `COPY go.mod go.sum ./`
+#
+# [[builds]]
+# name = "secagent-analyzer-rust"
+# component = "secagent"
+# dockerfile = "docker/analyzer-rust.Dockerfile"
+
+# ── Users & admin groups ───────────────────────────────────────────────────────────────
+# Optional [[users]] blocks seed SSO logins. Each is provisioned into SecSSO (Authentik) and
+# written to blueprints/users.generated.yaml with a one-time password (that generated file is
+# gitignored — it holds secrets — so this real secsite.toml is too; keep both out of git).
+#
+# Every name in a user's `groups` becomes an Authentik group + membership. Admin access is
+# per-service, gated on a named group (a valid login is necessary but not sufficient):
+#
+#   secrouter-admins  → the SecRouter admin console
+#   secllm-admins     → the SecLLM admin console (SECLLM_ADMIN_GROUP)
+#   secchat-admins    → the SecChat admin console + webhook management (SECCHAT_ADMIN_GROUP)
+#
+# Put a user in the group for each service they administer — e.g. an operator who runs
+# everything gets all three. A user in none of them is a normal, non-admin member.
+#
+#   [[users]]
+#   username = "austin"
+#   name     = "Austin"
+#   email    = "austin@example.mil"
+#   groups   = ["secrouter-admins", "secllm-admins", "secchat-admins"]
+#
+#   [[users]]
+#   username = "casey"
+#   name     = "Casey"
+#   groups   = []   # a normal member — can sign in, no admin consoles

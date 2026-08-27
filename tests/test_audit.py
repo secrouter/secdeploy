@@ -522,7 +522,7 @@ def test_fedora_deploy_real_run_2instance_writes_egress_and_shared_token(tmp_pat
     assert rules == [{
         "provider": "secllm",
         "allowedHost": ["secllm-gpu1.sec.internal:11400", "secllm-gpu2.sec.internal:11400"],
-        "authorizedClassifications": ["CUI"],
+        "authorizedClassifications": ["UNCLASSIFIED", "CUI"],
         "authorization": rules[0]["authorization"],
     }]
 
@@ -636,7 +636,7 @@ def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, m
     assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
     # The harness install steps actually ran: pi globally + `secagent init`, and NO secagent unit.
-    assert any(c == ["npm", "install", "-g", "@earendil-works/pi-coding-agent"] for c in run_calls)
+    assert any(c[:4] == ["npm", "install", "-g", "@earendil-works/pi-coding-agent"] for c in run_calls)
     assert any(c[:2] == ["bash", "-c"] and "secagent init --domain sec.internal" in c[2]
                for c in run_calls)
     assert not any("secagent.service" in " ".join(c) for c in run_calls)
@@ -648,3 +648,139 @@ def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, m
     assert auth["secagent_enabled"] is True
     assert auth["secagent_llm_at_secrouter"] is True
     assert auth["oidc_service_subject"] == "svc-secagent"
+
+
+# ── deploy-audit hash chain (AU-3.3.8) — chaining, verify, tamper, grandfathering ───────────
+T0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+T1 = datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+T2 = datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc)
+
+
+def _write(out, now, **overrides):
+    m = _manifest()
+    kwargs = dict(target="macos", services=[], shas={}, now=now)
+    kwargs.update(overrides)
+    return audit.write_deploy_audit(m, None, None, out, **kwargs)
+
+
+def test_first_deploy_chains_to_genesis(tmp_path):
+    out = tmp_path / "out"
+    _write(out, T0)
+    files = sorted((out / "audit").glob("deploy-macos-local-*.json"))
+    assert len(files) == 1
+    record = json.loads(files[0].read_text())
+    assert record["prevHash"] == audit.GENESIS
+    assert "hash" in record and record["hash"]
+
+
+def test_second_deploy_chains_to_first_deploys_hash(tmp_path):
+    out = tmp_path / "out"
+    _write(out, T0)
+    _write(out, T1)
+    files = sorted((out / "audit").glob("deploy-macos-local-*.json"))
+    assert len(files) == 2
+    r0 = json.loads(files[0].read_text())
+    r1 = json.loads(files[1].read_text())
+    assert r1["prevHash"] == r0["hash"]
+    assert r1["prevHash"] != audit.GENESIS
+
+
+def test_fixed_snapshot_gets_chain_fields_too_but_isnt_part_of_the_walked_chain(tmp_path):
+    out = tmp_path / "out"
+    json_path = _write(out, T0)
+    snapshot = json.loads(json_path.read_text())
+    assert "prevHash" in snapshot and "hash" in snapshot
+    # the fixed-name snapshot is overwritten every deploy, so it never itself accumulates as a
+    # second chain entry — only ONE timestamped chain file exists after a single deploy.
+    assert len(list((out / "audit").glob("deploy-macos-local-*.json"))) == 1
+
+
+def test_verify_chain_ok_for_a_clean_multi_entry_chain(tmp_path):
+    out = tmp_path / "out"
+    _write(out, T0)
+    _write(out, T1)
+    _write(out, T2)
+    result = audit.verify_chain(out, "macos", None)
+    assert result == {"ok": True, "checked": 3, "brokenAt": None}
+
+
+def test_verify_chain_empty_when_nothing_chained_yet(tmp_path):
+    out = tmp_path / "out"
+    result = audit.verify_chain(out, "macos", None)
+    assert result == {"ok": True, "checked": 0, "brokenAt": None}
+
+
+def test_verify_all_empty_out_dir(tmp_path):
+    out = tmp_path / "out"
+    result = audit.verify_all(out)
+    assert result == {"ok": True, "checked": 0, "brokenAt": None, "targets": {}}
+
+
+def test_verify_all_aggregates_multiple_target_resource_chains(tmp_path):
+    out = tmp_path / "out"
+    _write(out, T0, target="macos")
+    _write(out, T1, target="macos")
+    _write(out, T0, target="fedora-fips")
+    result = audit.verify_all(out)
+    assert result["ok"] is True
+    assert result["checked"] == 3
+    assert set(result["targets"]) == {"macos-local", "fedora-fips-local"}
+    assert result["targets"]["macos-local"]["checked"] == 2
+    assert result["targets"]["fedora-fips-local"]["checked"] == 1
+
+
+def test_verify_detects_tampered_content(tmp_path):
+    out = tmp_path / "out"
+    _write(out, T0)
+    _write(out, T1)
+    files = sorted((out / "audit").glob("deploy-macos-local-*.json"))
+    tampered = json.loads(files[0].read_text())
+    tampered["components"] = [{"name": "evil", "kind": "service", "tier": "x", "ref": "x",
+                               "sha": None, "role": "x"}]
+    files[0].write_text(json.dumps(tampered, indent=2) + "\n")
+
+    result = audit.verify_chain(out, "macos", None)
+    assert result["ok"] is False
+    assert result["checked"] == 0  # the tampered entry is the FIRST one
+    assert str(files[0]) in result["brokenAt"]
+
+
+def test_verify_detects_broken_prevhash_link(tmp_path):
+    out = tmp_path / "out"
+    _write(out, T0)
+    _write(out, T1)
+    files = sorted((out / "audit").glob("deploy-macos-local-*.json"))
+    second = json.loads(files[1].read_text())
+    second["prevHash"] = "not-the-real-hash"
+    # prevHash changed → hash must be recomputed too, or this would ALSO trip the hash check —
+    # either way it's correctly detected as broken; recompute so the break is specifically the
+    # prevHash LINK, not just a corrupted hash field.
+    check = {k: v for k, v in second.items() if k != "hash"}
+    import hashlib
+    second["hash"] = hashlib.sha256(audit._canonical(check).encode()).hexdigest()
+    files[1].write_text(json.dumps(second, indent=2) + "\n")
+
+    result = audit.verify_chain(out, "macos", None)
+    assert result["ok"] is False
+    assert result["checked"] == 1  # the first entry still checks out clean
+    assert str(files[1]) in result["brokenAt"]
+
+
+def test_grandfathering_ignores_pre_chain_legacy_files(tmp_path):
+    # Simulate a pre-upgrade deploy: only the fixed-name snapshot exists, no chain entry at all
+    # (as if written by a secdeploy version from before this feature existed).
+    out = tmp_path / "out"
+    legacy = out / "audit" / "deploy-macos-local.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"schema_version": 1, "target": "macos"}, indent=2) + "\n")
+
+    # verify sees nothing to check yet — the legacy file doesn't match the chain-entry pattern.
+    assert audit.verify_chain(out, "macos", None) == {"ok": True, "checked": 0, "brokenAt": None}
+
+    # the FIRST real deploy after upgrading starts a fresh chain at GENESIS — it does not try
+    # (and fail) to link into the legacy file's content.
+    _write(out, T0)
+    files = sorted((out / "audit").glob("deploy-macos-local-*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["prevHash"] == audit.GENESIS
+    assert audit.verify_chain(out, "macos", None) == {"ok": True, "checked": 1, "brokenAt": None}

@@ -56,7 +56,7 @@ no flags; CLI flags still override it one-off. `secdeploy configure` now writes 
 `secsite.toml` — every deploy option is asked, but only where it actually applies to a given
 resource — and can optionally seed operator secrets (SecCert's admin token/CA passphrase,
 SecAgent's SecSSO client secret, SecRecorder's Hugging Face token, SecRouter's
-`FREEROUTER_CONFIG` path) into the gitignored `*.env` files, never into `secsite.toml` itself.
+`SECROUTER_CONFIG` path) into the gitignored `*.env` files, never into `secsite.toml` itself.
 See [secsite.md](secsite.md). A bare `topology.toml` still works byte-identically.
 
 Still to do, building on that:

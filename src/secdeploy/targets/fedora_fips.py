@@ -31,6 +31,7 @@ from .. import backup as backup_mod
 from .. import process as P
 from .. import wiring
 from ..manifest import Manifest
+from ..site import AuditOptions
 
 NAME = "fedora-fips"
 KIND = "systemd-native"
@@ -76,6 +77,10 @@ SECRECORDER_ADDRESSING_ENV = ETC / "secrecorder-addressing.env"
 # guarded. nginx links the system OpenSSL — FIPS-validated in FIPS mode — which is why the suite
 # standardized on it for the edge TLS termination (macOS runs the same nginx for its eval).
 SECPROXY_NGINX_CONF = ETC / "nginx-secproxy.conf"
+# secproxy's log-rotation config (see wiring.logrotate_conf_text) — installed to the standard
+# logrotate drop-in dir; systemd's own logrotate.timer picks it up (no separate cron needed).
+# No secret in it either, so it's refreshed unconditionally, same as the nginx conf itself.
+SECPROXY_LOGROTATE = Path("/etc/logrotate.d") / "secproxy"
 # The SAN cert nginx serves — issued from SecCert by certbot at deploy time (see
 # _issue_secproxy_cert), covering all fronted FQDNs; nginx_conf_text points every :443 server
 # block's ssl_certificate/ssl_certificate_key here. Key lands 0600, owned by secsuite-secproxy.
@@ -402,6 +407,14 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              str(addr_dir / "secproxy.nginx.conf"), str(SECPROXY_NGINX_CONF)],
             f"install generated nginx config → {SECPROXY_NGINX_CONF}",
         ))
+        # logrotate config for secproxy's access/error logs (see wiring.logrotate_conf_text) —
+        # no secret, refreshed unconditionally like the nginx conf itself. macOS has no
+        # logrotate/cron by default (launchd host) — see targets/macos.py's own secproxy block
+        # for the newsyslog alternative it documents instead of installing this.
+        steps.append((
+            ["install", "-m", "644", str(addr_dir / "secproxy.logrotate.conf"), str(SECPROXY_LOGROTATE)],
+            f"install secproxy logrotate config → {SECPROXY_LOGROTATE}",
+        ))
         # Landing page (see wiring.landing_page_html) — generated + written to addr_dir alongside
         # the nginx config in deploy(), same pattern as everything else staged there.
         steps.append((
@@ -409,6 +422,14 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              str(addr_dir / "secproxy-index.html"), str(VAR / "secproxy" / "www" / "index.html")],
             f"install landing page → {VAR / 'secproxy' / 'www' / 'index.html'}",
         ))
+        # Branded 502/503/504/404 pages (see wiring.error_page_html) — nginx_conf_text's server
+        # blocks error_page-route to these, alongside the landing page, in the same www root.
+        for kind, fname in (("5xx", "5xx.html"), ("404", "404.html")):
+            steps.append((
+                ["install", "-m", "644", "-o", "secsuite-secproxy", "-g", "secsuite-secproxy",
+                 str(addr_dir / f"secproxy-{fname}"), str(VAR / "secproxy" / "www" / fname)],
+                f"install {kind} error page → {VAR / 'secproxy' / 'www' / fname}",
+            ))
         if topology is not None:
             steps += _issue_secproxy_cert(topology, without)
     # units — only the selected services, plus the suite target. secagent is skipped: it's an
@@ -453,7 +474,12 @@ def deploy(
     with_agent: bool = False,
     native_services: bool = True,
     autostart_models: list[str] | None = None,
+    inference_backend: str = "auto",  # macOS-only (vLLM-Metal); accepted+ignored here
     users=None,
+    secchat_pool=None,
+    secchat_voice=None,
+    site_builds=None,
+    audit_opts: AuditOptions | None = None,
 ) -> None:
     users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
@@ -465,8 +491,10 @@ def deploy(
                "WHISPER_MODEL/WHISPER_DIARIZE_MODEL directly in /etc/secsuite/secrecorder.env")
     if tls or configure_hosts or trust_ca:
         P.warn("--tls/--configure-hosts/--trust-ca are macOS-only (fedora-fips gets TLS via "
-               "secrouter.env's FREEROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
+               "secrouter.env's SECROUTER_CONFIG + SecCert's native ACME integration) — ignoring")
     without = without or []
+    # Optional site container builds ([[builds]]) — run first so later steps' images exist.
+    common.run_site_builds(site_builds or [], work, dry_run)
     # Placement: which native services run on THIS resource. secdns is only deployed with a
     # topology (it needs a generated zone); single-host (no topology) is byte-identical. secllm
     # additionally needs --with-inference: the DNS + peer-env wiring (steps 1-3) always reflects
@@ -518,13 +546,23 @@ def deploy(
     )
 
     # SecRouter's OIDC config fragment (security.oidc.issuer/jwksUri/serviceSubjects) — not a
-    # turnkey env var like SECROUTER_EGRESS_FILE (SecRouter's FREEROUTER_CONFIG is hand-authored
+    # turnkey env var like SECROUTER_EGRESS_FILE (SecRouter's SECROUTER_CONFIG is hand-authored
     # JSON), so write_addressing() writes it as a documented fragment for the operator to merge
     # rather than installing it anywhere. It's generated whenever SecRouter+SecSSO are co-placed
     # (--with-agent or not — same placement-only precedent as the rest of write_addressing), but
     # only SURFACED here (dry-run/log) when --with-agent is set, since it's specifically about
     # authorizing svc-secagent and would be noise otherwise.
     oidc_preview = wiring.secrouter_oidc_config(topology, without) if topology is not None else {}
+
+    # SecRouter's audit-syslog config fragment (security.audit.sink/syslog — secsite.toml's
+    # [audit] table) — same "hand-authored JSON, not env-var turnkey" reasoning as the OIDC
+    # fragment above, so write_addressing() writes it the same way (secrouter-audit.json, for
+    # the operator to merge). Unlike OIDC (only surfaced with --with-agent, since it's about
+    # authorizing svc-secagent specifically), this is surfaced whenever it's actually generated —
+    # syslog forwarding isn't gated behind any deploy flag, only the site config.
+    audit_syslog_preview = (
+        wiring.secrouter_audit_syslog_config(audit_opts) if topology is not None else {}
+    )
 
     # Optional: point this host's resolver at secdns for the internal domain.
     resolver_configured = False
@@ -560,6 +598,12 @@ def deploy(
             print(f"  · SecRouter OIDC config fragment (merge into security.oidc) would be "
                   f"written → {oidc_path}: issuer={oidc_preview['issuer']!r}, "
                   f"serviceSubjects={oidc_preview['serviceSubjects']!r}")
+        if audit_syslog_preview:
+            audit_syslog_path = (addr_dir / "secrouter-audit.json") if addr_dir else None
+            print(f"  · SecRouter audit syslog config fragment (merge into security.audit) would "
+                  f"be written → {audit_syslog_path}: "
+                  f"{audit_syslog_preview['syslog']['host']}:{audit_syslog_preview['syslog']['port']} "
+                  f"({audit_syslog_preview['syslog']['protocol']}/{audit_syslog_preview['syslog']['format']})")
         if out is not None:
             note = audit.dry_run_note(
                 out, NAME, resource, component_count=len(services) + len(stacks),
@@ -582,7 +626,8 @@ def deploy(
     written: dict[str, object] | None = None
     if addr_dir is not None:
         written = wiring.write_addressing(topology, addr_dir, resource, without,
-                                          secrouter_egress_path=str(SECROUTER_EGRESS_FILE))
+                                          secrouter_egress_path=str(SECROUTER_EGRESS_FILE),
+                                          audit_opts=audit_opts)
         if "secproxy" in services and topology is not None:
             # Landing page (see wiring.landing_page_html) — staged here alongside the nginx
             # config write_addressing just produced; _deploy_steps installs it from this path.
@@ -592,6 +637,10 @@ def deploy(
             (addr_dir / "secproxy-index.html").write_text(
                 wiring.landing_page_html(topology, without, setup_actions=actions)
             )
+            # Branded 502/503/504/404 pages (see wiring.error_page_html) — staged here alongside
+            # the landing page; _deploy_steps installs both into the same www root.
+            (addr_dir / "secproxy-5xx.html").write_text(wiring.error_page_html("5xx"))
+            (addr_dir / "secproxy-404.html").write_text(wiring.error_page_html("404"))
         if "secdns" in services:
             (addr_dir / "secdns.env").write_text(wiring.secdns_env_text(topology, str(SECDNS_ZONE)))
         if "secllm" in services:
@@ -606,6 +655,9 @@ def deploy(
         if secagent_enabled and written.get("oidc"):
             P.log(f"SecRouter OIDC config fragment written → {written['oidc']} "
                   "(merge into security.oidc — see docs/fedora-fips.md)")
+        if written.get("audit"):
+            P.log(f"SecRouter audit syslog config fragment written → {written['audit']} "
+                  "(merge into security.audit — see docs/compliance.md)")
         # SecRecorder (a NATIVE service, not a stack) turnkey SSO — mirror SecSSO's generated OIDC
         # login-client secret into the just-written env/secrecorder.env, and point SecSSO's
         # SecRecorder redirect at this topology's callback. This must run HERE, before the install
@@ -663,11 +715,37 @@ def deploy(
         if sc_redir:
             P.log("secsso: pointed the SecChat OIDC client at its topology callback "
                   "(SECCHATNG_REDIRECT_URI/LAUNCH_URL in work/secsso/.env)")
+        # Optional agent pool: build+push the runnerd image first (when requested) so the .env sync +
+        # manifests below reference the pushed (digest-pinned) image.
+        if secchat_pool is not None and secchat_pool.enabled and secchat_pool.build_image:
+            built = common.build_push_runnerd_image(secchat_pool, work)
+            if built:
+                secchat_pool.image = built
         sc_env = wiring.sync_secchat_env(
-            work / "secsso" / ".env", work / "secchat" / ".env", topology, without)
+            work / "secsso" / ".env", work / "secchat" / ".env", topology, without,
+            pool=secchat_pool, voice=secchat_voice)
         if sc_env:
             P.log(f"secchat: synced OIDC secret + topology env → work/secchat/.env "
                   f"({len(sc_env)} keys)")
+        # Optional Kubernetes agent pool: emit the cluster manifests, and (when apply is set) apply them.
+        pool_sa_provisioned = False
+        if secchat_pool is not None and secchat_pool.enabled and addr_dir is not None:
+            pool_path = wiring.write_pool_manifests(secchat_pool, addr_dir)
+            if pool_path:
+                P.log(f"secchat: wrote Kubernetes agent-pool manifests → {pool_path} "
+                      "(apply with `kubectl apply -f`; see docs/agent-pool.md)")
+                if secchat_pool.apply:
+                    common.apply_pool_manifests(secchat_pool, pool_path)
+                # Out-of-cluster SecChat: extract + mount the SA credential before the stack bring-up.
+                # Folds the voice media relay's mediad service into the SAME compose.override.yaml
+                # when also enabled (Compose auto-merges only one override file).
+                if secchat_pool.apply and secchat_pool.create_service_account:
+                    pool_sa_provisioned = common.provision_pool_credentials(
+                        secchat_pool, work / "secchat", voice=secchat_voice)
+        # Voice media relay (secchat-mediad): write its own compose.override.yaml when enabled and
+        # not already folded into the pool's above. Before the stack bring-up below.
+        if secchat_voice is not None and secchat_voice.enabled and not pool_sa_provisioned:
+            common.write_mediad_compose(secchat_voice, work / "secchat")
     # Declared end-user accounts → SecSSO: render work/secsso/blueprints/users.generated.yaml
     # (random initial passwords, forced reset on first login) before the stacks bring-up.
     if not dry_run and users and placed and "secsso" in placed and "secsso" not in (without or []):

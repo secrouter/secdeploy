@@ -22,7 +22,9 @@ step actually ran) and hand it in; this module just assembles and writes the rec
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -39,6 +41,122 @@ SCHEMA_VERSION = 1
 # or not the caller bothered to synthesize a Topology for the audit.
 SINGLE_HOST_RESOURCE = "local"
 SINGLE_HOST_ADDRESS = "127.0.0.1"
+
+# ── deploy-audit hash chain (AU-3.3.8 — protect audit information) ─────────────────────────
+#
+# write_deploy_audit() has always written ONE fixed-name snapshot per target+resource
+# (deploy-<target>-<resource>.json/.txt — see audit_paths), overwritten by every redeploy. That
+# is fine as a "what does this resource look like right now" artifact but useless as tamper-
+# evidence: overwriting destroys the previous record, so there is nothing left to chain INTO.
+#
+# So each real deploy ALSO appends an immutable, timestamped copy of the same record —
+# deploy-<target>-<resource>-<UTC timestamp>.json — carrying two extra fields: `prevHash` (the
+# SHA-256 of the previous such file's canonical content for the same target+resource, or the
+# literal string "GENESIS" if this is the first one) and `hash` (the SHA-256 of THIS record's
+# own canonical content, `prevHash` included, `hash` itself excluded — you cannot hash yourself).
+# The fixed-name snapshot gets the identical content (so it always shows its own place in the
+# chain too), but is never itself part of the chain sequence :func:`verify_chain` walks — a
+# redeploy overwriting it doesn't break anything, since the timestamped file already captured it.
+#
+# Old files from before this existed (or the fixed-name snapshot itself) carry no `prevHash`/
+# `hash` and don't match the timestamped-filename pattern below, so they're invisible to
+# :func:`verify_chain`/:func:`verify_all` — "grandfathered": the chain simply starts fresh at
+# GENESIS the first time a real deploy runs under this feature, rather than erroring on history
+# it has no way to validate.
+CHAIN_TS_FMT = "%Y%m%dT%H%M%S%f"  # UTC, microsecond resolution — collision-safe even for
+                                   # back-to-back deploys in a fast test/CI loop
+GENESIS = "GENESIS"
+_CHAIN_RE = re.compile(r"^deploy-(?P<stem>.+)-(?P<ts>\d{8}T\d{12}Z)\.json$")
+
+
+def _canonical(record: dict[str, object]) -> str:
+    """Deterministic serialization used for hashing — compact, key order as inserted (never
+    re-sorted: :func:`write_deploy_audit` always builds ``record`` the same way for the same
+    inputs, so this is reproducibly the same text for the same logical content)."""
+    return json.dumps(record, separators=(",", ":"))
+
+
+def _chain_file_path(out_dir: str | Path, target: str, resource: str | None, now: datetime) -> Path:
+    """Where THIS deploy's immutable, timestamped chain entry gets written — see the module
+    docstring above. Distinct from :func:`audit_paths`'s fixed-name snapshot; never overwritten."""
+    stem = f"deploy-{target}-{_resource_label(resource)}-{now.strftime(CHAIN_TS_FMT)}Z"
+    return Path(out_dir) / "audit" / f"{stem}.json"
+
+
+def _existing_chain_files(out_dir: str | Path, target: str, resource: str | None) -> list[Path]:
+    """Every already-written chain entry for this target+resource, oldest first (the timestamp
+    format sorts lexicographically = chronologically). Empty if none exist yet — either a fresh
+    deploy (chain starts at GENESIS) or only grandfathered pre-chain files are present."""
+    d = Path(out_dir) / "audit"
+    if not d.is_dir():
+        return []
+    prefix = f"deploy-{target}-{_resource_label(resource)}-"
+    matches = []
+    for p in d.iterdir():
+        m = _CHAIN_RE.match(p.name)
+        if m and p.name.startswith(prefix):
+            matches.append(p)
+    return sorted(matches)
+
+
+def _verify_files(files: list[Path]) -> dict[str, object]:
+    """Walk an already-sorted (chronological) list of chain files, recomputing each entry's
+    hash and checking the prevHash link to the one before it. Returns
+    ``{"ok", "checked", "brokenAt"}`` — ``checked`` is how many entries verified clean before a
+    break (or all of them, if ``ok``); ``brokenAt`` is the 1-based position of the first bad
+    entry (its path), or ``None`` when everything checks out."""
+    prev_hash = GENESIS
+    for i, f in enumerate(files, 1):
+        try:
+            entry = json.loads(f.read_text())
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "checked": i - 1, "brokenAt": f"{f} (unreadable: {exc})"}
+        if entry.get("prevHash") != prev_hash:
+            return {"ok": False, "checked": i - 1, "brokenAt": str(f)}
+        stored_hash = entry.get("hash")
+        check = {k: v for k, v in entry.items() if k != "hash"}
+        if hashlib.sha256(_canonical(check).encode()).hexdigest() != stored_hash:
+            return {"ok": False, "checked": i - 1, "brokenAt": str(f)}
+        prev_hash = stored_hash
+    return {"ok": True, "checked": len(files), "brokenAt": None}
+
+
+def verify_chain(out_dir: str | Path, target: str, resource: str | None = None) -> dict[str, object]:
+    """Verify one target+resource's deploy-audit hash chain — walks its timestamped chain
+    entries chronologically (see the module docstring), recomputing and cross-checking every
+    ``hash``/``prevHash``. Returns ``{"ok": bool, "checked": int, "brokenAt": str | None}``.
+    Empty/no chain entries yet (a fresh out/, or only grandfathered pre-chain files) is ``ok``
+    with ``checked=0`` — nothing to verify is not a failure."""
+    return _verify_files(_existing_chain_files(out_dir, target, resource))
+
+
+def verify_all(out_dir: str | Path) -> dict[str, object]:
+    """Verify every target+resource's chain found under ``<out_dir>/audit/`` — what
+    ``secdeploy audit verify`` runs. Returns
+    ``{"ok": bool, "checked": int, "brokenAt": str | None, "targets": {"<target>-<resource>":
+    {...same shape as :func:`verify_chain`...}, ...}}`` — ``ok``/``checked``/``brokenAt`` are
+    the aggregate across every discovered chain (``brokenAt`` names the FIRST broken one found);
+    ``targets`` carries the per-chain detail. Directories with no chain files at all (nothing
+    chained yet) report ``ok=True, checked=0, targets={}`` — never a failure."""
+    d = Path(out_dir) / "audit"
+    groups: dict[str, list[Path]] = {}
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            m = _CHAIN_RE.match(p.name)
+            if m:
+                groups.setdefault(m.group("stem"), []).append(p)
+    ok = True
+    checked = 0
+    broken_at: str | None = None
+    targets: dict[str, object] = {}
+    for stem, files in sorted(groups.items()):
+        result = _verify_files(sorted(files))
+        targets[stem] = result
+        checked += result["checked"]
+        if not result["ok"] and ok:
+            ok = False
+            broken_at = f"{stem}: {result['brokenAt']}"
+    return {"ok": ok, "checked": checked, "brokenAt": broken_at, "targets": targets}
 
 
 def _resource_label(resource: str | None) -> str:
@@ -196,6 +314,14 @@ def _render_txt(record: dict[str, object]) -> str:
     for k, v in record["flags"].items():
         v_str = (", ".join(v) or "(none)") if isinstance(v, list) else ("yes" if v else "no")
         lines.append(f"  {k:<20} {v_str}")
+
+    if "hash" in record:
+        lines += [
+            "",
+            "audit chain (AU-3.3.8 — verify with `secdeploy audit verify`):",
+            f"  prevHash: {record.get('prevHash', '?')}",
+            f"  hash:     {record['hash']}",
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -242,6 +368,11 @@ def write_deploy_audit(
 
     ``now`` is injectable (default :func:`datetime.now` in UTC) so callers get a deterministic,
     testable timestamp instead of wall-clock time.
+
+    Also appends this deploy to the target+resource's hash chain (AU-3.3.8 — see the module
+    docstring above): the returned/written record gains ``prevHash``/``hash`` fields, and an
+    immutable, timestamped copy lands alongside the fixed-name snapshot this always wrote —
+    verify with :func:`verify_chain`/:func:`verify_all` or ``secdeploy audit verify``.
     """
     now = now or datetime.now(timezone.utc)
     without = list(without or [])
@@ -273,6 +404,20 @@ def write_deploy_audit(
         ),
         "flags": flags,
     }
+
+    # Hash-chain this deploy onto the previous one for this SAME target+resource (see the
+    # module docstring) — GENESIS if none exists yet (first real deploy here, or only
+    # grandfathered pre-chain files are present). prevHash is set before hash is computed;
+    # hash covers everything ELSE in the record (it cannot cover itself).
+    prev_files = _existing_chain_files(out_dir, target, resource)
+    record["prevHash"] = (
+        json.loads(prev_files[-1].read_text()).get("hash", GENESIS) if prev_files else GENESIS
+    )
+    record["hash"] = hashlib.sha256(_canonical(record).encode()).hexdigest()
+
+    chain_path = _chain_file_path(out_dir, target, resource, now)
+    chain_path.parent.mkdir(parents=True, exist_ok=True)
+    chain_path.write_text(json.dumps(record, indent=2) + "\n")
 
     json_path, txt_path = audit_paths(out_dir, target, resource)
     json_path.parent.mkdir(parents=True, exist_ok=True)

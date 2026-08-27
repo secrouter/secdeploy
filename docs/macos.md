@@ -290,6 +290,14 @@ webroot) under `out/secproxy/state` — and names your user as nginx's `worker` 
 starts nginx as root with no user drop of its own. No production paths to create, and no manual
 cert placement: both are handled for you.
 
+Both targets' config defines the same named `secproxy` log format (nginx's `combined` fields
+plus `$request_id`/`$request_time`/`$upstream_response_time`). fedora-fips additionally installs
+a logrotate config for it (`/etc/logrotate.d/secproxy`) — this eval target does **not**: macOS is
+a launchd host with no `cron`/`logrotate` by default. If you need rotation here, the native
+alternative is [`newsyslog`](https://www.unix.com/man-page/osx/8/newsyslog/)
+(`/etc/newsyslog.d/*.conf`, driven by `periodic(8)`) — wiring it up is left to you for this eval
+target (see [compliance.md](compliance.md) for the retention/integrity shared-responsibility note).
+
 ### What it fronts
 
 The same components as fedora-fips — **secsso, secrouter, secagent, secchat, secrecorder** —
@@ -486,5 +494,5 @@ macOS notes specific to this target:
 ## Notes
 
 - SecRouter runs in **dev mode** here (security disabled). For anything real, mount a hardened
-  `freerouter.config.json` (see the SecRouter repo) — or use the `fedora-fips` target.
+  `secrouter.config.json` (see the SecRouter repo) — or use the `fedora-fips` target.
 - The Mac path is not a FIPS environment; use it for evaluation, not accreditation.
