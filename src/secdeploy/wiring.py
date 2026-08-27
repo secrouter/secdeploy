@@ -280,7 +280,9 @@ def landing_page_html(
 \t\theader {{ display:flex; align-items:center; gap:14px; padding:14px 22px; background:var(--panel);
 \t\t         border-bottom:1px solid var(--border); border-top:3px solid var(--accent); }}
 \t\theader h1 {{ font-size:15px; margin:0; font-weight:700; text-transform:uppercase; letter-spacing:.14em; }}
-\t\theader .lock {{ color:var(--accent); }}
+\t\theader h1 .sec {{ color:var(--accent); }}
+\t\t/* one currentColor hexagon works in both themes (nodes follow --fg, hub follows --accent) */
+\t\theader .brand-mark {{ height:26px; width:auto; display:block; color:var(--fg); }}
 \t\theader .who {{ margin-left:auto; color:var(--muted); font:11px var(--mono);
 \t\t              text-transform:uppercase; letter-spacing:.08em; }}
 \t\tmain {{ padding:24px 22px; max-width:900px; margin:0 auto; }}
@@ -314,10 +316,18 @@ def landing_page_html(
 </head>
 <body>
 \t<header>
-\t\t<span class="lock">🔒</span>
-\t\t<h1>SecRouter Suite</h1>
+\t\t<svg class="brand-mark" viewBox="0 0 48 58" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+\t\t\t<g transform="translate(4,5)">
+\t\t\t\t<polygon points="24,2 44,13 44,37 24,54 4,37 4,13" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+\t\t\t\t<path d="M24 28 L24 14 M24 28 L14 38 M24 28 L34 38" stroke="currentColor" stroke-width="1.9"/>
+\t\t\t\t<path d="M24 14 L14 38 M24 14 L34 38 M14 38 L34 38" stroke="currentColor" stroke-width="1.4" stroke-opacity="0.4"/>
+\t\t\t\t<circle cx="24" cy="14" r="2.7" fill="currentColor"/><circle cx="14" cy="38" r="2.7" fill="currentColor"/><circle cx="34" cy="38" r="2.7" fill="currentColor"/>
+\t\t\t\t<circle cx="24" cy="28" r="4.4" fill="var(--accent)"/>
+\t\t\t</g>
+\t\t</svg>
+\t\t<h1><span class="sec">SEC</span>ROUTER SUITE</h1>
 \t\t<span class="who">{domain}</span>
-\t\t<button class="btn ghost theme-toggle" title="Toggle light / dark" onclick="toggleTheme()">DARK</button>
+\t\t<button class="btn ghost theme-toggle" title="Toggle light / dark" onclick="toggleTheme()">◐</button>
 \t</header>
 \t<main>
 \t\t<div class="card">
@@ -332,11 +342,10 @@ def landing_page_html(
 \t\tfunction effectiveTheme(){{ var a=document.documentElement.getAttribute("data-theme");
 \t\t\tif(a==="dark"||a==="light") return a;
 \t\t\treturn (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"; }}
+\t\t/* The ◐ glyph is theme-neutral (secrecorder's toggle pattern) — no label swap needed. */
 \t\tfunction setTheme(t){{ document.documentElement.setAttribute("data-theme", t);
-\t\t\ttry {{ localStorage.setItem("secrouter-theme", t); }} catch(e){{}}
-\t\t\tvar b=document.querySelector(".theme-toggle"); if(b) b.textContent = effectiveTheme()==="dark" ? "LIGHT" : "DARK"; }}
+\t\t\ttry {{ localStorage.setItem("secrouter-theme", t); }} catch(e){{}} }}
 \t\tfunction toggleTheme(){{ setTheme(effectiveTheme()==="dark" ? "light" : "dark"); }}
-\t\tsetTheme(effectiveTheme());
 \t</script>
 </body>
 </html>
@@ -392,12 +401,22 @@ def error_page_html(kind: str) -> str:
 \t\t.wordmark {{ font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.14em;
 \t\t             color:var(--muted); margin-bottom:14px; }}
 \t\t.wordmark .sec {{ color:var(--accent); }}
+\t\t.brand-mark {{ height:34px; width:auto; display:block; margin:0 auto 10px; color:var(--fg); }}
 \t\th1 {{ margin:0 0 8px; font:700 20px var(--mono); text-transform:uppercase; letter-spacing:.04em; }}
 \t\tp {{ margin:0; color:var(--muted); }}
 \t</style>
 </head>
 <body>
 \t<div class="card">
+\t\t<svg class="brand-mark" viewBox="0 0 48 58" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+\t\t\t<g transform="translate(4,5)">
+\t\t\t\t<polygon points="24,2 44,13 44,37 24,54 4,37 4,13" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+\t\t\t\t<path d="M24 28 L24 14 M24 28 L14 38 M24 28 L34 38" stroke="currentColor" stroke-width="1.9"/>
+\t\t\t\t<path d="M24 14 L14 38 M24 14 L34 38 M14 38 L34 38" stroke="currentColor" stroke-width="1.4" stroke-opacity="0.4"/>
+\t\t\t\t<circle cx="24" cy="14" r="2.7" fill="currentColor"/><circle cx="14" cy="38" r="2.7" fill="currentColor"/><circle cx="34" cy="38" r="2.7" fill="currentColor"/>
+\t\t\t\t<circle cx="24" cy="28" r="4.4" fill="var(--accent)"/>
+\t\t\t</g>
+\t\t</svg>
 \t\t<div class="wordmark"><span class="sec">SEC</span>PROXY</div>
 \t\t<h1>{esc_title}</h1>
 \t\t<p>{html.escape(message)}</p>

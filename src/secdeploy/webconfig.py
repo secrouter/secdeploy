@@ -258,14 +258,12 @@ function effectiveTheme() {
   if (a === 'dark' || a === 'light') return a;
   return (window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
 }
+/* The ◐ glyph is theme-neutral (secrecorder's toggle pattern) — no label swap needed. */
 function setTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
   try { localStorage.setItem('secrouter-theme', t); } catch (e) {}
-  var b = document.querySelector('.theme-toggle');
-  if (b) b.textContent = effectiveTheme() === 'dark' ? 'LIGHT' : 'DARK';
 }
 function toggleTheme() { setTheme(effectiveTheme() === 'dark' ? 'light' : 'dark'); }
-setTheme(effectiveTheme());
 """
 
 
@@ -401,7 +399,7 @@ def render_form(site: SiteConfig, manifest: Manifest, dest: str,
   <h1><span class="sec">SEC</span>DEPLOY · configure</h1>
   <span class="sub">SecRouter Suite — site configuration</span>
   <button class="btn ghost theme-toggle" type="button" title="Toggle light / dark"
-          onclick="toggleTheme()">DARK</button>
+          onclick="toggleTheme()">◐</button>
 </header>
 <main>
 {banner}
