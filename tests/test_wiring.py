@@ -496,6 +496,146 @@ def test_secllm_env_text_carries_fixed_fields_and_token():
     assert "SECLLM_ADMIN_TOKEN=test-token-123" in text
 
 
+# ── secllm_env_text: SECLLM_CATALOG (the operator-maintained catalog's installed path) ──
+def test_secllm_env_text_catalog_absent_leaves_line_commented():
+    text = wiring.secllm_env_text(admin_token="tok")
+    assert "\nSECLLM_CATALOG=" not in text
+    assert "# SECLLM_CATALOG=" in text
+
+
+def test_secllm_env_text_catalog_sets_the_line():
+    text = wiring.secllm_env_text(admin_token="tok", catalog="/etc/secsuite/secllm-catalog.json")
+    assert "SECLLM_CATALOG=/etc/secsuite/secllm-catalog.json" in text
+
+
+# ── stage_secllm_catalog / write_addressing(secllm_catalog=...): provisioning the operator's
+#    catalog file onto every inference resource (the copy half of the "Gemma drift" feature) ────
+def _write_catalog(tmp_path, name: str, ids: list[str]) -> Path:
+    p = tmp_path / name
+    p.write_text(json.dumps({"models": [{"id": i, "hf_model": f"org/{i}"} for i in ids]}))
+    return p
+
+
+def test_stage_secllm_catalog_copies_file_content(tmp_path):
+    src = _write_catalog(tmp_path, "models.json", ["gpt-oss-20b"])
+    out = tmp_path / "out"
+    dest = wiring.stage_secllm_catalog("models.json", out, root=tmp_path)
+    assert dest == out / "secllm-catalog.json"
+    assert json.loads(dest.read_text()) == json.loads(src.read_text())
+
+
+def test_write_addressing_stages_catalog_when_secllm_placed(tmp_path):
+    _write_catalog(tmp_path, "models.json", ["gpt-oss-20b"])
+    topo = _topo(tmp_path)  # GPU_SPLIT: secllm placed on 'gpu'
+    out = tmp_path / "out"
+    written = wiring.write_addressing(
+        topo, out, "gpu", secllm_catalog="models.json", root=tmp_path,
+    )
+    assert written["secllm_catalog"] == out / "secllm-catalog.json"
+    assert (out / "secllm-catalog.json").exists()
+
+
+def test_write_addressing_no_catalog_staged_without_secllm_catalog_arg(tmp_path):
+    topo = _topo(tmp_path)
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "gpu")
+    assert "secllm_catalog" not in written
+    assert not (out / "secllm-catalog.json").exists()
+
+
+def test_write_addressing_no_catalog_staged_on_resource_without_secllm(tmp_path):
+    # 'core' (GPU_SPLIT) hosts identity/gateway/collab — no secllm here — so even with a catalog
+    # configured, nothing is staged for THIS resource's addressing dir.
+    _write_catalog(tmp_path, "models.json", ["gpt-oss-20b"])
+    topo = _topo(tmp_path)
+    out = tmp_path / "out"
+    written = wiring.write_addressing(topo, out, "core", secllm_catalog="models.json", root=tmp_path)
+    assert "secllm_catalog" not in written
+
+
+# ── secllm_catalog_ids: thin re-export of site.read_secllm_catalog_ids ──────────────────
+def test_secllm_catalog_ids_reads_ids(tmp_path):
+    _write_catalog(tmp_path, "models.json", ["gpt-oss-20b", "Llama-3.2-3B-Instruct"])
+    assert wiring.secllm_catalog_ids("models.json", tmp_path) == [
+        "gpt-oss-20b", "Llama-3.2-3B-Instruct",
+    ]
+
+
+# ── secllm_catalog_drift_warnings: the "Gemma drift" cross-component check ──────────────
+def test_drift_warnings_quiet_when_nothing_to_check(tmp_path, monkeypatch):
+    # Neither SecRouter's tier binding nor autostart_models is in play — nothing this check
+    # applies to on this run, catalog or not. secrouter/secllm are both REQUIRED components (can
+    # never be dropped via `without`), so an empty pool is simulated directly rather than via a
+    # topology that could never actually load this way.
+    topo = _topo(tmp_path)
+    monkeypatch.setattr(wiring, "secllm_endpoints", lambda *a, **k: [])
+    assert wiring.secllm_catalog_drift_warnings(topo, catalog="", autostart_models=None) == []
+
+
+def test_drift_warnings_skip_note_when_no_catalog_but_tier_binding_in_play(tmp_path):
+    # GPU_SPLIT: secrouter (gateway) + a non-empty secllm pool (inference on 'gpu') → SecRouter's
+    # turnkey tier binding IS in play here, but no [secllm].catalog is known.
+    topo = _topo(tmp_path)
+    warnings = wiring.secllm_catalog_drift_warnings(topo, catalog="")
+    assert len(warnings) == 1
+    assert "skipped" in warnings[0]
+    assert "[secllm].catalog" in warnings[0]
+
+
+def test_drift_warnings_quiet_on_clean_match(tmp_path):
+    _write_catalog(tmp_path, "models.json", list(wiring.SECROUTER_DEFAULT_TIER_MODELS.values()))
+    topo = _topo(tmp_path)
+    assert wiring.secllm_catalog_drift_warnings(
+        topo, catalog="models.json", root=tmp_path,
+    ) == []
+
+
+def test_drift_warnings_warns_on_missing_tier_model(tmp_path):
+    # Catalog is missing the MEDIUM tier's default id (gemma-4-26B-A4B-it) — the actual
+    # "Gemma drift" incident this whole feature is named for.
+    ids = [m for tier, m in wiring.SECROUTER_DEFAULT_TIER_MODELS.items() if tier != "medium"]
+    _write_catalog(tmp_path, "models.json", ids)
+    topo = _topo(tmp_path)
+    warnings = wiring.secllm_catalog_drift_warnings(topo, catalog="models.json", root=tmp_path)
+    assert len(warnings) == 1
+    assert "medium=gemma-4-26B-A4B-it" in warnings[0]
+    assert "models.json" in warnings[0]
+    assert "SECROUTER_SECLLM_MODELS" in warnings[0]
+
+
+def test_drift_warnings_warns_on_missing_autostart_id(tmp_path):
+    _write_catalog(tmp_path, "models.json", list(wiring.SECROUTER_DEFAULT_TIER_MODELS.values()))
+    topo = _topo(tmp_path)
+    warnings = wiring.secllm_catalog_drift_warnings(
+        topo, catalog="models.json", autostart_models=["not-in-catalog"], root=tmp_path,
+    )
+    assert len(warnings) == 1
+    assert "not-in-catalog" in warnings[0]
+    assert "autostart_models" in warnings[0]
+
+
+def test_drift_warnings_autostart_check_applies_even_without_secrouter(tmp_path, monkeypatch):
+    # No tier binding in play (empty pool — see the "quiet" test above for why this is
+    # simulated rather than built via `without`), but a still-declared autostart_models id
+    # missing from the catalog must still warn — the two checks are independent.
+    _write_catalog(tmp_path, "models.json", ["gpt-oss-20b"])
+    topo = _topo(tmp_path)
+    monkeypatch.setattr(wiring, "secllm_endpoints", lambda *a, **k: [])
+    warnings = wiring.secllm_catalog_drift_warnings(
+        topo, catalog="models.json", autostart_models=["not-in-catalog"], root=tmp_path,
+    )
+    assert len(warnings) == 1
+    assert "not-in-catalog" in warnings[0]
+
+
+def test_drift_warnings_skips_politely_on_unreadable_catalog(tmp_path):
+    topo = _topo(tmp_path)
+    warnings = wiring.secllm_catalog_drift_warnings(topo, catalog="nope.json", root=tmp_path)
+    assert len(warnings) == 1
+    assert "skipped" in warnings[0]
+    assert "does not exist" in warnings[0]
+
+
 # ── host_port: the checkEgress-matching form (host:port, not the full URL) ──────────────
 def test_host_port_keeps_port():
     assert wiring.host_port("https://secllm.sec.internal:11400/v1") == "secllm.sec.internal:11400"

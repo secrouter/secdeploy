@@ -234,6 +234,43 @@ documented fragment — `secrouter-audit.json`, alongside the addressing artifac
 "merge into security.audit" — for you to fold into SecRouter's config by hand, same treatment as
 its OIDC fragment.
 
+## Optional: a custom SecLLM model catalog — `[secllm]`
+
+A top-level `[secllm]` table points at an operator-maintained `models.json` — a copy of SecLLM's
+own catalog schema (`secllm/models.example.json`) that **replaces** SecLLM's built-in model
+catalog on every inference resource. Suite-wide like `[audit]`, not per-resource: every SecLLM
+instance/replica in the deployment serves the SAME catalog.
+
+```toml
+[secllm]
+catalog = "models.json"   # relative to the secdeploy root, or an absolute path
+```
+
+Absent (the default) means no override at all — every SecLLM instance keeps serving its built-in
+catalog, unchanged. When set, `deploy` validates the file **fail-loud at config load** (it must
+exist, parse as JSON, and carry a `models` list of unique, non-empty ids — every other field on
+an entry, e.g. SecLLM's own `hf_model`/`vram_fraction`/an in-progress `revision` key, is left for
+SecLLM's own catalog schema to validate, not this check), then copies it to every inference
+resource/replica at deploy time and points `SECLLM_CATALOG` at the installed copy.
+
+**Why this exists — the "Gemma drift" incident.** SecRouter's turnkey SecLLM routing
+(`SECROUTER_SECLLM_ENDPOINTS`) binds each classification tier to a *fixed* default real model id
+(e.g. its MEDIUM tier defaults to `gemma-4-26B-A4B-it`) — a binding SecRouter makes on its own,
+with no visibility into what SecLLM is actually serving. Swap in a custom catalog that renames or
+drops one of those ids — without also rebinding that tier via SecRouter's own
+`SECROUTER_SECLLM_MODELS` — and SecRouter keeps routing to a model nothing actually serves: every
+request to that tier fails, discovered only once a user hits it. Once `[secllm].catalog` is set,
+`deploy` (and `secdeploy verify`) cross-checks every model id SecRouter will actually route to —
+its default tier bindings, plus any `autostart_models` id — against the catalog's own ids, and
+prints a loud **warning** naming exactly which id(s) are missing and the fix (add the id to the
+catalog, or rebind the tier with `SECROUTER_SECLLM_MODELS`). This is a warning, not a hard error —
+you may be running a hand-managed catalog the check can't fully reason about — and it quietly
+skips with a one-line note when no `[secllm].catalog` is configured at all (nothing known to
+check against).
+
+The deploy audit (see [compliance.md](compliance.md)) records the catalog's path and its model id
+**list only** — ids are already non-secret, and nothing else about an entry is recorded.
+
 ## Precedence and back-compat
 
 `secdeploy verify` / `plan` / `deploy` / `bundle` all resolve the active site config the same

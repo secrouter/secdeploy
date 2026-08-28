@@ -42,6 +42,10 @@ carry no `prevHash`/`hash` and don't match the timestamped chain-entry filename 
 `verify` simply never sees them — the chain starts fresh at `GENESIS` the first time a real
 deploy runs under this feature, rather than erroring on history it has no way to validate.
 
+When `secsite.toml`'s `[secllm].catalog` is set, the record's `addressing.secllm_catalog` field
+rides along in the same audited artifact — the catalog's path and its model id **list only**
+(already non-secret; see [secsite.md](secsite.md)'s `[secllm]` table).
+
 ## `secdeploy evidence`
 
 ```

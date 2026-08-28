@@ -640,3 +640,101 @@ def test_audit_round_trips_through_to_toml(tmp_path):
 
 def test_bare_config_emits_no_audit_section(tmp_path):
     assert "[audit]" not in _site(tmp_path, BARE).to_toml()
+
+
+# ── [secllm] — optional operator-maintained model catalog override (models.json). Mirrors the
+#    [audit] coverage above: defaults, parse, fail-loud file validation, round-trip, bare-config
+#    cleanliness. See docs/secsite.md ("Gemma drift" motivation). ───────────────────────────────
+def _write_catalog(tmp_path, name: str, ids: list[str]) -> Path:
+    import json as _json
+
+    p = tmp_path / name
+    p.write_text(_json.dumps({"models": [{"id": i, "hf_model": f"org/{i}"} for i in ids]}))
+    return p
+
+
+def test_secllm_defaults_off_when_absent(tmp_path):
+    site = _site(tmp_path, BARE)
+    assert site.secllm.catalog == ""
+
+
+def test_secllm_catalog_parses_relative_path(tmp_path):
+    _write_catalog(tmp_path, "models.json", ["Llama-3.2-3B-Instruct", "gpt-oss-20b"])
+    site = _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+    assert site.secllm.catalog == "models.json"
+
+
+def test_secllm_catalog_parses_absolute_path(tmp_path):
+    catalog = _write_catalog(tmp_path, "models.json", ["Llama-3.2-3B-Instruct"])
+    site = _site(tmp_path, BARE + f'\n[secllm]\ncatalog = "{catalog}"\n')
+    assert site.secllm.catalog == str(catalog)
+
+
+def test_secllm_catalog_leniently_accepts_unknown_entry_fields(tmp_path):
+    # An entry carrying fields this validation doesn't know about (e.g. secllm's own in-progress
+    # `revision` key) must not be rejected — only `id` is validated here; everything else is
+    # secllm's own catalog.py's schema to own.
+    import json as _json
+
+    p = tmp_path / "models.json"
+    p.write_text(_json.dumps({"models": [
+        {"id": "gpt-oss-20b", "hf_model": "openai/gpt-oss-20b", "revision": "abc123", "future_field": 1},
+    ]}))
+    site = _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+    assert site.secllm.catalog == "models.json"
+
+
+def test_secllm_catalog_missing_file_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secllm\]\.catalog:.*does not exist"):
+        _site(tmp_path, BARE + '\n[secllm]\ncatalog = "nope.json"\n')
+
+
+def test_secllm_catalog_bad_json_rejected(tmp_path):
+    (tmp_path / "models.json").write_text("{not json")
+    with pytest.raises(ValueError, match=r"\[secllm\]\.catalog:.*not valid JSON"):
+        _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+
+
+def test_secllm_catalog_missing_models_list_rejected(tmp_path):
+    (tmp_path / "models.json").write_text('{"_note": "oops"}')
+    with pytest.raises(ValueError, match=r"\[secllm\]\.catalog:.*\"models\" list"):
+        _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+
+
+def test_secllm_catalog_empty_id_rejected(tmp_path):
+    import json as _json
+
+    (tmp_path / "models.json").write_text(_json.dumps({"models": [{"hf_model": "org/x"}]}))
+    with pytest.raises(ValueError, match=r"\[secllm\]\.catalog:.*id is required"):
+        _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+
+
+def test_secllm_catalog_duplicate_id_rejected(tmp_path):
+    _write_catalog(tmp_path, "models.json", ["gpt-oss-20b", "gpt-oss-20b"])
+    with pytest.raises(ValueError, match=r"\[secllm\]\.catalog:.*duplicate model id"):
+        _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+
+
+def test_secllm_unknown_key_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match=r"\[secllm\]: unknown key"):
+        _site(tmp_path, BARE + '\n[secllm]\nbogus = 1\n')
+
+
+def test_secllm_round_trips_through_to_toml(tmp_path):
+    _write_catalog(tmp_path, "models.json", ["Llama-3.2-3B-Instruct"])
+    site = _site(tmp_path, BARE + '\n[secllm]\ncatalog = "models.json"\n')
+    reloaded = _site(tmp_path, site.to_toml())
+    assert reloaded.secllm == site.secllm
+
+
+def test_bare_config_emits_no_secllm_section(tmp_path):
+    assert "[secllm]" not in _site(tmp_path, BARE).to_toml()
+
+
+def test_read_secllm_catalog_ids_returns_ids_in_file_order(tmp_path):
+    from secdeploy.site import read_secllm_catalog_ids
+
+    _write_catalog(tmp_path, "models.json", ["gpt-oss-20b", "Llama-3.2-3B-Instruct"])
+    assert read_secllm_catalog_ids("models.json", root=tmp_path) == [
+        "gpt-oss-20b", "Llama-3.2-3B-Instruct",
+    ]

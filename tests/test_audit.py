@@ -164,6 +164,39 @@ def test_write_deploy_audit_multi_instance_pool_captured(tmp_path):
     assert record["flags"]["configure_resolver"] is True
 
 
+def test_write_deploy_audit_carries_secllm_catalog_path_and_ids(tmp_path):
+    m = _manifest()
+    topo = _topo(tmp_path, GPU_SPLIT)
+    out = tmp_path / "out"
+
+    json_path = audit.write_deploy_audit(
+        m, topo, "gpu", out,
+        target="macos", services=["secllm"], shas={},
+        secllm_catalog_path="/etc/secsuite/secllm-catalog.json",
+        secllm_catalog_ids=["Llama-3.2-3B-Instruct", "gpt-oss-20b"],
+        now=FIXED_NOW,
+    )
+    record = json.loads(json_path.read_text())
+    assert record["addressing"]["secllm_catalog"] == {
+        "path": "/etc/secsuite/secllm-catalog.json",
+        "model_ids": ["Llama-3.2-3B-Instruct", "gpt-oss-20b"],
+    }
+    assert "Llama-3.2-3B-Instruct" in json_path.with_suffix(".txt").read_text()
+
+
+def test_write_deploy_audit_secllm_catalog_absent_by_default(tmp_path):
+    m = _manifest()
+    topo = _topo(tmp_path, GPU_SPLIT)
+    out = tmp_path / "out"
+
+    json_path = audit.write_deploy_audit(
+        m, topo, "core", out, target="fedora-fips", services=[], shas={}, now=FIXED_NOW,
+    )
+    record = json.loads(json_path.read_text())
+    assert record["addressing"]["secllm_catalog"] is None
+    assert "none provisioned" in json_path.with_suffix(".txt").read_text()
+
+
 def test_write_deploy_audit_pool_omitted_when_secrouter_not_here(tmp_path):
     # gpu1 hosts only secllm — no secrouter here, so no pool/egress is recorded, even though
     # the pool exists elsewhere in the topology.
@@ -648,6 +681,153 @@ def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, m
     assert auth["secagent_enabled"] is True
     assert auth["secagent_llm_at_secrouter"] is True
     assert auth["oidc_service_subject"] == "svc-secagent"
+
+
+# ── [secllm].catalog provisioning: both targets copy the file + set SECLLM_CATALOG, and the
+#    deploy audit carries the catalog path + model id LIST ONLY (already non-secret) ───────────
+def _write_catalog(tmp_path, ids: list[str]) -> Path:
+    p = tmp_path / "models.json"
+    p.write_text(json.dumps({"models": [{"id": i, "hf_model": f"org/{i}"} for i in ids]}))
+    return p
+
+
+def test_macos_deploy_real_run_provisions_secllm_catalog(tmp_path, monkeypatch):
+    from secdeploy import process as P
+    from secdeploy.targets import macos
+
+    monkeypatch.setattr(P, "run", lambda *a, **k: None)
+    monkeypatch.setattr(macos, "_compose_cmd", lambda: ["docker", "compose"])
+
+    m = _manifest()
+    topo = _topo(tmp_path, GPU_SPLIT)  # secllm placed on 'gpu'
+    work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
+    work.mkdir()
+    root.mkdir()
+    # a usable secllm venv, so _ensure_native_venv lets the launchd plist actually get staged
+    (root / "work" / "secllm" / ".venv" / "bin").mkdir(parents=True)
+    catalog = _write_catalog(tmp_path, ["gpt-oss-20b"])
+
+    macos.deploy(
+        m, work, root, dry_run=False, out=out, topology=topo, resource="gpu",
+        with_inference=True, secllm_catalog=str(catalog),
+    )
+
+    # staged alongside the rest of this resource's addressing artifacts
+    staged = out / "addressing" / "secllm-catalog.json"
+    assert staged.exists()
+    assert json.loads(staged.read_text()) == json.loads(catalog.read_text())
+
+    # the launchd plist actually carries SECLLM_CATALOG pointing at the staged copy — not the
+    # secsite.toml-relative path the operator wrote
+    plist = (out / "launchd" / "internal.secsuite.secllm.plist").read_text()
+    assert "<key>SECLLM_CATALOG</key>" in plist
+    assert f"<string>{staged}</string>" in plist
+
+    # the deploy audit records the catalog path + model id LIST ONLY (never the file's other
+    # fields) — see audit._addressing_record.
+    record = json.loads((out / "audit" / "deploy-macos-gpu.json").read_text())
+    catalog_record = record["addressing"]["secllm_catalog"]
+    assert catalog_record["path"] == str(staged)
+    assert catalog_record["model_ids"] == ["gpt-oss-20b"]
+
+
+def test_macos_deploy_no_catalog_provisioned_without_secllm_catalog_set(tmp_path, monkeypatch):
+    from secdeploy import process as P
+    from secdeploy.targets import macos
+
+    monkeypatch.setattr(P, "run", lambda *a, **k: None)
+    monkeypatch.setattr(macos, "_compose_cmd", lambda: ["docker", "compose"])
+
+    m = _manifest()
+    topo = _topo(tmp_path, GPU_SPLIT)
+    work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
+    work.mkdir()
+    root.mkdir()
+    (root / "work" / "secllm" / ".venv" / "bin").mkdir(parents=True)
+
+    macos.deploy(
+        m, work, root, dry_run=False, out=out, topology=topo, resource="gpu",
+        with_inference=True,
+    )
+
+    assert not (out / "addressing" / "secllm-catalog.json").exists()
+    plist = (out / "launchd" / "internal.secsuite.secllm.plist").read_text()
+    assert "SECLLM_CATALOG" not in plist
+    record = json.loads((out / "audit" / "deploy-macos-gpu.json").read_text())
+    assert record["addressing"]["secllm_catalog"] is None
+
+
+def test_fedora_deploy_real_run_provisions_secllm_catalog(tmp_path, monkeypatch):
+    from secdeploy import process as P
+    from secdeploy.targets import fedora_fips
+
+    run_calls: list[list[str]] = []
+    monkeypatch.setattr(P, "run", lambda cmd, *a, **k: run_calls.append(cmd))
+    monkeypatch.setattr(fedora_fips.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(os_module, "geteuid", lambda: 0)
+
+    m = _manifest()
+    topo = _topo(tmp_path, MULTI_INFERENCE)  # secllm placed on gpu1/gpu2 (fedora-fips)
+    work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
+    (work / "secllm").mkdir(parents=True)
+    root.mkdir()
+    catalog = _write_catalog(tmp_path, ["Llama-3.2-3B-Instruct"])
+
+    fedora_fips.deploy(
+        m, work, root, dry_run=False, out=out, topology=topo, resource="gpu1",
+        with_inference=True, secllm_catalog=str(catalog),
+    )
+
+    addr_dir = out / "addressing"
+    staged = addr_dir / "secllm-catalog.json"
+    assert staged.exists()
+    assert json.loads(staged.read_text()) == json.loads(catalog.read_text())
+
+    # SECLLM_CATALOG in the generated secllm.env points at the FINAL installed path, not the
+    # local staging one.
+    secllm_env = (addr_dir / "secllm.env").read_text()
+    assert "SECLLM_CATALOG=/etc/secsuite/secllm-catalog.json" in secllm_env
+
+    # the install step that copies the staged file to its installed path actually ran.
+    catalog_install = [
+        c for c in run_calls if c[:1] == ["bash"] and "secllm-catalog.json" in " ".join(c)
+    ]
+    assert any(
+        str(staged) in " ".join(c) and "/etc/secsuite/secllm-catalog.json" in " ".join(c)
+        for c in catalog_install
+    )
+
+    record = json.loads((out / "audit" / "deploy-fedora-fips-gpu1.json").read_text())
+    catalog_record = record["addressing"]["secllm_catalog"]
+    assert catalog_record["path"] == "/etc/secsuite/secllm-catalog.json"
+    assert catalog_record["model_ids"] == ["Llama-3.2-3B-Instruct"]
+
+
+def test_fedora_deploy_no_catalog_provisioned_without_secllm_catalog_set(tmp_path, monkeypatch):
+    from secdeploy import process as P
+    from secdeploy.targets import fedora_fips
+
+    run_calls: list[list[str]] = []
+    monkeypatch.setattr(P, "run", lambda cmd, *a, **k: run_calls.append(cmd))
+    monkeypatch.setattr(fedora_fips.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(os_module, "geteuid", lambda: 0)
+
+    m = _manifest()
+    topo = _topo(tmp_path, MULTI_INFERENCE)
+    work, root, out = tmp_path / "work", tmp_path / "root", tmp_path / "out"
+    (work / "secllm").mkdir(parents=True)
+    root.mkdir()
+
+    fedora_fips.deploy(
+        m, work, root, dry_run=False, out=out, topology=topo, resource="gpu1",
+        with_inference=True,
+    )
+
+    assert not (out / "addressing" / "secllm-catalog.json").exists()
+    secllm_env = (out / "addressing" / "secllm.env").read_text()
+    assert "\nSECLLM_CATALOG=" not in secllm_env  # only the commented doc line is present
+    record = json.loads((out / "audit" / "deploy-fedora-fips-gpu1.json").read_text())
+    assert record["addressing"]["secllm_catalog"] is None
 
 
 # ── deploy-audit hash chain (AU-3.3.8) — chaining, verify, tamper, grandfathering ───────────

@@ -852,6 +852,7 @@ def deploy(
     secchat_voice=None,
     site_builds=None,
     audit_opts=None,
+    secllm_catalog: str = "",
 ) -> None:
     without = without or []
     users = users or []
@@ -883,6 +884,16 @@ def deploy(
         and _here(n)
     ]
 
+    # Gemma-drift cross-component check (see wiring.secllm_catalog_drift_warnings): every model
+    # id SecRouter's SecLLM turnkey routing/autostart_models will actually need, checked against
+    # a KNOWN [secllm].catalog — before a live routing 502 / a stuck autostart finds it instead.
+    # Cheap (a JSON read + set comparison), so it runs on --dry-run too, not just a real deploy.
+    if topology is not None:
+        for w in wiring.secllm_catalog_drift_warnings(
+            topology, without, catalog=secllm_catalog, autostart_models=autostart_models, root=root,
+        ):
+            P.warn(w)
+
     if topology is not None and not dry_run:
         # So certbot's HTTP-01 challenges for secproxy's SAN cert can actually reach this host
         # from inside the seccert container — see _write_seccert_extra_hosts. Written before any
@@ -908,7 +919,8 @@ def deploy(
     written: dict[str, object] | None = None
     if topology is not None and not dry_run and out is not None:
         written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without,
-                                          audit_opts=audit_opts)
+                                          audit_opts=audit_opts,
+                                          secllm_catalog=secllm_catalog or None, root=root)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
         # The compose SecRouter reads env/secrouter.env (env_file in deploy/macos/compose.yaml),
         # but the generated SECROUTER_SECLLM_ENDPOINTS is FQDN-form — resolvable only via the
@@ -1027,6 +1039,14 @@ def deploy(
             # useless the moment it restarts. Not generated/written on --dry-run. ONE token shared
             # by every replica — same operator, same console credential.
             admin_token = wiring.secllm_admin_token(root / "out") if not dry_run else "***"
+            # The operator's [secllm].catalog, already staged by write_addressing (above) to
+            # out/addressing/secllm-catalog.json — macOS runs its native services straight out of
+            # this checkout (no separate /etc install step, unlike fedora-fips), so every replica
+            # just points at that staged copy directly, same as SECDNS_ZONE does for secdns.
+            catalog_env = (
+                {"SECLLM_CATALOG": str(written["secllm_catalog"])}
+                if written and written.get("secllm_catalog") else {}
+            )
             for iname, iport in local_secllm:
                 secllm = launchd.LaunchdService(
                     name=iname,
@@ -1039,7 +1059,8 @@ def deploy(
                     # ceiling / switch semantics, e.g. 1 = loading a new model evicts the oldest.)
                     env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(iport),
                          "SECLLM_BACKEND": backend, "SECLLM_ADMIN_TOKEN": admin_token,
-                         "SECLLM_AUTOSTART": ",".join(autostart_models or []), **metal_env},
+                         "SECLLM_AUTOSTART": ",".join(autostart_models or []), **metal_env,
+                         **catalog_env},
                     working_dir=str(root), user=user,
                 )
                 _install_or_note(secllm, staging_dir, native_services=native_services,
@@ -1425,6 +1446,16 @@ def deploy(
         return
     if out is not None:
         shas = common.resolved_shas(manifest, work)
+        # The provisioned catalog's path + model id LIST ONLY (non-secret — see
+        # audit._addressing_record) — best-effort re-read: SiteConfig.load already validated
+        # this fail-loud, so a failure here is only a stale/mid-edit file since that check ran;
+        # never worth failing an otherwise-successful deploy over an audit-record nicety.
+        catalog_ids: list[str] = []
+        if written and written.get("secllm_catalog"):
+            try:
+                catalog_ids = wiring.secllm_catalog_ids(secllm_catalog, root)
+            except ValueError as exc:
+                P.warn(f"secllm catalog: could not re-read model ids for the audit record: {exc}")
         audit_path = audit.write_deploy_audit(
             manifest, topology, resource, out,
             target=NAME, services=services, shas=shas, stacks=stacks,
@@ -1438,6 +1469,8 @@ def deploy(
             resolver_configured=resolver_configured,
             secllm_auth_enabled=(written is not None),
             secagent_enabled=("secagent" in services),
+            secllm_catalog_path=(str(written["secllm_catalog"]) if written and written.get("secllm_catalog") else None),
+            secllm_catalog_ids=catalog_ids,
         )
         P.log(f"deploy audit artifact written → {audit_path}")
     if topology is not None and _here("secproxy") and wiring.fronted_instances(topology, without):

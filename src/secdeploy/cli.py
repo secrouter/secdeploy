@@ -180,6 +180,18 @@ def _verify_topology(args, m: Manifest) -> None:
         print(f"    dropped ([deploy].without): {', '.join(site.without)}")
     for w in topo.warnings:
         P.warn(w)
+    # Gemma-drift cross-component check (see wiring.secllm_catalog_drift_warnings) — a natural
+    # hook here since verify already has the whole topology + every resource's autostart_models
+    # in hand (unlike a single-resource deploy, which only sees its own). Aggregated across every
+    # declared resource, not just one, since verify inspects the whole site, not one target.
+    all_autostart = sorted({
+        m for opts in site.deploy_options.values() for m in opts.autostart_models
+    })
+    for w in wiring.secllm_catalog_drift_warnings(
+        topo, site.without, catalog=site.secllm.catalog, autostart_models=all_autostart,
+        root=(site.path.parent if site.path else None),
+    ):
+        P.warn(w)
 
 
 def cmd_configure(args) -> int:
@@ -334,6 +346,11 @@ def cmd_deploy(args) -> int:
         # from_topology), so this is a no-op (no syslog fragment generated) exactly when there's
         # no secsite.toml to have set it in the first place.
         audit_opts=site.audit,
+        # [secllm] is suite-wide too (like [audit] above) — always passed; `site` defaults to an
+        # empty SecllmOptions() (catalog="") in single-host/topology-only mode, so this is a
+        # no-op (secllm's built-in catalog, unchanged) exactly when there's no secsite.toml to
+        # have set it in the first place.
+        secllm_catalog=site.secllm.catalog,
     )
     return 0
 

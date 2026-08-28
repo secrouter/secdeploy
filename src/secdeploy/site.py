@@ -35,6 +35,7 @@ template (:meth:`SiteConfig.to_toml`), ready for Wave 2's ``configure`` wizard t
 
 from __future__ import annotations
 
+import json
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,6 +124,67 @@ SECCHAT_VOICE_KEYS = {
 AUDIT_TABLE_KEYS = {"syslog_host", "syslog_port", "syslog_proto", "syslog_format"}
 AUDIT_VALID_PROTOS = {"udp", "tcp"}
 AUDIT_VALID_FORMATS = {"json", "cef"}
+
+# The top-level [secllm] table — an optional operator-maintained model catalog override
+# (secsite.toml's ``catalog`` key points at a ``models.json``; see ``SecllmOptions``). Suite-wide
+# (not per-resource) like [audit]/[deploy] — there is one catalog for the deployment, and every
+# inference resource/replica serves the SAME one (see wiring.stage_secllm_catalog).
+SECLLM_TABLE_KEYS = {"catalog"}
+
+
+def resolve_secllm_catalog_path(catalog: str, root: Path | None = None) -> Path:
+    """Resolve a ``[secllm].catalog`` value to an absolute path.
+
+    An absolute value passes through unchanged; a relative one resolves against ``root`` (the
+    secdeploy root — the directory containing ``suite.toml``/``secsite.toml``; defaults to the
+    current working directory, which is what a normal ``secdeploy`` invocation's cwd already is
+    — the same "relative to where you ran secdeploy" convention every other bare path in
+    secsite.toml, e.g. ``model_dir``, already follows).
+    """
+    p = Path(catalog)
+    return p if p.is_absolute() else (root or Path.cwd()) / p
+
+
+def read_secllm_catalog_ids(catalog: str, root: Path | None = None) -> list[str]:
+    """Read + validate an operator-maintained SecLLM model catalog (``models.json``), returning
+    its model ids in file order.
+
+    This is the fail-loud check :meth:`SiteConfig.load` runs at config-load time for
+    ``[secllm].catalog`` (a bad/missing file is caught immediately, not at deploy — or worse,
+    only surfacing later as a SecRouter routing 502 — see ``wiring.secllm_catalog_drift_warnings``,
+    the "Gemma drift" cross-component check this table exists to enable), and is reused verbatim
+    at deploy time for provisioning (copying the file to each inference resource) and that same
+    drift check.
+
+    Raises :class:`ValueError` (fail-loud) when: the file doesn't exist; it isn't valid JSON; it
+    isn't a JSON object with a ``models`` list; any entry in that list isn't a table, or has an
+    empty/missing ``id``; or two entries share an ``id``. Every OTHER field on a model entry is
+    ignored here — this only ever extracts ids, so an unrecognized key (e.g. secllm's own
+    in-progress ``revision`` field) never trips this validation; secllm's own
+    ``secllm/catalog.py`` is the schema authority for everything else about an entry.
+    """
+    path = resolve_secllm_catalog_path(catalog, root)
+    if not path.is_file():
+        raise ValueError(f"[secllm].catalog: {path} does not exist")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"[secllm].catalog: {path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise ValueError(f"[secllm].catalog: {path} must be a JSON object with a \"models\" list")
+    ids: list[str] = []
+    seen: set[str] = set()
+    for i, m in enumerate(data["models"]):
+        if not isinstance(m, dict):
+            raise ValueError(f"[secllm].catalog: {path} models[{i}] must be a table")
+        mid = str(m.get("id", "")).strip()
+        if not mid:
+            raise ValueError(f"[secllm].catalog: {path} models[{i}]: id is required and non-empty")
+        if mid in seen:
+            raise ValueError(f"[secllm].catalog: {path} has a duplicate model id {mid!r}")
+        seen.add(mid)
+        ids.append(mid)
+    return ids
 
 
 @dataclass
@@ -336,6 +398,31 @@ class AuditOptions:
 
 
 @dataclass
+class SecllmOptions:
+    """Optional operator-maintained SecLLM model catalog override (secsite.toml's top-level
+    ``[secllm]`` table — see docs/secsite.md and the "Gemma drift" motivation there).
+
+    ``catalog`` is a path (relative to the secdeploy root, or absolute) to a ``models.json`` in
+    secllm's own catalog schema (``secllm/models.example.json`` / ``secllm/src/secllm/
+    catalog.py``) — copied to every inference resource/replica at deploy time and pointed at via
+    ``SECLLM_CATALOG`` (see ``wiring.stage_secllm_catalog``/``secllm_env_text``), REPLACING
+    secllm's own built-in catalog on those hosts. Empty (the default) means no override at all —
+    every SecLLM instance keeps serving its built-in catalog, byte-for-byte the pre-existing
+    behavior.
+
+    Knowing this catalog is also what turns on the cross-component "Gemma drift" check
+    (:func:`secdeploy.wiring.secllm_catalog_drift_warnings`): SecRouter's turnkey SecLLM routing
+    (``SECROUTER_SECLLM_ENDPOINTS``) binds each classification tier to a FIXED default real model
+    id (mirrored in ``wiring.SECROUTER_DEFAULT_TIER_MODELS``); a custom catalog that renames or
+    drops one of those ids without also rebinding that tier (``SECROUTER_SECLLM_MODELS``) leaves
+    SecRouter routing to a model nothing actually serves — a live incident this table's
+    validation exists to catch before it does, not after a request 502s.
+    """
+
+    catalog: str = ""
+
+
+@dataclass
 class SiteConfig:
     """The whole site: WHERE things run (a :class:`Topology`) + how ``deploy`` should run them.
 
@@ -357,6 +444,7 @@ class SiteConfig:
     secchat_pool: PoolOptions = field(default_factory=PoolOptions)
     secchat_voice: VoiceOptions = field(default_factory=VoiceOptions)
     audit: AuditOptions = field(default_factory=AuditOptions)
+    secllm: SecllmOptions = field(default_factory=SecllmOptions)
     builds: list[BuildSpec] = field(default_factory=list)
     path: Path | None = None
 
@@ -614,6 +702,29 @@ class SiteConfig:
                 f"[audit]: syslog_port {audit_opts.syslog_port} must be between 1 and 65535"
             )
 
+        # Optional top-level [secllm] — an operator-maintained model catalog override
+        # (models.json). Additive (silently ignored before this parser existed), same fail-loud
+        # unknown-key discipline as every other optional table above — PLUS a filesystem-level
+        # fail-loud check (read_secllm_catalog_ids: exists/valid JSON/unique non-empty ids) when
+        # catalog is actually set, so a bad path is caught here rather than at deploy time (see
+        # SecllmOptions' docstring for the "Gemma drift" cross-component check this enables).
+        secllm_table = data.get("secllm") or {}
+        if not isinstance(secllm_table, dict):
+            errors.append("[secllm] must be a table")
+            secllm_table = {}
+        unknown_secllm = sorted(k for k in secllm_table if k not in SECLLM_TABLE_KEYS)
+        if unknown_secllm:
+            errors.append(
+                f"[secllm]: unknown key(s) {', '.join(unknown_secllm)} "
+                f"(expected: {', '.join(sorted(SECLLM_TABLE_KEYS))})"
+            )
+        secllm_opts = SecllmOptions(catalog=str(secllm_table.get("catalog", "")).strip())
+        if secllm_opts.catalog:
+            try:
+                read_secllm_catalog_ids(secllm_opts.catalog, root=path.parent)
+            except ValueError as exc:
+                errors.append(str(exc))
+
         # Placement half — same parser topology.toml has always used; deferred (validate=False)
         # so a placement error and a deploy-key error can each raise their own focused message
         # rather than one tangled into the other (see validate() below).
@@ -621,7 +732,8 @@ class SiteConfig:
         site = SiteConfig(
             topology=topology, without=without, ssh=ssh,
             deploy_options=deploy_options, users=users, secchat_pool=secchat_pool,
-            secchat_voice=secchat_voice, audit=audit_opts, builds=builds, path=path,
+            secchat_voice=secchat_voice, audit=audit_opts, secllm=secllm_opts,
+            builds=builds, path=path,
         )
         site.validate()
         if errors:
@@ -818,5 +930,14 @@ class SiteConfig:
             out.append(f"syslog_port = {aud.syslog_port}")
             out.append(f'syslog_proto = "{aud.syslog_proto}"')
             out.append(f'syslog_format = "{aud.syslog_format}"')
+            out.append("")
+        secllm = self.secllm
+        if secllm.catalog:
+            out.append("# Operator-maintained SecLLM model catalog (models.json), copied to every")
+            out.append("# inference resource and cross-checked against what SecRouter/autostart_models")
+            out.append("# will route to/load (the \"Gemma drift\" guard — see docs/secsite.md). Absent")
+            out.append("# (the default) = secllm's own built-in catalog on every instance.")
+            out.append("[secllm]")
+            out.append(f'catalog = "{secllm.catalog}"')
             out.append("")
         return "\n".join(out).rstrip() + "\n"
