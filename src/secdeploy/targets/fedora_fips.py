@@ -652,6 +652,17 @@ def deploy(
             (addr_dir / "secllm.env").write_text(
                 wiring.secllm_env_text(api_token=api_token, autostart=autostart_models)
             )
+            # Per-resource SecLLM replicas ([groups.inference] instances = N) are automated on
+            # macOS only so far — fedora-fips runs the one static secllm.service unit. Warn
+            # rather than silently under-deploying the declared pool (the generated
+            # SECROUTER_SECLLM_ENDPOINTS above still lists every declared replica, so a pool
+            # entry would 502 until brought up by hand or the count is dropped to 1).
+            local_replicas = [i for i in topology.instances("secllm") if i[1] == resource]
+            if len(local_replicas) > 1:
+                P.warn(f"secllm: {len(local_replicas)} instances declared on resource "
+                       f"{resource!r}, but fedora-fips automates only the first "
+                       "(secllm.service) — bring the extra replicas up by hand (distinct "
+                       "SECLLM_PORT per instance) or set [groups.inference] instances = 1")
         if secagent_enabled and written.get("oidc"):
             P.log(f"SecRouter OIDC config fragment written → {written['oidc']} "
                   "(merge into security.oidc — see docs/fedora-fips.md)")

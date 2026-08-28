@@ -87,23 +87,16 @@ services:
       # SECROUTER_SECLLM_ENDPOINTS is also set, since turnkey-routing to SecLLM requires this
       # file to actually authorize the egress.
       SECROUTER_EGRESS_FILE: /addressing/secrouter-egress.json
-      # Overrides the env_file's secllm.sec.internal FQDN — that name only resolves on the
-      # HOST (macOS's /etc/resolver/sec.internal, served by SecDNS as a native launchd
-      # service), which a Docker container has no visibility into at all. SecLLM ALSO runs
-      # natively on macOS (never containerized — see targets/macos.py), so it's reachable
-      # from inside this container via Docker's own host.docker.internal, same mechanism
-      # already used for SecCert's HTTP-01 responder above. Confirmed live: without this,
-      # every request 502s "fetch failed" (DNS ENOTFOUND) despite the endpoint URL otherwise
-      # being correct. Port 11400 is SecLLM's fixed manifest port (suite.toml), not derived
-      # per-deploy like the FQDN was — matches this file's own SECROUTER_PORT convention of
-      # hardcoding stable suite ports directly rather than templating them.
-      #
-      # LIMITATION: this assumes a single-host topology (this Mac IS the one SecLLM
-      # instance) — the common macOS eval shape this whole compose file targets. A genuine
-      # multi-instance SecLLM pool spanning OTHER resources needs real per-instance
-      # reachability (some local via host.docker.internal, some remote via DNS/IP), which a
-      # single static override can't express; that scenario needs hand-tuning here.
-      SECROUTER_SECLLM_ENDPOINTS: http://host.docker.internal:11400/v1
+      # NOTE — no SECROUTER_SECLLM_ENDPOINTS override here (there used to be a hardcoded
+      # single http://host.docker.internal:11400/v1): the deploy now rewrites the env_file's
+      # value to the CONTAINER-effective pool before this service starts — one entry per
+      # SecLLM instance ([groups.inference] instances = N), host.docker.internal:<port> for
+      # instances on this host and raw topology addresses for remote ones (see
+      # wiring.secllm_container_endpoints + targets/macos.py). The FQDN form the env would
+      # otherwise carry only resolves via the HOST's resolver (/etc/resolver, served by
+      # SecDNS), invisible to this container — confirmed live, 502 "fetch failed" without the
+      # rewrite. A standalone `docker compose up` (no secdeploy run first) has no endpoints
+      # set and routing falls back to the mounted SECROUTER_CONFIG's own providers.secllm.
     depends_on:
       - seccert
     ports:

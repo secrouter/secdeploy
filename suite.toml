@@ -30,8 +30,10 @@ role = "internal ACME certificate authority (stands up first — issues the suit
 
 [components.secsso]
 repo = "secrouter/secsso"
-# main — carries the secchatng OIDC blueprint + the redirect-env passthrough (promoted from the
-# rearchitecture rebuild branch). Repin to a secsso release tag at the next suite release.
+# main — carries the secchatng OIDC blueprint, the redirect-env passthrough, and the exact-sub
+# service identities (svc-secagent/svc-secchat app-password grants, SECAGENT_SVC_APP_PASSWORD/
+# SECCHAT_SVC_APP_PASSWORD env) this repo's wiring composites depend on. Repin to a secsso
+# release tag at the next suite release.
 ref = "main"
 kind = "stack"
 tier = "identity"

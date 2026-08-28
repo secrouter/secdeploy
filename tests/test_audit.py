@@ -628,12 +628,11 @@ def test_fedora_deploy_real_run_with_agent_installs_secagent_harness(tmp_path, m
     # no daemon-only pi models.json is generated (secagent init writes the harness one live)
     assert not (addr_dir / "secagent-pi-models.json").exists()
 
-    # SecRouter's OIDC config fragment — svc-secagent (SecAgent's non-interactive account) and
-    # svc-secchat (SecChat's shared service identity), unconditionally, regardless of whether
-    # either is actually placed in this topology.
+    # SecRouter's OIDC config fragment — both service accounts (secchat is placed on 'core'
+    # too), with svc-secchat additionally a delegator (it forwards X-Sec-Acting-User).
     oidc = json.loads((addr_dir / "secrouter-oidc.json").read_text())
     assert oidc["serviceSubjects"] == ["svc-secagent", "svc-secchat"]
-    assert "delegatingSubjects" not in oidc
+    assert oidc["delegatingSubjects"] == ["svc-secchat"]
     assert oidc["issuer"] == "http://secsso.sec.internal:9000/"
 
     # The harness install steps actually ran: pi globally + `secagent init`, and NO secagent unit.

@@ -109,6 +109,16 @@ resource = "core"
 #
 #   [groups.inference]
 #   resources = ["gpu", "gpu2"]
+#
+# PER-RESOURCE replicas — several SecLLM instances on ONE host (SecRouter round-robins across
+# the pool, breaker- and health-aware). `instances = N` on the group runs N replicas per
+# resource on consecutive ports (11400, 11401, ...), named secllm, secllm-2, ... Only the
+# stateless inference tier accepts N > 1; automated on macOS (one launchd service per
+# replica), fedora-fips still brings up only the first.
+#
+#   [groups.inference]
+#   resource = "gpu"
+#   instances = 2
 
 # ── Single-host variant ──────────────────────────────────────────────────────────────
 # For one machine, define a single resource and point every tier at it:

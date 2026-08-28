@@ -58,6 +58,11 @@ class Topology:
     manifest: Manifest
     path: Path | None = None
     warnings: list[str] = field(default_factory=list)
+    # tier -> per-resource replica count (``instances = N`` on the group table; default 1).
+    # Only the stateless ``inference`` tier accepts N > 1 — see :meth:`validate`. Each replica
+    # beyond the first gets the NEXT port up from the component's manifest port, so N replicas
+    # on one host claim ports [port, port+N-1] (see :meth:`instances`).
+    group_instances: dict[str, int] = field(default_factory=dict)
 
     # ── construction ───────────────────────────────────────────────────────────────
     @staticmethod
@@ -95,6 +100,11 @@ class Topology:
             tier: list(g["resources"]) if "resources" in g else [g["resource"]]
             for tier, g in (data.get("groups") or {}).items()
         }
+        group_instances = {
+            tier: int(g["instances"])
+            for tier, g in (data.get("groups") or {}).items()
+            if "instances" in g
+        }
         topo = Topology(
             domain=data.get("domain", DEFAULT_DOMAIN),
             upstream_dns=list(data.get("upstream_dns", [])),
@@ -102,6 +112,7 @@ class Topology:
             groups=groups,
             manifest=manifest,
             path=path,
+            group_instances=group_instances,
         )
         if validate:
             topo.validate()
@@ -168,19 +179,35 @@ class Topology:
                             f"inference tier is on resource {res!r} which declares no 'gpu' "
                             f"capability — {c.name} inference will be CPU-bound (slow/unsupported)"
                         )
+        # per-resource replica counts (``instances = N`` on a group table): only the stateless
+        # inference tier may replicate — every other tier's components hold state (DBs, cert
+        # stores, session stores) or own a well-known singleton port contract.
+        for tier, n in self.group_instances.items():
+            if n < 1:
+                errors.append(f"group {tier!r}: instances must be >= 1 (got {n})")
+            elif n > 1 and tier != "inference":
+                errors.append(
+                    f"group {tier!r}: instances = {n} — only the stateless 'inference' tier "
+                    f"supports multiple instances per resource"
+                )
         # no two components sharing a resource may collide on a port (checked per resource, so
-        # a tier spread across several resources is fine — each instance owns its own host)
+        # a tier spread across several resources is fine — each instance owns its own host).
+        # A replicated component claims the whole range [port, port+N-1] (see instances()).
         for rname in self.resources:
             seen: dict[int, str] = {}
             for name, c in self.components_on(rname).items():
                 if not c.port:
                     continue
-                if c.port in seen:
-                    errors.append(
-                        f"resource {rname!r}: port {c.port} used by both {seen[c.port]!r} and {name!r}"
-                    )
-                else:
-                    seen[c.port] = name
+                n = max(1, self.group_instances.get(c.tier, 1))
+                for p in range(c.port, c.port + n):
+                    if p in seen:
+                        errors.append(
+                            f"resource {rname!r}: port {p} used by both {seen[p]!r} and {name!r}"
+                            + (f" (replica port — {name} claims {c.port}..{c.port + n - 1})"
+                               if p != c.port else "")
+                        )
+                    else:
+                        seen[p] = name
         self.warnings = warnings
         if errors:
             raise ValueError("invalid topology:\n  - " + "\n  - ".join(errors))
@@ -247,21 +274,32 @@ class Topology:
         secproxy is actually deployed."""
         return self.manifest.components[component].fronted and self._proxy_address() is not None
 
-    def instances(self, component: str) -> list[tuple[str, str, str]]:
-        """Every ``(instance_name, resource_name, address)`` for ``component`` — one per
-        resource its tier is placed on.
+    def instances(self, component: str) -> list[tuple[str, str, str, int]]:
+        """Every ``(instance_name, resource_name, address, port)`` for ``component`` — one per
+        resource its tier is placed on, times the tier's per-resource replica count
+        (``instances = N`` on the group table, default 1).
 
-        A tier on ONE resource yields a single instance named after the bare component
-        (unchanged FQDN, e.g. ``secllm``); a tier spread across MANY resources yields one
-        instance per resource, named ``<component>-<resource>`` (e.g. ``secllm-gpu1``,
-        ``secllm-gpu2``) so each gets a distinct, stable FQDN. SecLLM is the motivating case —
-        stateless, so N instances need no coordination — but this works for any tier.
+        Naming keeps every pre-replica shape byte-identical: a tier on ONE resource yields a
+        first instance named after the bare component (unchanged FQDN, e.g. ``secllm``); a
+        tier spread across MANY resources names each resource's first instance
+        ``<component>-<resource>`` (e.g. ``secllm-gpu1``). Replicas beyond the first append
+        ``-2``..``-N`` to that base (``secllm-2``, or ``secllm-gpu1-2``) and take the NEXT
+        port up (manifest port + replica_index - 1), so N replicas on one host claim ports
+        ``[port, port+N-1]`` — validated collision-free in :meth:`validate`. SecLLM is the
+        motivating case — stateless, so N instances need no coordination; every other tier is
+        capped at 1 replica per resource (see :meth:`validate`).
         """
-        tier = self.manifest.components[component].tier
-        res_list = self.groups.get(tier, [])
-        if len(res_list) <= 1:
-            return [(component, res, self.resources[res].address) for res in res_list]
-        return [(f"{component}-{res}", res, self.resources[res].address) for res in res_list]
+        c = self.manifest.components[component]
+        res_list = self.groups.get(c.tier, [])
+        n = max(1, self.group_instances.get(c.tier, 1))
+        result: list[tuple[str, str, str, int]] = []
+        for res in res_list:
+            base = component if len(res_list) <= 1 else f"{component}-{res}"
+            addr = self.resources[res].address
+            for i in range(1, n + 1):
+                name = base if i == 1 else f"{base}-{i}"
+                result.append((name, res, addr, (c.port + i - 1) if c.port else 0))
+        return result
 
     def zone(self, without: list[str] | None = None) -> list[tuple[str, str, str]]:
         """DNS records secdns serves: (fqdn, "A", resource address) — one per placed
@@ -282,7 +320,7 @@ class Topology:
             fronted = self.is_fronted(name)
             any_fronted = any_fronted or fronted
             proxy_addr = edge_addr if fronted else None
-            for instance_name, _res, addr in self.instances(name):
+            for instance_name, _res, addr, _port in self.instances(name):
                 records.append(
                     (self.fqdn(instance_name), "A", proxy_addr if proxy_addr is not None else addr)
                 )
@@ -327,8 +365,10 @@ class Topology:
         scheme: str = "https", path: str = "",
     ) -> list[str]:
         """Every instance's base URL for ``component`` (one per resource its tier is placed
-        on) — e.g. the SecLLM backend pool SecRouter load-balances/fails over across. Empty
-        if ``component`` isn't selected or has no inbound port.
+        on, times the tier's per-resource replica count) — e.g. the SecLLM backend pool
+        SecRouter load-balances/fails over across. Replicas beyond the first carry their own
+        port (manifest port + offset — see :meth:`instances`). Empty if ``component`` isn't
+        selected or has no inbound port.
 
         A FRONTED instance (see :meth:`is_fronted`) gets a bare ``https://<fqdn>`` (443
         implied); otherwise ``http://<fqdn>:<port>`` — NOT ``https``, regardless of ``scheme``
@@ -343,11 +383,10 @@ class Topology:
         if not port:
             return []
         fronted = self.is_fronted(component)
-        suffix = "" if fronted else f":{port}"
         effective_scheme = scheme if fronted else "http"
         return [
-            f"{effective_scheme}://{self.fqdn(name)}{suffix}{path}"
-            for name, _res, _addr in self.instances(component)
+            f"{effective_scheme}://{self.fqdn(name)}{'' if fronted else f':{iport}'}{path}"
+            for name, _res, _addr, iport in self.instances(component)
         ]
 
     def env_for(

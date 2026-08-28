@@ -112,7 +112,9 @@ suppress). See SecAgent's `docs/leanctx.md` for the full security posture.
 
 The native **SecChat** (the canonical `secchat` stack) deploys with the suite — no flag — and its
 env is fully turnkey: when SecSSO is also placed, the deploy mirrors SecSSO's generated OIDC
-login-client secret and writes the topology issuer/audience/client-id/public-url/SecRouter env into
+login-client secret, wires SecChat's `svc-secchat` SecRouter service identity (the
+`SECCHAT_SECROUTER_*` client_credentials env, derived from SecSSO's `SECCHAT_SVC_APP_PASSWORD`),
+and writes the topology issuer/audience/client-id/public-url/SecRouter env into
 `work/secchat/.env` (nothing to reconcile by hand; its SSO client id stays `secchatng`, the retained
 Authentik client — users only ever see "SecChat"). And a `[[users]]` list in your `secsite.toml`
 provisions those accounts in SecSSO with random, must-reset-on-first-login passwords (printed once at
@@ -152,6 +154,14 @@ is host-side, so the **containers** (SecCert/SecRouter) still resolve peers thro
 `host.docker.internal`, not through SecDNS — which is why the secproxy ACME cert usually can't
 issue on macOS (see [TLS on macOS](#tls-on-macos-the-same-eval-limitation-as-secrecorder)). For
 real inference and a FIPS crypto boundary, use `fedora-fips`.
+
+**Multiple SecLLM instances on this one Mac** — `[groups.inference] instances = N` in
+`topology.toml`/`secsite.toml` installs one launchd service per replica (`secllm` on 11400,
+`secllm-2` on 11401, …), all sharing the backend/admin-token/autostart config, and the deploy
+rewrites the compose SecRouter's `SECROUTER_SECLLM_ENDPOINTS` to the container-effective pool
+(`host.docker.internal:<port>` per local replica) so it round-robins across them —
+breaker-aware, with per-replica `/v1/models` health probes. See
+[topology.md § Per-resource replicas](topology.md#per-resource-replicas-instances--n).
 
 SecRecorder is installed and started as a launchd daemon too. For a one-off foreground run
 instead (e.g. `--no-native-services`, or to watch its output):

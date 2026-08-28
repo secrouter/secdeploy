@@ -910,6 +910,21 @@ def deploy(
         written = wiring.write_addressing(topology, Path(out) / "addressing", resource, without,
                                           audit_opts=audit_opts)
         P.log(f"addressing artifacts written → {written['zone']} (+ env/)")
+        # The compose SecRouter reads env/secrouter.env (env_file in deploy/macos/compose.yaml),
+        # but the generated SECROUTER_SECLLM_ENDPOINTS is FQDN-form — resolvable only via the
+        # HOST's resolver (/etc/resolver, served by SecDNS), invisible inside the container.
+        # Re-address the pool for the container's view (host.docker.internal for instances on
+        # THIS resource, raw topology addresses for remote ones) BEFORE the compose up below
+        # reads the file — this is what lets a multi-instance SecLLM pool load-balance from the
+        # containerized SecRouter without the old single-endpoint hardcode in compose.yaml.
+        container_eps = wiring.secllm_container_endpoints(topology, resource, without)
+        secrouter_env_path = Path(out) / "addressing" / "env" / "secrouter.env"
+        if container_eps and _here("secrouter") and secrouter_env_path.exists():
+            wiring._set_env_keys(
+                secrouter_env_path,
+                {"SECROUTER_SECLLM_ENDPOINTS": ",".join(container_eps)})
+            P.log(f"secrouter: SECLLM pool re-addressed for the container "
+                  f"({len(container_eps)} endpoint(s)) → {secrouter_env_path}")
     if dry_run and topology is not None:
         here = ", ".join(services) or "(none)"
         print(f"# topology: resource {resource!r} @ {topology.resources[resource].address} — "
@@ -989,67 +1004,86 @@ def deploy(
 
     # secllm — opt-in inference; real local inference via SECLLM_BACKEND=mlx (Apple's mlx-lm —
     # vllm never installs here, GPU/Linux only), falling back to mock if mlx-lm isn't actually
-    # installed (see _secllm_backend). Runs as the user (high port).
+    # installed (see _secllm_backend). Runs as the user (high port). One launchd service per
+    # LOCAL instance ([groups.inference] instances = N → replicas secllm, secllm-2, … on
+    # consecutive ports; see Topology.instances) — all replicas share the backend, admin token,
+    # and autostart list, so each serves the same catalog and SecRouter's pool balancing
+    # (SECROUTER_SECLLM_ENDPOINTS round-robin + breaker) spreads load across them.
     if with_inference and topology is not None and _here("secllm"):
-        port = manifest.components["secllm"].port
+        local_secllm = [(iname, iport) for iname, res, _addr, iport
+                        in topology.instances("secllm") if res == resource]
         backend = _secllm_backend(root, inference_backend)
         # The metal backend runs `vllm serve` from an external venv — tell secllm where it is
         # (its own default is the same path, but be explicit so an operator override flows through).
         metal_env = {"SECLLM_METAL_VENV": str(_metal_venv())} if backend == "metal" else {}
-        fallback = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={port} SECLLM_BACKEND={backend} "
+        base_port = manifest.components["secllm"].port
+        fallback = (f"SECLLM_HOST=0.0.0.0 SECLLM_PORT={base_port} SECLLM_BACKEND={backend} "
                     f"uv run --project work/secllm secllm serve")
         if not dry_run and native_services and not _ensure_native_venv(root, "secllm"):
             P.warn(f"secllm: no project venv — run `secdeploy build macos`, then start it: {fallback}")
         else:
             # Cached (see wiring.secllm_admin_token) rather than left to secllm's own fallback —
             # unset, it mints a fresh one every process start and only logs it (secllm/config.py),
-            # useless the moment it restarts. Not generated/written on --dry-run.
+            # useless the moment it restarts. Not generated/written on --dry-run. ONE token shared
+            # by every replica — same operator, same console credential.
             admin_token = wiring.secllm_admin_token(root / "out") if not dry_run else "***"
-            secllm = launchd.LaunchdService(
-                name="secllm",
-                program_args=[str(_venv_bin(root, "secllm", "secllm")), "serve"],
-                log_dir=log_dir,
-                # SECLLM_MAX_LOADED unset → secllm's default 0 = "models coexist, no eviction"
-                # (its concurrent multi-model serving). On macOS/MLX there's no GPU inventory to
-                # pack against, so workers just launch and share unified memory — both autostart
-                # models stay resident. (Set >0 only to restore the old hard ceiling / switch
-                # semantics, e.g. 1 = loading a new model evicts the oldest.)
-                env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(port),
-                     "SECLLM_BACKEND": backend, "SECLLM_ADMIN_TOKEN": admin_token,
-                     "SECLLM_AUTOSTART": ",".join(autostart_models or []), **metal_env},
-                working_dir=str(root), user=user,
-            )
-            _install_or_note(secllm, staging_dir, native_services=native_services,
-                             dry_run=dry_run, fallback_note=fallback)
+            for iname, iport in local_secllm:
+                secllm = launchd.LaunchdService(
+                    name=iname,
+                    program_args=[str(_venv_bin(root, "secllm", "secllm")), "serve"],
+                    log_dir=log_dir,
+                    # SECLLM_MAX_LOADED unset → secllm's default 0 = "models coexist, no eviction"
+                    # (its concurrent multi-model serving). On macOS/MLX there's no GPU inventory
+                    # to pack against, so workers just launch and share unified memory — both
+                    # autostart models stay resident. (Set >0 only to restore the old hard
+                    # ceiling / switch semantics, e.g. 1 = loading a new model evicts the oldest.)
+                    env={**_base_env(home), "SECLLM_HOST": "0.0.0.0", "SECLLM_PORT": str(iport),
+                         "SECLLM_BACKEND": backend, "SECLLM_ADMIN_TOKEN": admin_token,
+                         "SECLLM_AUTOSTART": ",".join(autostart_models or []), **metal_env},
+                    working_dir=str(root), user=user,
+                )
+                _install_or_note(secllm, staging_dir, native_services=native_services,
+                                 dry_run=dry_run, fallback_note=fallback)
             if not dry_run and native_services:
-                P.log("secllm admin token cached → out/secllm-admin-token (stable across restarts)")
+                P.log("secllm admin token cached → out/secllm-admin-token (stable across "
+                      "restarts, shared by every replica)")
+                if len(local_secllm) > 1:
+                    P.log(f"secllm: {len(local_secllm)} instances on this resource — "
+                          + ", ".join(f"{n}:{p}" for n, p in local_secllm)
+                          + " (SecRouter load-balances across the pool; scaling DOWN later "
+                            "leaves the extra launchd service installed — remove it with "
+                            "`sudo launchctl bootout system/internal.secsuite.<name>` + delete "
+                            "its plist)")
                 if autostart_models:
                     P.log(f"secllm autostart: {', '.join(autostart_models)} — downloaded (if not "
-                          "already cached) and loaded the moment the service starts")
+                          "already cached) and loaded the moment each instance starts")
 
-    # SecSSO's SECAGENT_SERVICE_CLIENT_SECRET (secsso/blueprints/secagent-service.yaml's
-    # client_credentials provider) must exist BEFORE secagent's own block below can mirror it
-    # into SECAGENT_CLIENT_SECRET — seed it here rather than waiting for the stacks bring-up
-    # later in this function (too late for THIS deploy's secagent env), using the same
-    # generate-if-blank pass deploy_stacks itself uses (so a fresh deploy's first run already
-    # has the matching secret, not just a redeploy's second pass).
+    # SecSSO's SECAGENT_SVC_APP_PASSWORD (secsso/blueprints/secagent-service.yaml's
+    # svc-secagent service-account app-password) must exist BEFORE secagent's own block below
+    # can derive SECAGENT_CLIENT_SECRET from it — seed it here rather than waiting for the
+    # stacks bring-up later in this function (too late for THIS deploy's secagent env), using
+    # the same generate-if-blank pass deploy_stacks itself uses (so a fresh deploy's first run
+    # already has the matching secret, not just a redeploy's second pass).
     if not dry_run and with_agent and placed and "secsso" in placed and "secsso" not in without:
         common.ensure_stack_secrets(work, ["secsso"])
         secrets_path = root / "deploy" / "macos" / "secrets.env"
         synced = wiring.sync_secagent_service_secret(work / "secsso" / ".env", secrets_path)
         if synced:
-            P.log(f"secagent: SECAGENT_CLIENT_SECRET synced from SecSSO's generated service "
-                  f"client secret → {secrets_path}")
+            P.log(f"secagent: SECAGENT_CLIENT_SECRET derived from SecSSO's svc-secagent "
+                  f"app-password (sub=svc-secagent composite) → {secrets_path}")
         elif secrets_path.exists():
             current = _parse_env_file(secrets_path).get("SECAGENT_CLIENT_SECRET", "")
-            provisioned = _parse_env_file(work / "secsso" / ".env").get(
-                "SECAGENT_SERVICE_CLIENT_SECRET", "")
-            if current and provisioned and current != provisioned:
+            app_password = _parse_env_file(work / "secsso" / ".env").get(
+                "SECAGENT_SVC_APP_PASSWORD", "")
+            expected = (wiring.service_client_secret("svc-secagent", app_password)
+                        if app_password else "")
+            if current and expected and current != expected:
                 P.warn(f"secagent: {secrets_path}'s SECAGENT_CLIENT_SECRET doesn't match "
-                       "SecSSO's provisioned secagent client secret — `secagent token` will "
-                       "fail with invalid_client. Blank the line to auto-sync on the next "
-                       "deploy, or set it to match work/secsso/.env's "
-                       "SECAGENT_SERVICE_CLIENT_SECRET yourself.")
+                       "SecSSO's provisioned svc-secagent app-password composite — `secagent "
+                       "token` will fail with invalid_client (or authenticate with a stale "
+                       "identity whose sub isn't svc-secagent). Blank the line to auto-sync on "
+                       "the next deploy, or run work/secsso's `./bootstrap/secsso.sh "
+                       "secagent-config` and set it to the printed value yourself.")
 
     # Native SecChat (a compose stack) turnkey env: mirror SecSSO's generated OIDC login-client
     # secret and write the topology-derived OIDC/gateway env into work/secchat/.env BEFORE the

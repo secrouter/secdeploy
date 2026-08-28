@@ -174,6 +174,34 @@ On fedora-fips this installs a hardened `secllm.service` (see
 macOS (no GPU passthrough into Colima) it installs a native launchd daemon using
 `SECLLM_BACKEND=mock` for a GPU-free eval (see [macos.md § Native services](macos.md#native-services-launchd)).
 
+### Per-resource replicas (`instances = N`)
+
+Several SecLLM instances on **one** host — parallel capacity on a single box, load-balanced by
+SecRouter exactly like the multi-resource pool (its pooled `secllm` provider round-robins
+across `SECROUTER_SECLLM_ENDPOINTS`, skips endpoints whose circuit breaker is open, and — for
+a multi-endpoint pool — actively health-probes each replica's `/v1/models`):
+
+```toml
+[groups.inference]
+resource = "gpu"
+instances = 2
+```
+
+Each resource in the group then runs N replicas on **consecutive ports** (11400, 11401, …).
+The first replica keeps the pre-replica name, port, and FQDN byte-identical (`secllm`,
+`secllm.sec.internal:11400` — or `secllm-gpu1` when the tier also spans several resources);
+extras append `-2`…`-N` (`secllm-2.sec.internal:11401`). Every replica gets its own DNS A
+record, pool endpoint, and egress-allowlist entry. Only the stateless `inference` tier accepts
+`instances > 1`; the port range is validated collision-free against everything else on the
+resource.
+
+All replicas share one backend, admin token, and `autostart_models` list, so each serves the
+same catalog. On **macOS** the deploy installs one launchd service per replica (`secllm`,
+`secllm-2`, …) automatically; **fedora-fips** brings up only the first replica so far (the
+deploy warns — bring extras up by hand with a distinct `SECLLM_PORT`, or keep `instances = 1`
+there). Scaling the count back down leaves the extra launchd service installed — remove it
+with `sudo launchctl bootout system/internal.secsuite.<name>` and delete its plist.
+
 Two more pieces of this pool's security setup are generated alongside the wiring above — both
 are CMMC audit evidence, recorded in the [deploy audit artifact](fedora-fips.md#deployment-audit-artifacts):
 an explicit SecRouter **egress allow-list** (`out/addressing/secrouter-egress.json`,
@@ -250,7 +278,8 @@ above.
 
 **N-way inference** — two SecLLM instances behind SecRouter's backend pool: the
 [Multi-instance inference](#multi-instance-inference-n-secllm-backends) example above (swap
-`[groups.inference] resource = "gpu"` for `resources = ["gpu1", "gpu2"]`).
+`[groups.inference] resource = "gpu"` for `resources = ["gpu1", "gpu2"]`), or — on a single
+host — [`instances = N` replicas](#per-resource-replicas-instances--n) on consecutive ports.
 
 ## What consumes the topology
 
