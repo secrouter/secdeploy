@@ -195,12 +195,23 @@ def _component_records(
 
 def _addressing_record(
     topology: "Topology | None", without: list[str], addressing: dict[str, object] | None,
-    services: list[str],
+    services: list[str], *,
+    secllm_catalog_path: str | None = None, secllm_catalog_ids: list[str] | None = None,
 ) -> dict[str, object]:
+    # Operator-maintained SecLLM model catalog (secsite.toml's [secllm].catalog) — path + model
+    # id LIST ONLY (already non-secret, see SecllmOptions/wiring.stage_secllm_catalog); recorded
+    # whenever the catalog was actually provisioned this run (a target only passes the path once
+    # it's copied the file — see targets/macos.py, targets/fedora_fips.py), independent of the
+    # topology/single-host branch below.
+    catalog_record = (
+        {"path": secllm_catalog_path, "model_ids": list(secllm_catalog_ids or [])}
+        if secllm_catalog_path else None
+    )
     if topology is None:
         return {
             "secdns_zone": {"path": None, "record_count": 0},
             "secrouter_secllm_backend_pool": [],
+            "secllm_catalog": catalog_record,
             "note": "single-host mode (no topology.toml) — no cross-host addressing generated this run",
         }
     zone_path = str(addressing["zone"]) if addressing else None
@@ -208,6 +219,7 @@ def _addressing_record(
     return {
         "secdns_zone": {"path": zone_path, "record_count": len(topology.zone(without))},
         "secrouter_secllm_backend_pool": pool,
+        "secllm_catalog": catalog_record,
     }
 
 
@@ -288,6 +300,12 @@ def _render_txt(record: dict[str, object]) -> str:
         lines += [f"    - {u}" for u in pool]
     else:
         lines.append("  secrouter → secllm backend pool: (not applicable on this resource/run)")
+    catalog = addr.get("secllm_catalog")
+    if catalog:
+        lines.append(f"  secllm catalog:  {catalog['path']} ({len(catalog['model_ids'])} model id(s))")
+        lines += [f"    - {m}" for m in catalog["model_ids"]]
+    else:
+        lines.append("  secllm catalog:  (none provisioned — secllm's built-in catalog)")
 
     auth = record["authorizations"]
     lines += [
@@ -342,6 +360,8 @@ def write_deploy_audit(
     resolver_configured: bool = False,
     secllm_auth_enabled: bool = False,
     secagent_enabled: bool = False,
+    secllm_catalog_path: str | None = None,
+    secllm_catalog_ids: list[str] | None = None,
     now: datetime | None = None,
 ) -> Path:
     """Write the JSON + ``.txt`` audit artifacts for one real deploy; return the JSON path.
@@ -365,6 +385,12 @@ def write_deploy_audit(
     pi harness (``--with-agent``) — see ``secagent_enabled``/``secagent_llm_at_secrouter``/
     ``oidc_service_subject`` in the ``authorizations`` section. Like ``secllm_auth_enabled``, no
     secret (the SecSSO client secret) is ever accepted by this function or appears in the artifact.
+
+    ``secllm_catalog_path``/``secllm_catalog_ids`` record the operator-maintained SecLLM model
+    catalog (secsite.toml's ``[secllm].catalog``) this run provisioned, if any — the installed
+    path and the model id LIST ONLY (already non-secret; see ``SecllmOptions``/
+    ``wiring.stage_secllm_catalog``). Both default ``None``/empty, meaning no catalog override
+    was provisioned this run (the pre-``[secllm]`` behavior).
 
     ``now`` is injectable (default :func:`datetime.now` in UTC) so callers get a deterministic,
     testable timestamp instead of wall-clock time.
@@ -395,7 +421,10 @@ def write_deploy_audit(
         "target": target,
         "resource": {"name": resource_name, "address": resource_address},
         "components": _component_records(manifest, list(services) + stacks, shas),
-        "addressing": _addressing_record(topology, without, addressing, services),
+        "addressing": _addressing_record(
+            topology, without, addressing, services,
+            secllm_catalog_path=secllm_catalog_path, secllm_catalog_ids=secllm_catalog_ids,
+        ),
         "authorizations": _authorizations_record(
             topology, without, services,
             trust_anchor_added=trust_anchor_added, resolver_configured=resolver_configured,

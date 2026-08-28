@@ -60,6 +60,11 @@ ANCHORS = Path("/etc/pki/ca-trust/source/anchors")
 SERVICES = ("secdns", "seccert", "secllm", "secrouter", "secagent", "secrecorder", "secproxy")
 SECDNS_ZONE = VAR / "secdns" / "secdns.zone"  # where the secdns service reads its zone
 SECROUTER_EGRESS_FILE = ETC / "secrouter-egress.json"  # SecRouter's SECROUTER_EGRESS_FILE target
+# The operator's [secllm].catalog (secsite.toml), staged by wiring.write_addressing to
+# addr_dir/secllm-catalog.json and installed here — secllm's SECLLM_CATALOG env points at this
+# path (see the secllm.env write below). No secret in it (model ids are already non-secret, same
+# reasoning as SECDNS_ZONE/SECPROXY_NGINX_CONF), so it's refreshed unconditionally every deploy.
+SECLLM_CATALOG_FILE = ETC / "secllm-catalog.json"
 # The generated peer-wiring env (pool/token/egress-file path) — layered onto the operator's own
 # secrouter.env via a SECOND EnvironmentFile= in secrouter.service (see that unit + deploy()
 # below), a DISTINCT path from ETC/secrouter.env so it never clobbers the operator's config.
@@ -292,6 +297,16 @@ def _deploy_steps(manifest: Manifest, work: Path, root: Path,
              f"install -m 640 {addr_dir}/secllm.env {ETC}/secllm.env"],
             f"config {ETC}/secllm.env (generated; kept across redeploys — carries the admin token)",
         ))
+        # The operator's [secllm].catalog, if secsite.toml sets one — staged by write_addressing
+        # to addr_dir/secllm-catalog.json (see deploy()); guarded on the STAGED file's existence
+        # (`test -f`, `|| true`) rather than the installed destination's, same pattern as
+        # SECROUTER_EGRESS_FILE above, since this only exists when a catalog was actually
+        # configured. No secret in it, so — unlike secllm.env itself — always refreshed.
+        steps.append((
+            ["bash", "-c", f"test -f {addr_dir}/secllm-catalog.json && "
+             f"install -m 644 {addr_dir}/secllm-catalog.json {SECLLM_CATALOG_FILE} || true"],
+            f"install SecLLM model catalog → {SECLLM_CATALOG_FILE} (if [secllm].catalog is set)",
+        ))
     # secrouter — install the generated egress allow-list (secrouter-egress.json), CMMC
     # evidence for the SecLLM-pool egress authorization (see wiring.secrouter_egress_rules).
     # Not a secret (unlike secllm.env above) — always refreshed, so a redeploy after the pool
@@ -480,6 +495,7 @@ def deploy(
     secchat_voice=None,
     site_builds=None,
     audit_opts: AuditOptions | None = None,
+    secllm_catalog: str = "",
 ) -> None:
     users = users or []
     # native_services is a macOS-only knob (launchd install vs. print) — fedora-fips is always
@@ -529,6 +545,16 @@ def deploy(
     trust_anchor_added = "seccert" in services
     secagent_enabled = "secagent" in services
     addr_dir = (Path(out) / "addressing") if (topology is not None and out is not None) else None
+
+    # Gemma-drift cross-component check (see wiring.secllm_catalog_drift_warnings): every model
+    # id SecRouter's SecLLM turnkey routing/autostart_models will actually need, checked against
+    # a KNOWN [secllm].catalog — before a live routing 502 / a stuck autostart finds it instead.
+    # Cheap (a JSON read + set comparison), so it runs on --dry-run too, not just a real deploy.
+    if topology is not None:
+        for w in wiring.secllm_catalog_drift_warnings(
+            topology, without, catalog=secllm_catalog, autostart_models=autostart_models, root=root,
+        ):
+            P.warn(w)
     steps = _deploy_steps(manifest, work, root, services, addr_dir=addr_dir,
                           topology=topology, without=without)
     # secproxy's SecCert-issued SAN cert is minted at deploy time by certbot --standalone (see
@@ -627,7 +653,8 @@ def deploy(
     if addr_dir is not None:
         written = wiring.write_addressing(topology, addr_dir, resource, without,
                                           secrouter_egress_path=str(SECROUTER_EGRESS_FILE),
-                                          audit_opts=audit_opts)
+                                          audit_opts=audit_opts,
+                                          secllm_catalog=secllm_catalog or None, root=root)
         if "secproxy" in services and topology is not None:
             # Landing page (see wiring.landing_page_html) — staged here alongside the nginx
             # config write_addressing just produced; _deploy_steps installs it from this path.
@@ -649,8 +676,15 @@ def deploy(
             # this reads back exactly what write_addressing just generated/reused, not a fresh
             # independent token.
             api_token = wiring.secllm_shared_token(addr_dir)
+            # SECLLM_CATALOG points at the FINAL installed path (SECLLM_CATALOG_FILE), not the
+            # staging one under addr_dir — _deploy_steps installs the staged secllm-catalog.json
+            # there, and this env file is copied to /etc/secsuite/secllm.env at the same install
+            # pass, so both land in place together (see the secllm.env step above).
+            catalog_installed = str(SECLLM_CATALOG_FILE) if written.get("secllm_catalog") else None
             (addr_dir / "secllm.env").write_text(
-                wiring.secllm_env_text(api_token=api_token, autostart=autostart_models)
+                wiring.secllm_env_text(
+                    api_token=api_token, autostart=autostart_models, catalog=catalog_installed,
+                )
             )
             # Per-resource SecLLM replicas ([groups.inference] instances = N) are automated on
             # macOS only so far — fedora-fips runs the one static secllm.service unit. Warn
@@ -780,6 +814,16 @@ def deploy(
         # see audit.py. secllm_auth_enabled mirrors exactly when the token/egress wiring above
         # ran (addr_dir is not None) — no topology, no shared-token wiring, nothing to report.
         shas = common.resolved_shas(manifest, work)
+        # The provisioned catalog's path + model id LIST ONLY (non-secret — see
+        # audit._addressing_record) — best-effort re-read: SiteConfig.load already validated this
+        # fail-loud, so a failure here is only a stale/mid-edit file since that check ran; never
+        # worth failing an otherwise-successful deploy over an audit-record nicety.
+        catalog_ids: list[str] = []
+        if written and written.get("secllm_catalog"):
+            try:
+                catalog_ids = wiring.secllm_catalog_ids(secllm_catalog, root)
+            except ValueError as exc:
+                P.warn(f"secllm catalog: could not re-read model ids for the audit record: {exc}")
         audit_path = audit.write_deploy_audit(
             manifest, topology, resource, out,
             target=NAME, services=services, shas=shas, stacks=stacks,
@@ -792,6 +836,8 @@ def deploy(
             resolver_configured=resolver_configured,
             secllm_auth_enabled=(addr_dir is not None),
             secagent_enabled=secagent_enabled,
+            secllm_catalog_path=(str(SECLLM_CATALOG_FILE) if written and written.get("secllm_catalog") else None),
+            secllm_catalog_ids=catalog_ids,
         )
         P.log(f"deploy audit artifact written → {audit_path}")
     if ("secproxy" in services and topology is not None

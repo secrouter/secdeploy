@@ -34,6 +34,23 @@ from .topology import Topology
 # Override per call for a different/broader ladder (keep it in ascending order).
 DEFAULT_EGRESS_CLASSIFICATIONS = ["UNCLASSIFIED", "CUI"]
 
+# Mirrors secrouter's own SECLLM_TIER_MODELS default EXACTLY (secrouter/src/config.ts) — the real
+# SecLLM model id each classification tier turnkey-routes to (as `secllm/<id>`) the moment
+# SECROUTER_SECLLM_ENDPOINTS is set (applySecllmEndpointsIntake), absent an explicit
+# SECROUTER_SECLLM_MODELS override on SecRouter's own side (secdeploy does not generate that var
+# today — it's a hand-set SecRouter env, not topology-derived). This is the binding
+# secllm_catalog_drift_warnings cross-checks a known [secllm].catalog against: a custom catalog
+# that renames/drops one of these ids without also setting SECROUTER_SECLLM_MODELS leaves
+# SecRouter routing a tier to a model nothing actually serves (the "Gemma drift" this guards
+# against — secllm's own built-in catalog ships all four of these ids, so the default posture is
+# always clean; drift only shows up once an operator swaps in a custom catalog).
+SECROUTER_DEFAULT_TIER_MODELS = {
+    "simple": "Llama-3.2-3B-Instruct",
+    "medium": "gemma-4-26B-A4B-it",
+    "complex": "Llama-3.3-70B-Instruct",
+    "reasoning": "gpt-oss-20b",
+}
+
 
 def active_topology(
     manifest: Manifest,
@@ -1767,6 +1784,110 @@ def secllm_shared_token(out_dir: str | Path) -> str:
     return token
 
 
+def secllm_catalog_ids(catalog: str, root: Path | None = None) -> list[str]:
+    """Thin re-export of :func:`secdeploy.site.read_secllm_catalog_ids` for callers (targets,
+    :mod:`secdeploy.audit`) that already depend on this module rather than importing ``site``
+    directly — same layering as everything else here (``site`` → ``wiring`` → targets)."""
+    from .site import read_secllm_catalog_ids
+    return read_secllm_catalog_ids(catalog, root)
+
+
+def stage_secllm_catalog(catalog: str, out_dir: str | Path, root: Path | None = None) -> Path:
+    """Copy the operator's ``[secllm].catalog`` file into ``out_dir`` as ``secllm-catalog.json``
+    — called from :func:`write_addressing` whenever SecLLM is placed on the resource being
+    addressed. ``out_dir`` is normally the shared ``addressing`` staging dir (fedora-fips then
+    installs this staged copy to its real ``/etc/secsuite/secllm-catalog.json`` location — see
+    ``targets/fedora_fips.py``) or macOS's own ``out/`` dir directly (macOS's native launchd
+    services read straight from there, same as ``secllm_admin_token``'s cache file — no separate
+    install step). No secret in it (model ids are already non-secret, same reasoning as the
+    secdns zone / nginx conf), so — unlike ``secllm.env``'s admin token — this is refreshed
+    unconditionally every deploy rather than guarded against clobbering.
+    """
+    from .site import resolve_secllm_catalog_path
+
+    src = resolve_secllm_catalog_path(catalog, root)
+    dest = Path(out_dir) / "secllm-catalog.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(src.read_bytes())
+    return dest
+
+
+def secllm_catalog_drift_warnings(
+    topology: Topology, without: list[str] | None = None, *,
+    catalog: str = "", autostart_models: list[str] | None = None, root: Path | None = None,
+) -> list[str]:
+    """The "Gemma drift" cross-component check: every secllm model name SecRouter will actually
+    route to, and every ``autostart_models`` id, checked against a KNOWN ``[secllm].catalog`` —
+    catching a custom catalog that silently stops serving a model something else in the suite
+    still expects, rather than letting it surface later as a live routing 502 / a stuck-pending
+    autostart load.
+
+    Returns zero or more human-readable strings for the caller to ``P.warn`` (or log at deploy
+    time / ``secdeploy verify``). Each string is either:
+
+    * an actual drift WARNING — naming the missing model id(s) and the exact fix (add the id to
+      the catalog, or rebind the tier via ``SECROUTER_SECLLM_MODELS`` / fix ``autostart_models``);
+    * a single SKIP note, when there's something to check (SecRouter is turnkey-routing to a
+      SecLLM pool here, and/or ``autostart_models`` is set) but no ``[secllm].catalog`` is known
+      at all — the operator may be running a hand-managed catalog on the box this can't see, so
+      this is a one-line heads-up, not an error.
+
+    Returns an empty list — quietly — both when nothing in this topology/run has any tier
+    binding or autostart id to check (nothing to say), AND when a catalog IS known and every id
+    it needs to cover is actually present (a clean match, also nothing to say).
+
+    Checks TWO independent things, either of which can produce a warning on its own:
+
+    1. SecRouter's implicit tier→model binding (:data:`SECROUTER_DEFAULT_TIER_MODELS`) — only
+       "in play" when SecRouter is selected AND this topology's SecLLM pool is non-empty (i.e.
+       ``SECROUTER_SECLLM_ENDPOINTS`` would actually be set — see :func:`secllm_endpoints`).
+       secdeploy does not generate ``SECROUTER_SECLLM_MODELS`` itself, so the DEFAULT bindings
+       are always what's checked (an operator who already hand-set that env on SecRouter's own
+       config has taken explicit ownership and can disregard a warning naming a tier they in fact
+       rebound elsewhere).
+    2. ``autostart_models`` (``SECLLM_AUTOSTART``) — independent of whether SecRouter/a pool is
+       even in this topology at all; a model autostarted but absent from the catalog will never
+       actually be servable under that id.
+    """
+    selected = topology.manifest.select(without)
+    tier_binding_in_play = "secrouter" in selected and bool(secllm_endpoints(topology, without))
+    autostart_models = list(autostart_models or [])
+    if not tier_binding_in_play and not autostart_models:
+        return []
+    if not catalog:
+        return [
+            "secllm catalog drift check: skipped — no [secllm].catalog set in secsite.toml, so "
+            "SecRouter's tier bindings / autostart_models can't be cross-checked against a known "
+            "catalog (secllm's own built-in catalog is assumed on every instance)."
+        ]
+    try:
+        catalog_ids = set(secllm_catalog_ids(catalog, root))
+    except ValueError as exc:
+        return [f"secllm catalog drift check: skipped — {exc}"]
+
+    warnings: list[str] = []
+    if tier_binding_in_play:
+        missing = {
+            tier: mid for tier, mid in SECROUTER_DEFAULT_TIER_MODELS.items()
+            if mid not in catalog_ids
+        }
+        if missing:
+            pairs = ", ".join(f"{tier}={mid}" for tier, mid in sorted(missing.items()))
+            warnings.append(
+                f"SecRouter's SecLLM turnkey routing binds tier(s) to model id(s) missing from "
+                f"the catalog ({pairs}) — add the missing id(s) to {catalog} or set "
+                "SECROUTER_SECLLM_MODELS to rebind that tier to a model id the catalog actually "
+                "serves."
+            )
+    missing_auto = sorted(m for m in autostart_models if m not in catalog_ids)
+    if missing_auto:
+        warnings.append(
+            "autostart_models names id(s) missing from the SecLLM catalog: "
+            f"{', '.join(missing_auto)} — add them to {catalog} or fix autostart_models."
+        )
+    return warnings
+
+
 def secdns_address_for(topology: Topology, resource: str,
                        without: list[str] | None = None) -> str | None:
     """The address ``resource`` should point its resolver at to reach secdns.
@@ -1795,7 +1916,7 @@ def secdns_env_text(topology: Topology, zone_path: str) -> str:
 
 def secllm_env_text(
     admin_token: str | None = None, api_token: str | None = None,
-    autostart: list[str] | None = None,
+    autostart: list[str] | None = None, catalog: str | None = None,
 ) -> str:
     """Render one SecLLM instance's env (host/port/backend/tokens) for ``--with-inference``.
 
@@ -1823,6 +1944,13 @@ def secllm_env_text(
     cached — the moment the service starts, instead of waiting for the first request routed
     to that model. Empty/``None`` (the default) leaves the line commented out as
     documentation, matching this file's pre-``autostart_models`` behavior.
+
+    ``catalog`` (``SECLLM_CATALOG``) is the path this SecLLM instance should read its model
+    catalog from — the REAL, installed location a caller staged the operator's ``[secllm].
+    catalog`` file to (see :func:`stage_secllm_catalog`), not the secsite.toml-relative path an
+    operator wrote. Empty/``None`` (the default) leaves the line commented out as documentation
+    and secllm falls back to its own built-in catalog — byte-for-byte the pre-``[secllm]``
+    behavior.
     """
     token = admin_token if admin_token is not None else secrets.token_urlsafe(32)
     api = api_token if api_token is not None else secrets.token_urlsafe(32)
@@ -1830,6 +1958,12 @@ def secllm_env_text(
         f"SECLLM_AUTOSTART={','.join(autostart)}\n" if autostart
         else "# Autostart model(s) at boot instead of lazy first-request load — comma-separated "
              "catalog ids, e.g. Llama-3.2-3B-Instruct,gpt-oss-20b.\n# SECLLM_AUTOSTART=\n"
+    )
+    catalog_line = (
+        f"SECLLM_CATALOG={catalog}\n" if catalog
+        else "# Operator-maintained model catalog (models.json) — path to the installed copy of "
+             "secsite.toml's [secllm].catalog; unset = secllm's own built-in catalog.\n"
+             "# SECLLM_CATALOG=\n"
     )
     return (
         "# secllm — generated by secdeploy (--with-inference); kept across redeploys\n"
@@ -1839,6 +1973,7 @@ def secllm_env_text(
         f"SECLLM_ADMIN_TOKEN={token}\n"
         f"SECLLM_API_TOKEN={api}\n"
         f"{autostart_line}"
+        f"{catalog_line}"
     )
 
 
@@ -1850,6 +1985,8 @@ def write_addressing(
     *,
     secrouter_egress_path: str | None = None,
     audit_opts: "AuditOptions | None" = None,
+    secllm_catalog: str | None = None,
+    root: Path | None = None,
 ) -> dict[str, object]:
     """Write the addressing artifacts for ``resource`` into ``out_dir``.
 
@@ -1876,10 +2013,14 @@ def write_addressing(
     macOS; both targets run nginx) — plus ``<out_dir>/secproxy.logrotate.conf`` (see
     :func:`logrotate_conf_text`) for its access/error logs. Both are resource-specific like the
     egress/OIDC/audit files above (only the resource secproxy itself runs on needs them), unlike
-    the suite-wide zone. Returns the written paths — note that these last are
-    generated purely from topology PLACEMENT, the same as everything else here, independent of
-    whether a target's ``--with-inference``/``--with-agent`` flag actually installs the
-    corresponding service (see ``targets/fedora_fips.py``).
+    the suite-wide zone. When SecLLM is placed on ``resource`` and ``secllm_catalog`` is given
+    (secsite.toml's ``[secllm].catalog``), also copies that file into ``<out_dir>/
+    secllm-catalog.json`` (see :func:`stage_secllm_catalog`; ``root`` resolves a relative
+    ``secllm_catalog`` path) for the target to install/reference from SecLLM's own env
+    (``SECLLM_CATALOG`` — see :func:`secllm_env_text`). Returns the written paths — note that
+    these last are generated purely from topology PLACEMENT, the same as everything else here,
+    independent of whether a target's ``--with-inference``/``--with-agent`` flag actually
+    installs the corresponding service (see ``targets/fedora_fips.py``).
     """
     rdir = Path(out_dir)
     (rdir / "env").mkdir(parents=True, exist_ok=True)
@@ -1916,6 +2057,10 @@ def write_addressing(
         logrotate_conf_path = rdir / "secproxy.logrotate.conf"
         logrotate_conf_path.write_text(logrotate_conf_text())
 
+    catalog_path: Path | None = None
+    if secllm_catalog and "secllm" in placed:
+        catalog_path = stage_secllm_catalog(secllm_catalog, rdir, root)
+
     env_paths: dict[str, Path] = {}
     for name in placed:
         ep = rdir / "env" / f"{name}.env"
@@ -1939,4 +2084,6 @@ def write_addressing(
         result["nginx_conf"] = nginx_conf_path
     if logrotate_conf_path is not None:
         result["logrotate_conf"] = logrotate_conf_path
+    if catalog_path is not None:
+        result["secllm_catalog"] = catalog_path
     return result

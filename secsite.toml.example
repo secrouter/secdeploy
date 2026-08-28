@@ -212,6 +212,22 @@ resource = "core"
 # # syslog_proto = "udp"                # "udp" or "tcp"
 # # syslog_format = "json"              # "json" or "cef"
 
+# ── Custom SecLLM model catalog (optional) ─────────────────────────────────────────────
+# Suite-wide (like [audit] above, not per-resource): points at an operator-maintained models.json
+# that REPLACES SecLLM's built-in catalog on every inference resource/replica. Validated
+# fail-loud at config load (file exists, valid JSON, unique non-empty model ids — everything else
+# on an entry is SecLLM's own catalog schema to validate, not this check), then copied to every
+# inference resource at deploy time and pointed at via SECLLM_CATALOG. Absent (default) = every
+# SecLLM instance keeps its built-in catalog, unchanged.
+#
+# Also turns on the "Gemma drift" cross-check: once set, `deploy`/`secdeploy verify` compares
+# every model id SecRouter's turnkey routing (and any autostart_models below) will actually need
+# against this catalog's ids, and WARNS — naming the missing id(s) and the fix — if a custom
+# catalog silently stops serving something else in the suite still expects. See docs/secsite.md.
+#
+# [secllm]
+# catalog = "models.json"    # relative to the secdeploy root, or an absolute path
+
 # ── Container builds (optional) ────────────────────────────────────────────────────────
 # Images the deploy builds from fetched component checkouts (docker layer cache makes re-runs
 # cheap; local-only by default — right for colima/k3s shared runtimes; push = true needs registry).

@@ -17,6 +17,22 @@
   (`syslog_host`/`syslog_port`/`syslog_proto`/`syslog_format`) forwards SecRouter's audit log to a
   syslog/SIEM sink, in addition to (never instead of) its own tamper-evident SQLite chain —
   written as a documented `secrouter-audit.json` fragment for the operator to merge.
+- **Deploy-audit carries the SecLLM catalog.** When `[secllm].catalog` is provisioned this run,
+  the deploy-audit record's `addressing.secllm_catalog` field carries the installed path and the
+  model id **list only** (ids are already non-secret).
+
+### Inference
+- **`[secllm]` — a suite-wide, operator-maintained model catalog.** `catalog` points at a
+  `models.json` (SecLLM's own catalog schema) that replaces SecLLM's built-in catalog on every
+  inference resource/replica. Validated fail-loud at config load (file exists, valid JSON, unique
+  non-empty model ids — lenient on every other entry field); copied to each resource at deploy
+  time and pointed at via `SECLLM_CATALOG`. Absent = unchanged, built-in-catalog behavior.
+- **Cross-component "Gemma drift" check.** Once a catalog is known, `deploy`/`secdeploy verify`
+  cross-check every SecLLM model id SecRouter's turnkey routing (and `autostart_models`) will
+  actually need against the catalog's own ids, and WARN — naming the missing id(s) and the exact
+  fix — instead of letting a renamed/dropped model silently 502 the first live request that hits
+  it. Quietly skips with a one-line note when no catalog is configured. See
+  [docs/secsite.md](docs/secsite.md).
 
 ### Edge
 - **Branded error pages.** secproxy's fronted server blocks (the landing page and every fronted
