@@ -20,7 +20,7 @@ description = "SecRouter secure-AI suite"
 # ── Identity & trust (optional infra) ──
 [components.seccert]
 repo = "secrouter/seccert"
-ref = "v1.0.0"
+ref = "main"  # post-v1.0.0: suite-consistency (chained audit, OIDC admin, evidence) — repin at next release
 kind = "service"
 tier = "identity"
 port = 47001
@@ -44,7 +44,7 @@ role = "single sign-on (Authentik) — drop it when you have Okta/Entra/Keycloak
 
 [components.secdns]
 repo = "secrouter/secdns"
-ref = "v0.1.0"
+ref = "main"  # post-v0.1.0: suite-consistency (console + XSS fix, lifecycle audit) — repin at next release
 kind = "service"
 tier = "identity"
 port = 53
@@ -113,7 +113,7 @@ role = "native auditable team + agentic chat — SSO login, tamper-evident audit
 
 [components.secrecorder]
 repo = "secrouter/secrecorder"
-ref = "v0.8.2"
+ref = "main"  # post-v0.8.2: suite-consistency (audit trail, docs) — repin at next release
 kind = "service"
 tier = "collab"
 port = 47003
@@ -125,7 +125,7 @@ role = "transcription (native/MLX on macOS, faster-whisper on Fedora)"
 # ── Edge (optional infra) ──
 [components.secproxy]
 repo = "secrouter/secproxy"
-ref = "v0.2.0"
+ref = "main"  # post-v0.2.0: suite-consistency docs — repin at next release
 kind = "service"
 tier = "edge"
 port = 443
