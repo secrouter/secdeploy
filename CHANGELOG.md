@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Targets
+- **New `ubuntu` target.** Ubuntu 22.04+ / Debian 12+, native hardened systemd services — the
+  same design as `fedora-fips` (systemd units are reused directly, byte-identical), with the
+  distro deltas confined to `targets/ubuntu.py`: apt instead of dnf for the one package-manager
+  step secdeploy runs itself (nginx + certbot); CA trust via `.crt`-suffixed files under
+  `/usr/local/share/ca-certificates` + `update-ca-certificates` (fedora's `update-ca-trust`
+  equivalent); and an **advisory** (WARN, never fail-closed) FIPS check in place of fedora-fips's
+  fail-closed preflight, since stock Ubuntu/Debian ship no in-tree FIPS-validated OpenSSL module
+  (the accredited path is Ubuntu Pro's `fips-updates`). Teardown/backup/restore/status,
+  `[secllm]` catalog provisioning, `[audit]` syslog, and the secproxy logrotate config all carry
+  over unchanged. Dry-run/unit verified only — there is no live Ubuntu host in this environment
+  to validate a real deploy against; treat it as pending first live validation. See
+  [docs/ubuntu.md](docs/ubuntu.md).
+
 ### Compliance & audit
 - **Deploy-audit hash chain (AU-3.3.8).** Every real (non-`--dry-run`) deploy now also appends an
   immutable, timestamped `deploy-<target>-<resource>-<UTC timestamp>.json` carrying `prevHash`/

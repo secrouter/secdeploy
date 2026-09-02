@@ -31,6 +31,9 @@ everything else in `docs/` — organized by task, not by file name.
 - [fedora-fips.md](fedora-fips.md) — the production target: native, hardened systemd services
   linking the host's FIPS OpenSSL provider directly, with a fail-closed FIPS preflight, the
   secproxy edge front door, and logrotate for its access/error logs.
+- [ubuntu.md](ubuntu.md) — the same native, hardened systemd design on Ubuntu 22.04+ / Debian
+  12+ (apt instead of dnf, `.crt`-suffixed CA trust anchors); FIPS is advisory (WARN) rather
+  than fail-closed — dry-run/unit verified only, pending first live-host validation.
 
 ## Features
 

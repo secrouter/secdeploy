@@ -141,3 +141,7 @@ description = "MacBook Pro M-series — Docker Compose via Colima (services + st
 [targets.fedora-fips]
 kind = "systemd-native"
 description = "FIPS-mode Fedora host — native hardened systemd services (+ Podman for stack components)"
+
+[targets.ubuntu]
+kind = "systemd-native"
+description = "Ubuntu 22.04+ / Debian 12+ host — native hardened systemd services, apt-based (+ a container runtime for stack components); FIPS mode is advisory (WARN), not fail-closed — see docs/ubuntu.md"
