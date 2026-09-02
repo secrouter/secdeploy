@@ -38,9 +38,9 @@ from . import process as P
 from . import wiring
 from .manifest import Manifest
 from .site import DeployOptions, list_site_profiles, resolve_site_ref, site_profile_path
-from .targets import common, fedora_fips, macos
+from .targets import common, fedora_fips, macos, ubuntu
 
-TARGETS = {macos.NAME: macos, fedora_fips.NAME: fedora_fips}
+TARGETS = {macos.NAME: macos, fedora_fips.NAME: fedora_fips, ubuntu.NAME: ubuntu}
 ROADMAP_TARGETS = {
     "fedora-fips-image": "Proxmox-compatible qcow2 / LXC image (see docs/roadmap.md)",
 }
@@ -122,6 +122,22 @@ def _expected_assets(root: Path, target: str) -> list[Path]:
             d / "systemd/secrouter.service",
             d / "systemd/secrecorder.service",
             d / "systemd/secproxy.service",
+        ]
+    if target == ubuntu.NAME:
+        # systemd units are REUSED directly from deploy/fedora-fips/systemd/ (byte-identical —
+        # see targets/ubuntu.py's module docstring), so verify checks them there, not under
+        # deploy/ubuntu/ (which holds only what's actually distro-specific: the FIPS advisory
+        # check + the seeded-secret env examples).
+        units = root / "deploy/fedora-fips/systemd"
+        return [
+            root / "deploy/ubuntu/fips-check.sh",
+            units / "secsuite.target",
+            units / "secdns.service",
+            units / "seccert.service",
+            units / "secllm.service",
+            units / "secrouter.service",
+            units / "secrecorder.service",
+            units / "secproxy.service",
         ]
     return []
 
@@ -511,7 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name in ("plan", "build", "deploy", "status"):
         sp = sub.add_parser(name, help=f"{name} a target")
-        sp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+        sp.add_argument("target", help="deploy target (e.g. macos, fedora-fips, ubuntu)")
         sp.set_defaults(fn=globals()[f"cmd_{name}"])
         if name not in ("status", "deploy"):
             _without_arg(sp)
@@ -573,16 +589,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["deploy"].add_argument(
         "--configure-resolver", action="store_true", default=None, dest="configure_resolver",
         help="point this host's resolver at secdns for the internal domain (macOS /etc/resolver, "
-             "Fedora systemd-resolved) — asks first; the multi-host replacement for "
+             "fedora-fips/ubuntu systemd-resolved) — asks first; the multi-host replacement for "
              "--configure-hosts. Overrides the resource's secsite.toml `configure_resolver`.",
     )
     sub.choices["deploy"].add_argument(
         "--with-inference", action="store_true", default=None, dest="with_inference",
         help="also stand up SecLLM on every resource where the inference tier is placed here "
              "(default: off — the DNS/env wiring for SecLLM's backend pool is always generated; "
-             "this additionally installs + starts the secllm service). fedora-fips only; macOS "
-             "prints a native run command instead (see docs/macos.md). Overrides the resource's "
-             "secsite.toml `with_inference` when given.",
+             "this additionally installs + starts the secllm service). fedora-fips/ubuntu only; "
+             "macOS prints a native run command instead (see docs/macos.md). Overrides the "
+             "resource's secsite.toml `with_inference` when given.",
     )
     sub.choices["deploy"].add_argument(
         "--autostart-models", default=None,
@@ -604,8 +620,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-native-services", action="store_false", dest="native_services",
         help="macOS: don't install the native services (SecDNS/SecLLM/SecRecorder/"
              "secproxy) as launchd daemons — print the run commands so you start them in the "
-             "foreground yourself. Default is to install + start them. fedora-fips ignores this "
-             "(always systemd-native).",
+             "foreground yourself. Default is to install + start them. fedora-fips/ubuntu ignore "
+             "this (always systemd-native).",
     )
 
     tp = sub.add_parser(
@@ -613,7 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="remove what a deploy installed on this host — discovers what's actually here, "
              "never trusts topology.toml/deploy flags/the audit JSON (see docs)",
     )
-    tp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+    tp.add_argument("target", help="deploy target (e.g. macos, fedora-fips, ubuntu)")
     tp.add_argument(
         "--dry-run", action="store_true",
         help="print the discovered plan and stop — touches nothing",
@@ -643,7 +659,7 @@ def build_parser() -> argparse.ArgumentParser:
              "FIPS-encrypted archive — public-key: encrypt to a recipient cert, keep its "
              "private key offline (use --dry-run to preview)",
     )
-    kp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+    kp.add_argument("target", help="deploy target (e.g. macos, fedora-fips, ubuntu)")
     kp.add_argument(
         "--recipient",
         help="X.509 recipient cert (PEM) to encrypt the archive to. SecCert can mint one; keep "
@@ -661,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="decrypt + verify a backup archive and OVERWRITE this host's suite state with it "
              "(SecCert CA first, then the stacks) — needs the offline private key; asks first",
     )
-    rp.add_argument("target", help="deploy target (e.g. macos, fedora-fips)")
+    rp.add_argument("target", help="deploy target (e.g. macos, fedora-fips, ubuntu)")
     rp.add_argument("archive", help="the encrypted backup archive (…tar.cms) to restore from")
     rp.add_argument(
         "--key",

@@ -191,11 +191,11 @@ def read_secllm_catalog_ids(catalog: str, root: Path | None = None) -> list[str]
 class DeployOptions:
     """Per-resource deploy toggles — what CLI flags used to be the only way to set.
 
-    ``with_inference``/``with_agent``/``configure_resolver`` apply on both targets;
-    ``tls``/``configure_hosts``/``trust_ca`` are macOS-only (fedora-fips warns and ignores
-    them, exactly as it does for the equivalent CLI flags today); ``model_dir`` is macOS-only
-    too (air-gapped pre-downloaded model snapshots — see ``targets/macos.py``).
-    ``autostart_models`` applies on both targets — SecLLM catalog ids to load (downloading
+    ``with_inference``/``with_agent``/``configure_resolver`` apply on every target;
+    ``tls``/``configure_hosts``/``trust_ca`` are macOS-only (fedora-fips and ubuntu both warn
+    and ignore them, exactly as they do for the equivalent CLI flags today); ``model_dir`` is
+    macOS-only too (air-gapped pre-downloaded model snapshots — see ``targets/macos.py``).
+    ``autostart_models`` applies on every target — SecLLM catalog ids to load (downloading
     the weights first, if not already cached) at boot instead of on first request via
     ``/admin`` — see ``SECLLM_AUTOSTART`` in ``secllm/config.py``. Every bool defaults
     ``False`` and every string/list field defaults empty — a resource that declares none of

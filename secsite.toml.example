@@ -14,7 +14,7 @@
 #
 # NO SECRETS live here. The Hugging Face token, the SecCert CA passphrase, and SecAgent's client
 # secret stay in the *.env files (deploy/macos/secrets.env,
-# /etc/secsuite/*.env on fedora-fips) — see `secdeploy configure` and docs/*.md.
+# /etc/secsuite/*.env on fedora-fips/ubuntu) — see `secdeploy configure` and docs/*.md.
 #
 # If secsite.toml (and topology.toml) are BOTH absent, SecDeploy runs in single-host mode:
 # every component lands on the machine you run `deploy` on, and every deploy option defaults
@@ -51,7 +51,7 @@ ssh = false
 
 # ── Compute resources (hosts) ────────────────────────────────────────────────────────
 [resources.core]
-target = "fedora-fips"      # deploy mechanism: macos | fedora-fips
+target = "fedora-fips"      # deploy mechanism: macos | fedora-fips | ubuntu
 address = "10.0.0.5"        # how peer hosts reach this one (IP or resolvable name)
 # ssh = "root@10.0.0.5"     # optional — set to enable ssh-push deploy to this host
 capabilities = ["fips"]     # gpu | fips | arch tags
@@ -59,7 +59,7 @@ capabilities = ["fips"]     # gpu | fips | arch tags
 # Per-resource deploy options — commented here at their defaults. These differ per host (e.g.
 # inference on the GPU box, TLS on the Mac), which is why they live on the resource instead of
 # in the suite-wide [deploy] table above. Uncomment only what you need to change.
-# with_inference = false      # stand up SecLLM here (fedora-fips only; see 'gpu' below)
+# with_inference = false      # stand up SecLLM here (fedora-fips/ubuntu only; see 'gpu' below)
 # with_agent = false          # install SecAgent here as an on-demand pi harness (CLI / CI / MCP)
 # configure_resolver = false  # point THIS host's resolver at secdns (multi-host — docs/topology.md)
 # tls = false                 # macOS only: issue SecRecorder a SecCert cert via certbot
@@ -114,7 +114,7 @@ resource = "core"
 # the pool, breaker- and health-aware). `instances = N` on the group runs N replicas per
 # resource on consecutive ports (11400, 11401, ...), named secllm, secllm-2, ... Only the
 # stateless inference tier accepts N > 1; automated on macOS (one launchd service per
-# replica), fedora-fips still brings up only the first.
+# replica), fedora-fips/ubuntu still bring up only the first.
 #
 #   [groups.inference]
 #   resource = "gpu"

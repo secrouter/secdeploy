@@ -188,9 +188,9 @@ def run(
     getpass_fn: Callable[[str], str] = getpass.getpass,
 ) -> Path | None:
     """Drive the wizard; write ``dest`` (a ``secsite.toml``) and return it, or ``None`` if
-    aborted/invalid. ``root`` locates the ``deploy/{fedora-fips,macos}/*.env.example`` templates
-    for the optional secret-seeding step at the end (``cmd_configure`` passes the same root
-    every other target action uses — see ``cli._root``)."""
+    aborted/invalid. ``root`` locates the ``deploy/{fedora-fips,ubuntu,macos}/*.env.example``
+    templates for the optional secret-seeding step at the end (``cmd_configure`` passes the same
+    root every other target action uses — see ``cli._root``)."""
     out("secdeploy configure — describe where the suite runs and how deploy should run it\n")
     domain = _ask(input_fn, "internal DNS domain", DEFAULT_DOMAIN)
     up = _ask(input_fn, "upstream DNS resolvers, comma-separated (blank = closed network)", "")
@@ -312,14 +312,17 @@ def _write_env_seeds(
     items: list[tuple[str, str, dict[str, str]]], resources: dict[str, Resource], root: Path,
 ) -> list[Path]:
     """Group ``(component, resource, values)`` into actual files and write them: one
-    ``deploy/fedora-fips/<component>.env`` per fedora-fips component, but every macOS
-    component's values share the ONE ``deploy/macos/secrets.env`` — macOS has no per-component
-    env plumbing today (see docs/secsite.md). Starts from the DESTINATION file if it already
-    exists (so a second `configure` run — or leaving a field blank to mean "keep as-is" — never
-    resets an already-seeded value you didn't retype this time), else the shipped
-    ``*.env.example``. Blank-answered keys are dropped before grouping, so a component every
-    value was skipped for contributes nothing. Written at ``0600``. Returns the distinct paths
-    actually written, sorted for stable/testable output."""
+    ``deploy/<target>/<component>.env`` per fedora-fips/ubuntu component (each target keeps its
+    own seeded copy — see ``targets/ubuntu.py``'s module docstring on why the two targets don't
+    share seeded secrets even though their systemd units/shape do), but every macOS component's
+    values share the ONE ``deploy/macos/secrets.env`` — macOS has no per-component env plumbing
+    today (see docs/secsite.md). Starts from the DESTINATION file if it already exists (so a
+    second `configure` run — or leaving a field blank to mean "keep as-is" — never resets an
+    already-seeded value you didn't retype this time), else the shipped ``*.env.example`` — for
+    ubuntu that example is its own ``deploy/ubuntu/<component>.env.example`` (adapted from
+    fedora-fips's, not shared, since its header text differs). Blank-answered keys are dropped
+    before grouping, so a component every value was skipped for contributes nothing. Written at
+    ``0600``. Returns the distinct paths actually written, sorted for stable/testable output."""
     grouped: dict[Path, dict[str, str]] = {}
     example_for: dict[Path, Path] = {}
     for component, resource_name, raw_values in items:
@@ -331,8 +334,10 @@ def _write_env_seeds(
             dest = root / "deploy/macos/secrets.env"
             example = root / "deploy/macos/secrets.env.example"
         else:
-            dest = root / f"deploy/fedora-fips/{component}.env"
-            example = root / f"deploy/fedora-fips/{component}.env.example"
+            # fedora-fips and ubuntu each keep their own seeded *.env (and their own .example to
+            # fall back to) — same shape, different directory, per resource.target.
+            dest = root / f"deploy/{resource.target}/{component}.env"
+            example = root / f"deploy/{resource.target}/{component}.env.example"
         grouped.setdefault(dest, {}).update(values)
         example_for[dest] = example
 
@@ -428,5 +433,5 @@ def _maybe_seed_secrets(
         if p.name == "secrets.env":
             out("    ! macOS reads HF_TOKEN from this file automatically (deploy macos --tls / "
                 "--model-dir); any other value just seeded here is for safekeeping until the "
-                "macOS target wires it in too (known eval limitation — use fedora-fips for the "
-                "automated env layering — see docs/secsite.md).")
+                "macOS target wires it in too (known eval limitation — use fedora-fips/ubuntu "
+                "for the automated env layering — see docs/secsite.md).")

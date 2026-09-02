@@ -54,7 +54,7 @@ HELP: dict[str, str] = {
     "deploy.without": "Optional components to DROP — check what you already run elsewhere (your own CA, IdP, …).",
     "deploy.ssh": "Control-host mode: push deploys to each resource over SSH instead of deploying locally.",
     "resource.name": "Short resource id (e.g. mac, core, gpu1) — referenced by the tier placement below.",
-    "resource.target": "Deploy target for this host: macos (compose via Colima) or fedora-fips (hardened systemd).",
+    "resource.target": "Deploy target for this host: macos (compose via Colima), fedora-fips (hardened systemd, fail-closed FIPS), or ubuntu (hardened systemd, apt-based, advisory FIPS).",
     "resource.address": "The host's address as OTHER resources reach it (an IP or resolvable name).",
     "resource.capabilities": "Comma-separated capability tags (e.g. fips, gpu) — informational placement hints.",
     "resource.with_inference": "Stand up SecLLM (local model serving) on this host.",
@@ -278,7 +278,7 @@ def _resource_row(idx: object, name: str = "", target: str = "macos", address: s
     pre = f"res.{idx}."
     targets = "".join(
         f'<option value="{t}"{" selected" if t == target else ""}>{t}</option>'
-        for t in ("macos", "fedora-fips"))
+        for t in ("macos", "fedora-fips", "ubuntu"))
     head = ('<div class="rowhead"><b>resource</b>'
             '<button type="button" class="small" onclick="rmRow(this)">remove</button></div>')
     placement = (

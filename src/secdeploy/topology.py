@@ -38,7 +38,7 @@ class Resource:
     """A compute resource — one host the suite (or part of it) is deployed onto."""
 
     name: str
-    target: str  # deploy mechanism — a manifest target name (e.g. macos | fedora-fips)
+    target: str  # deploy mechanism — a manifest target name (e.g. macos | fedora-fips | ubuntu)
     address: str = "127.0.0.1"  # how peer hosts reach this one (IP or resolvable name)
     ssh: str = ""  # optional user@host — presence enables `deploy --ssh` to this resource
     capabilities: list[str] = field(default_factory=list)  # gpu | fips | arch tags

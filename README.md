@@ -47,6 +47,10 @@ may be dropped (naming a required one is an error).
   backend can't run in Docker on macOS).
 - **`fedora-fips`** — FIPS-mode Fedora host (production): **native, hardened systemd services**
   linking the system OpenSSL FIPS provider directly, with a fail-closed FIPS preflight.
+- **`ubuntu`** — Ubuntu 22.04+ / Debian 12+ host: the same native, hardened systemd design as
+  `fedora-fips` (apt instead of dnf, `.crt`-suffixed CA trust anchors); FIPS is **advisory**
+  (warns, doesn't abort) rather than fail-closed — see [docs/ubuntu.md](docs/ubuntu.md).
+  Dry-run/unit verified only; pending first live-host validation.
 
 ## Placing the suite across hosts
 

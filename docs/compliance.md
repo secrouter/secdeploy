@@ -102,7 +102,7 @@ here, and owned by the operator/environment instead:
 
 - **Log integrity/retention/forwarding for secproxy's nginx access/error logs.** SecDeploy emits
   a `log_format`/`access_log` (request id + timing fields) and a modest default logrotate policy
-  (fedora-fips only; see [fedora-fips.md](fedora-fips.md)) — but shipping those logs somewhere
+  (fedora-fips/ubuntu only; see [fedora-fips.md](fedora-fips.md)) — but shipping those logs somewhere
   durable, retaining them for a compliance-mandated period, and protecting them from tampering
   is the deploying organization's responsibility, not something this repo enforces.
 - **The syslog/SIEM sink itself** (`[audit].syslog_host`) — SecDeploy only wires SecRouter to
