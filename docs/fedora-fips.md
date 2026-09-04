@@ -253,6 +253,11 @@ hand-authored JSON file — so `deploy --with-agent` writes a documented fragmen
 These values match `secsso.sh`'s own `oidc-config`/`secagent-config` output exactly (both
 derive from the same SecSSO external URL), so the two never disagree.
 
+**Using an external IdP instead of SecSSO?** See
+[bring-your-own-idp-and-ca.md](bring-your-own-idp-and-ca.md#part-a--external-idp-azure-entra-id)
+for the Azure Entra ID runbook — what to put in this `security.oidc` block, and the matching
+SecAgent / SecChat / SecRecorder values, when nothing auto-wires them.
+
 The bare-root issuer serves a real discovery document too: Authentik only publishes
 `/.well-known/openid-configuration` under `/application/o/<slug>/`, so the generated secproxy
 nginx config aliases the root path on SecSSO's vhost to the `secrouter-admin-console`
@@ -431,6 +436,12 @@ Every `:443` `server` block reads that same pair (the whole point of one SAN cer
 SecCert's root the same way every other suite component on this host does: the system trust
 store, populated by the `update-ca-trust` step in the normal deploy flow above — nothing extra
 to configure for that.
+
+**Bringing your own certs instead of SecCert?** With `--without seccert` the deploy issues
+nothing and skips the trust-store step; you drop your own PEM `fullchain.pem`/`privkey.pem` into
+this same directory and install your CA yourself. See
+[bring-your-own-idp-and-ca.md](bring-your-own-idp-and-ca.md#part-b--pre-generated-tls-certificates)
+for the SAN/format requirements and the trust-anchor steps.
 
 ### Bootstrap ordering (flagged) and renewal
 
