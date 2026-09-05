@@ -39,6 +39,11 @@ secdeploy deploy fedora-fips --without seccert,secsso,secdns
 `--without` works on `plan` / `fetch` / `build` / `bundle` / `deploy`; only optional components
 may be dropped (naming a required one is an error).
 
+Dropping a component removes its turnkey wiring, not the need for it — you point the suite at
+your own instead. [docs/bring-your-own-idp-and-ca.md](docs/bring-your-own-idp-and-ca.md) is the
+runbook for the two common cases: an external IdP (**Azure Entra ID**) in place of SecSSO, and
+**pre-generated TLS certificates** in place of SecCert.
+
 ## Targets
 
 - **`macos`** — MacBook Pro M-series (eval): [SecCert](https://github.com/secrouter/seccert) +
